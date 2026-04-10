@@ -1,0 +1,13 @@
+# Vivado project files
+project_1/
+
+# Vitis workspace
+vitis_workspace/
+
+# Temporary files
+*.jou
+*.log
+*.str
+*.wdb
+*.wcfg
+dfx_runtime.txt
