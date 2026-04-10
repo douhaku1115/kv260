@@ -113,12 +113,40 @@ static void run_test1(void)
     mips_dump_regs(1, 7);
 }
 
+// Step 2: lw, sw, beq
+static const u32 test2_program[] = {
+    0x20010005, // addi $1, $0, 5       | $1 = 5
+    0x20020003, // addi $2, $0, 3       | $2 = 3
+    0x00221820, // add  $3, $1, $2      | $3 = 8
+    0xAC030000, // sw   $3, 0($0)       | mem[0] = 8
+    0x8C040000, // lw   $4, 0($0)       | $4 = 8 (mem[0])
+    0x10830001, // beq  $4, $3, +1      | $4==$3 → skip next
+    0x20050063, // addi $5, $0, 99      | skipped
+    0x20060001, // addi $6, $0, 1       | $6 = 1 (beqで分岐成功)
+    0x14810001, // bne  $0, $1, +1      | not implemented yet, falls through
+    0x20070002, // addi $7, $0, 2       | $7 = 2
+};
+#define TEST2_COUNT  (sizeof(test2_program) / sizeof(test2_program[0]))
+
+static void run_test2(void)
+{
+    xil_printf("=== Test 2: lw, sw, beq ===\r\n");
+
+    mips_reset();
+    mips_load_program(test2_program, TEST2_COUNT);
+    mips_run_cycles(100);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=5, $2=3, $3=8, $4=8, $5=0(skipped), $6=1, $7=2\r\n");
+    mips_dump_regs(1, 7);
+}
+
 int main(void)
 {
     xil_printf("\r\n==== MIPS Processor Test ====\r\n\r\n");
-    test_axi();
-    xil_printf("\r\n");
     run_test1();
+    xil_printf("\r\n");
+    run_test2();
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }

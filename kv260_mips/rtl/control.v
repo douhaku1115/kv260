@@ -36,12 +36,21 @@ module control (
 
     reg [1:0] alu_op;
 
+    // controls ビット割り当て:
+    //   [7] reg_write  - レジスタ書き込み有効
+    //   [6] reg_dst    - 書き込み先: 1=rd, 0=rt
+    //   [5] alu_src    - ALU入力B: 1=即値, 0=レジスタ
+    //   [4] branch     - 分岐命令
+    //   [3] mem_write  - データメモリ書き込み有効
+    //   [2] mem_to_reg - レジスタ書き戻し: 1=メモリ読出値, 0=ALU結果
+    //   [0] jump       - ジャンプ命令
     always @(*) begin
         case (opcode)
+            //                          76543210
             6'b000000: begin controls = 8'b11000000; alu_op = 2'b10; end // R型
             6'b001000: begin controls = 8'b10100000; alu_op = 2'b00; end // addi
-            6'b100011: begin controls = 8'b10100010; alu_op = 2'b00; end // lw
-            6'b101011: begin controls = 8'b00100100; alu_op = 2'b00; end // sw
+            6'b100011: begin controls = 8'b10100100; alu_op = 2'b00; end // lw
+            6'b101011: begin controls = 8'b00101000; alu_op = 2'b00; end // sw
             6'b000100: begin controls = 8'b00010000; alu_op = 2'b01; end // beq
             6'b000010: begin controls = 8'b00000001; alu_op = 2'b00; end // j
             6'b000011: begin controls = 8'b10000001; alu_op = 2'b00; end // jal

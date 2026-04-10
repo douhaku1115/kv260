@@ -84,8 +84,19 @@ module datapath (
         .zero(alu_zero)
     );
 
-    // データメモリ (Step 2で有効化、今はスタブ)
-    wire [31:0] mem_read_data = 32'b0; // Step 2で dmem に接続
+    // データメモリ (lw/sw 命令用)
+    // - addr: ALU結果 = ベースレジスタ + オフセット (バイトアドレス)
+    // - write_data: rt レジスタ値 (sw 時)
+    // - halt 中は書き込み禁止 (AXIデバッグ時の誤書き込み防止)
+    wire [31:0] mem_read_data;
+
+    dmem dmem_inst (
+        .clk(clk),
+        .mem_write(mem_write & ~halt),
+        .addr(alu_result),
+        .write_data(rd2),
+        .read_data(mem_read_data)
+    );
 
     // 書き戻しデータ
     assign write_data = mem_to_reg ? mem_read_data : alu_result;
