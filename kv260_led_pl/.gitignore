@@ -1,0 +1,36 @@
+# Vivado generated files
+**/*.cache/
+**/*.runs/
+**/*.sim/
+**/*.ip_user_files/
+**/*.gen/
+**/*.hw/
+**/*.log
+**/*.jou
+**/hbs.xml
+**/.Xil/
+
+# Vitis build artifacts
+**/build/
+**/Debug/
+**/Release/
+**/*.elf
+**/*.o
+**/*.a
+**/.cache/
+**/compile_commands.json
+
+# Vitis workspace
+vitis/_ide/
+vitis/.rigel_lopper/
+
+# Vitis platform generated (regenerated from XSA)
+vitis/kv260_led_pl/psu_cortexa53_0/
+vitis/kv260_led_pl/zynqmp_fsbl/
+vitis/kv260_led_pl/export/
+vitis/kv260_led_pl/logs/
+vitis/kv260_led_pl/resources/
+vitis/kv260_led_pl/hw/
+
+# Temp files
+vitis/main.c

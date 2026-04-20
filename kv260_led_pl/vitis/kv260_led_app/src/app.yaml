@@ -1,0 +1,4 @@
+domain_path: /home/dou/fpga/projects/kv260_led_pl/vitis/kv260_led_pl/export/kv260_led_pl/sw/standalone_psu_cortexa53_0
+app_src_dir: /tools/Xilinx/2025.1/Vitis/data/embeddedsw/lib/sw_apps/empty_application
+template: empty_application
+lang: c
