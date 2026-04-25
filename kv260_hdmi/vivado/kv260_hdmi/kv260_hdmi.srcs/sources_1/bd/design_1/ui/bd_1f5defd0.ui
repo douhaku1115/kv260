@@ -1,0 +1,26 @@
+{
+   "ActiveEmotionalView":"Default View",
+   "Default View_ScaleFactor":"1.5",
+   "Default View_TopLeft":"-459,-772",
+   "ExpandedHierarchyInLayout":"",
+   "guistr":"# # String gsaved with Nlview 7.8.0 2024-04-26 e1825d835c VDI=44 GEI=38 GUI=JA:21.0 TLS
+#  -string -flagsOSRD
+preplace inst zynq_ultra_ps_e_0 -pg 1 -lvl 1 -x 300 -y -210 -defaultsOSRD
+preplace inst clk_wiz_0 -pg 1 -lvl 1 -x 300 -y -570 -defaultsOSRD
+preplace inst rtl_top_0 -pg 1 -lvl 1 -x 300 -y -430 -defaultsOSRD
+preplace netloc zynq_ultra_ps_e_0_pl_clk0 1 0 2 -110 10 650
+preplace netloc zynq_ultra_ps_e_0_pl_resetn0 1 0 2 -120 20 680
+preplace netloc clk_wiz_0_clk_out1 1 0 2 -40 -60 690
+preplace netloc clk_wiz_0_locked 1 0 2 -50 -50 660
+preplace netloc zynq_ultra_ps_e_0_dp_video_ref_clk 1 0 2 -100 0 670
+preplace netloc rtl_top_0_video_de 1 0 2 -70 -30 720
+preplace netloc rtl_top_0_video_hsyncn 1 0 2 -80 -20 710
+preplace netloc rtl_top_0_video_vsyncn 1 0 2 -90 -10 700
+preplace netloc rtl_top_0_video_color 1 0 2 -60 -40 640
+levelinfo -pg 1 -140 300 740
+pagesize -pg 1 -db -bbox -sgen -140 -640 740 180
+"
+}
+{
+   "da_zynq_ultra_ps_e_cnt":"1"
+}
