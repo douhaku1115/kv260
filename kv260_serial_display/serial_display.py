@@ -2,36 +2,78 @@
 """
 案7: PC -> シリアル -> KV260 HDMI文字表示 (PetaLinux版)
 
-使い方:
-  KV260側 (SSH接続):
-    sudo systemctl stop serial-getty@ttyPS1.service
-    python3 serial_display.py
+■ 概要
+  PCからシリアル通信(UART)で送った文字を、KV260のHDMIモニターに
+  リアルタイム表示するプログラム。X WindowやGStreamerを使わず、
+  Linuxフレームバッファ(/dev/fb0)に直接ピクセルを書き込む。
 
-  PC側:
+■ システム構成
+  PC (tio /dev/ttyUSB1) --[UART 115200bps]--> KV260 (/dev/ttyPS1)
+                                                  |
+                                            serial_display.py
+                                                  |
+                                            /dev/fb0 --> HDMIモニター
+
+■ 仕組み
+  1. シリアルポート(/dev/ttyPS1)をraw modeで開く
+     - raw mode: カーネルの行バッファリングやエコーを無効化
+     - 受信した1バイトがそのまま読み取れる
+  2. フレームバッファ(/dev/fb0)を開き、解像度とピクセル形式を取得
+     - ioctlシステムコールでカーネルから画面情報を取得
+  3. 受信した各バイトを8x16ビットマップフォントで描画
+     - フォントデータの各ビットを前景色/背景色のピクセルに変換
+     - フレームバッファの該当位置にseek→writeで書き込み
+  4. カーソル管理: 右端で折り返し、下端でスクロール
+
+■ 使い方
+  KV260側 (SSH接続):
+    sudo systemctl stop serial-getty@ttyPS1.service  ← gettyがポートを占有しているため停止
+    sudo python3 serial_display.py
+
+  PC側 (別ターミナル):
     tio /dev/ttyUSB1
 
-  PCのtioで文字を打つと、KV260のHDMIモニターに表示される。
+  PCのtioで文字を打つと、KV260のHDMIモニターに緑色で表示される。
   Ctrl+C で終了。
+
+■ 動作環境
+  ボード: Xilinx KV260 Starter Kit
+  OS: PetaLinux 2025.1
+  画面: 1920x1080, 16bpp (RGB565)
+  シリアル: PS UART1, 115200bps 8N1
 """
 
 import os
 import sys
 import struct
-import fcntl
-import termios
+import fcntl      # ioctl: カーネルにデバイス情報を問い合わせる
+import termios    # シリアルポートの通信パラメータ設定
 import time
 
-# --- フレームバッファ設定 ---
+# ===========================================================================
+# フレームバッファ設定
+# ===========================================================================
+# Linuxフレームバッファ: /dev/fb0 はHDMI出力に対応するデバイスファイル。
+# 読み書きすると画面のピクセルデータに直接アクセスできる。
+# メモリマップ: 先頭が画面左上、1行分(xres*bpp/8バイト)ずつ下に並ぶ。
 FB_DEV = "/dev/fb0"
 
-# FBIOGET_VSCREENINFO = 0x4600
-# FBIOGET_FSCREENINFO = 0x4602
+# ioctl番号: Linuxカーネルのinclude/uapi/linux/fb.hで定義
+# FBIOGET_VSCREENINFO: 画面の解像度・ピクセル形式などを取得
 FBIOGET_VSCREENINFO = 0x4600
 FBIOGET_FSCREENINFO = 0x4602
 
 def get_fb_info(fb_fd):
-    """フレームバッファの解像度・BPPを取得"""
-    # vscreeninfo: 160 bytes
+    """フレームバッファの解像度・BPP(bits per pixel)を取得する。
+
+    ioctlでカーネルからfb_var_screeninfo構造体(160バイト)を読み出し、
+    そこから必要なフィールドを抽出する。
+
+    構造体レイアウト (linux/fb.h):
+      offset 0:  __u32 xres          ← 水平解像度 (例: 1920)
+      offset 4:  __u32 yres          ← 垂直解像度 (例: 1080)
+      offset 24: __u32 bits_per_pixel ← 1ピクセルのビット数 (16 or 32)
+    """
     buf = bytearray(160)
     fcntl.ioctl(fb_fd, FBIOGET_VSCREENINFO, buf)
     xres = struct.unpack_from("I", buf, 0)[0]
@@ -39,8 +81,16 @@ def get_fb_info(fb_fd):
     bpp = struct.unpack_from("I", buf, 24)[0]
     return xres, yres, bpp
 
-# --- 8x16 ビットマップフォント (ASCII 0x20-0x7E) ---
-# 各文字は16バイト (8ピクセル幅 x 16行, 1bit/pixel)
+# ===========================================================================
+# 8x16 ビットマップフォント (ASCII 0x20-0x7E)
+# ===========================================================================
+# 各文字は16バイト (8ピクセル幅 x 16行, 1bit/pixel)。
+# 1バイトの各ビットが1ピクセルに対応し、MSB(bit7)が左端、LSB(bit0)が右端。
+#
+# 例: 文字'A'の行 0xFE = 11111110
+#     → ■■■■■■■□  (■=前景色, □=背景色)
+#
+# VGAフォント(CP437)ベースの標準的な8x16フォント。
 FONT_8x16 = {}
 
 def _init_font():
@@ -273,91 +323,129 @@ def _init_font():
 
 _init_font()
 
-# 未定義文字用の四角
+# 未定義文字用のグリフ（四角形を表示して「不明な文字」を示す）
 _UNKNOWN_GLYPH = bytes([
     0xFF, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0x81,
     0x81, 0x81, 0x81, 0x81, 0x81, 0x81, 0xFF, 0x00
 ])
 
-# --- 色設定 (ARGB8888 / RGB565 対応) ---
-FG_COLOR_32 = 0xFF00FF00   # 緑
-BG_COLOR_32 = 0xFF000000   # 黒
-FG_COLOR_16 = 0x07E0       # 緑 (RGB565)
-BG_COLOR_16 = 0x0000       # 黒
+# ===========================================================================
+# 色設定
+# ===========================================================================
+# 32bpp (ARGB8888): 各ピクセル4バイト = Alpha, Red, Green, Blue 各8bit
+# 16bpp (RGB565):   各ピクセル2バイト = Red 5bit, Green 6bit, Blue 5bit
+#
+# RGB565の緑: 0x07E0 = 0b00000_111111_00000 (Greenのみ最大)
+FG_COLOR_32 = 0xFF00FF00   # 32bpp用 前景色: 緑 (不透明)
+BG_COLOR_32 = 0xFF000000   # 32bpp用 背景色: 黒 (不透明)
+FG_COLOR_16 = 0x07E0       # 16bpp用 前景色: 緑 (RGB565)
+BG_COLOR_16 = 0x0000       # 16bpp用 背景色: 黒
 
-CHAR_W = 8
-CHAR_H = 16
+CHAR_W = 8   # フォント幅 (ピクセル)
+CHAR_H = 16  # フォント高さ (ピクセル)
 
+
+# ===========================================================================
+# FrameBufferクラス: フレームバッファへの文字描画を管理
+# ===========================================================================
+# 画面をCHAR_W x CHAR_H ピクセルの格子に区切り、テキスト端末として扱う。
+# 1920x1080の場合: 240桁 x 67行 の文字が表示可能。
+#
+# フレームバッファのメモリレイアウト:
+#   アドレス 0                               xres * bytes_per_pixel
+#     ├─ 1行目のピクセル (左→右) ──────────┤
+#     ├─ 2行目のピクセル ──────────────────┤
+#     :                                      :
+#     ├─ yres行目のピクセル ───────────────┤
+#
+# 任意のピクセル(x,y)のアドレス = (y * xres + x) * bytes_per_pixel
 
 class FrameBuffer:
     def __init__(self, device=FB_DEV):
-        self.fd = os.open(device, os.O_RDWR)
+        self.fd = os.open(device, os.O_RDWR)  # フレームバッファを読み書き可能で開く
         self.xres, self.yres, self.bpp = get_fb_info(self.fd)
-        self.bytes_per_pixel = self.bpp // 8
-        self.line_length = self.xres * self.bytes_per_pixel
+        self.bytes_per_pixel = self.bpp // 8       # 16bpp→2バイト, 32bpp→4バイト
+        self.line_length = self.xres * self.bytes_per_pixel  # 1水平ラインのバイト数
 
-        # 文字グリッド
-        self.cols = self.xres // CHAR_W
-        self.rows = self.yres // CHAR_H
+        # 文字グリッド: 画面をフォントサイズで区切った時の桁数・行数
+        self.cols = self.xres // CHAR_W   # 1920/8 = 240桁
+        self.rows = self.yres // CHAR_H   # 1080/16 = 67行
 
-        # カーソル位置
-        self.cur_col = 0
-        self.cur_row = 0
+        # カーソル位置 (文字単位)
+        self.cur_col = 0  # 現在の桁 (0〜cols-1)
+        self.cur_row = 0  # 現在の行 (0〜rows-1)
 
         print(f"FB: {self.xres}x{self.yres}, {self.bpp}bpp")
         print(f"Grid: {self.cols}x{self.rows} chars")
 
-        # 画面クリア
-        self.clear()
+        self.clear()  # 起動時に画面を黒でクリア
 
     def clear(self):
-        """画面を黒でクリア"""
+        """画面全体を背景色(黒)で塗りつぶす。
+
+        1ラインぶんのピクセルデータを作り、yres回書き込む。
+        """
         if self.bpp == 32:
             line = struct.pack("I", BG_COLOR_32) * self.xres
         else:
             line = struct.pack("H", BG_COLOR_16) * self.xres
-        os.lseek(self.fd, 0, os.SEEK_SET)
+        os.lseek(self.fd, 0, os.SEEK_SET)  # ファイル先頭 = 画面左上
         for _ in range(self.yres):
             os.write(self.fd, line)
         self.cur_col = 0
         self.cur_row = 0
 
     def _draw_char(self, ch, col, row):
-        """1文字をフレームバッファに描画"""
+        """1文字をフレームバッファに描画する。
+
+        フォントデータ(16バイト)を1行ずつ処理:
+          - 各行(1バイト=8bit)のビットを左(MSB)から走査
+          - bit=1 → 前景色(緑)のピクセル
+          - bit=0 → 背景色(黒)のピクセル
+          - 8ピクセル分のデータをフレームバッファの該当位置に書き込む
+
+        描画位置の計算:
+          ピクセル座標 = (col*CHAR_W + x, row*CHAR_H + y)
+          バイトオフセット = (ピクセルY * xres + ピクセルX) * bytes_per_pixel
+        """
         glyph = FONT_8x16.get(ord(ch), _UNKNOWN_GLYPH)
 
-        for y in range(CHAR_H):
-            bits = glyph[y]
+        for y in range(CHAR_H):  # フォントの16行を処理
+            bits = glyph[y]      # この行のビットパターン (例: 0xFE = 11111110)
             pixels = bytearray()
-            for x in range(CHAR_W):
-                if bits & (0x80 >> x):
+            for x in range(CHAR_W):  # 8ピクセル分
+                if bits & (0x80 >> x):  # MSBから順にチェック (0x80=左端)
                     if self.bpp == 32:
                         pixels += struct.pack("I", FG_COLOR_32)
                     else:
-                        pixels += struct.pack("H", FG_COLOR_16)
+                        pixels += struct.pack("H", FG_COLOR_16)  # "H"=uint16
                 else:
                     if self.bpp == 32:
                         pixels += struct.pack("I", BG_COLOR_32)
                     else:
                         pixels += struct.pack("H", BG_COLOR_16)
 
+            # フレームバッファ上の書き込み位置を計算してseek→write
             offset = ((row * CHAR_H + y) * self.xres + col * CHAR_W) * self.bytes_per_pixel
             os.lseek(self.fd, offset, os.SEEK_SET)
             os.write(self.fd, bytes(pixels))
 
     def _scroll_up(self):
-        """1行分上にスクロール"""
-        # 2行目以降を読んで1行分上に書く
-        scroll_bytes = CHAR_H * self.line_length
+        """画面全体を1文字行分(CHAR_H=16ピクセル)上にスクロールする。
+
+        フレームバッファから各行のピクセルデータを読み出し、
+        1行分上の位置に書き戻す。最下行は背景色でクリア。
+        """
+        scroll_bytes = CHAR_H * self.line_length  # 1文字行 = 16ピクセル行分のバイト数
         for row in range(1, self.rows):
-            src_offset = row * scroll_bytes
-            dst_offset = (row - 1) * scroll_bytes
+            src_offset = row * scroll_bytes       # コピー元: 現在の行
+            dst_offset = (row - 1) * scroll_bytes # コピー先: 1行上
             os.lseek(self.fd, src_offset, os.SEEK_SET)
             data = os.read(self.fd, scroll_bytes)
             os.lseek(self.fd, dst_offset, os.SEEK_SET)
             os.write(self.fd, data)
 
-        # 最下行をクリア
+        # 最下行を背景色でクリア
         if self.bpp == 32:
             line = struct.pack("I", BG_COLOR_32) * self.xres
         else:
@@ -368,7 +456,17 @@ class FrameBuffer:
             os.write(self.fd, line)
 
     def put_char(self, ch):
-        """1文字出力（改行・スクロール対応）"""
+        """1文字を出力し、カーソルを進める。
+
+        制御文字の処理:
+          \\n, \\r → 改行 (カーソルを次の行の先頭へ)
+          BS(0x08), DEL(0x7f) → バックスペース (1文字戻して空白で消去)
+        通常文字:
+          現在のカーソル位置に描画し、カーソルを1桁右へ
+        端の処理:
+          右端到達 → 自動改行 (次の行の先頭へ)
+          下端到達 → 画面を1行スクロールして最下行に留まる
+        """
         if ch == '\n' or ch == '\r':
             self.cur_col = 0
             self.cur_row += 1
@@ -391,7 +489,7 @@ class FrameBuffer:
             self.cur_row = self.rows - 1
 
     def put_string(self, s):
-        """文字列出力"""
+        """文字列を1文字ずつput_charで出力する。"""
         for ch in s:
             self.put_char(ch)
 
@@ -399,33 +497,55 @@ class FrameBuffer:
         os.close(self.fd)
 
 
+# ===========================================================================
+# シリアルポート制御
+# ===========================================================================
+# Linuxのシリアルポートは通常 canonical mode (行単位処理) で動作する。
+# - 入力はEnterが押されるまでカーネルがバッファリング
+# - エコー(入力文字の自動送り返し)が有効
+#
+# ここではraw modeに設定して、1バイト受信するたびに即座に読み取れるようにする。
+# termios構造体の各フィールド:
+#   [0] iflag  : 入力処理フラグ (0=全て無効: パリティチェック、フロー制御なし)
+#   [1] oflag  : 出力処理フラグ (0=全て無効: 改行変換なし)
+#   [2] cflag  : 制御フラグ (CS8=8bitデータ, CREAD=受信有効, CLOCAL=モデム制御なし)
+#   [3] lflag  : ローカルフラグ (0=全て無効: エコーなし、行編集なし)
+#   [4] ispeed : 入力ボーレート
+#   [5] ospeed : 出力ボーレート
+#   [6] cc[]   : 特殊文字配列
+#     VMIN=1   : 最低1バイト受信で読み出し可能になる
+#     VTIME=0  : タイムアウトなし (データが来るまでブロック)
+
 def open_serial(device="/dev/ttyPS1", baudrate=115200):
-    """シリアルポートをraw modeでオープン"""
+    """シリアルポートをraw modeでオープンする。
+
+    O_NOCTTY: このデバイスをプロセスの制御端末にしない。
+    これがないと、シリアルポートがCtrl+Cなどのシグナルを処理してしまう。
+    """
     fd = os.open(device, os.O_RDWR | os.O_NOCTTY)
 
-    # termios設定: raw mode
     attrs = termios.tcgetattr(fd)
 
-    # Input flags: no parity, no flow control
-    attrs[0] = 0  # iflag
-    # Output flags: raw
-    attrs[1] = 0  # oflag
-    # Control flags: 8N1, enable receiver
-    attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL
-    # Local flags: raw
-    attrs[3] = 0  # lflag
-    # Speed
-    attrs[4] = termios.B115200  # ispeed
-    attrs[5] = termios.B115200  # ospeed
-    # cc: VMIN=1, VTIME=0 (1文字ずつ読む)
-    attrs[6][termios.VMIN] = 1
-    attrs[6][termios.VTIME] = 0
+    attrs[0] = 0                                     # iflag: 入力処理なし
+    attrs[1] = 0                                     # oflag: 出力処理なし
+    attrs[2] = termios.CS8 | termios.CREAD | termios.CLOCAL  # cflag: 8N1
+    attrs[3] = 0                                     # lflag: raw (エコーなし)
+    attrs[4] = termios.B115200                       # 入力ボーレート
+    attrs[5] = termios.B115200                       # 出力ボーレート
+    attrs[6][termios.VMIN] = 1                       # 1バイトで読み出し
+    attrs[6][termios.VTIME] = 0                      # タイムアウトなし
 
-    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    termios.tcsetattr(fd, termios.TCSANOW, attrs)    # 即座に設定適用
     return fd
 
 
+# ===========================================================================
+# メイン処理
+# ===========================================================================
+
 def main():
+    # コマンドライン引数でシリアルデバイスを指定可能 (デフォルト: /dev/ttyPS1)
+    # KV260のPS UART1はJTAG-USBケーブル経由でPCと接続される
     serial_dev = "/dev/ttyPS1"
     if len(sys.argv) > 1:
         serial_dev = sys.argv[1]
@@ -436,16 +556,22 @@ def main():
     print(f"Ctrl+C to quit")
     print()
 
+    # フレームバッファ初期化 (画面クリア、解像度取得)
     fb = FrameBuffer()
 
-    # 起動メッセージをHDMIに表示
+    # HDMIモニターに起動メッセージを表示
     fb.put_string("Serial Display Ready\n")
     fb.put_string(f"Waiting on {serial_dev}...\n")
     fb.put_string("---\n")
 
+    # シリアルポートをraw modeで開く
     ser_fd = open_serial(serial_dev)
 
     try:
+        # メインループ: シリアル受信 → HDMI描画
+        # os.read()はVMIN=1の設定により、最低1バイト受信するまでブロックする。
+        # 一度に最大256バイトまで読み取り、1バイトずつ画面に描画する。
+        # 非ASCII(128以上)は'?'に置換（日本語等のマルチバイト文字は非対応）。
         while True:
             data = os.read(ser_fd, 256)
             if not data:
