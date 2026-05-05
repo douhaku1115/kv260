@@ -1,6 +1,6 @@
 set board_type kv260
 set rtl_top_name mips_axi
-set rtl_files {rtl/mips_axi.v rtl/mips_top.v rtl/datapath.v rtl/control.v rtl/alu.v rtl/regfile.v rtl/imem.v}
+set rtl_files {rtl/mips_axi.v rtl/mips_top.v rtl/datapath.v rtl/control.v rtl/alu.v rtl/regfile.v rtl/imem.v rtl/dmem.v}
 set timing_xdc_file {timings.xdc}
 set project_name project_1
 set project_dir project_1
@@ -101,3 +101,8 @@ update_compile_order -fileset sources_1
 validate_bd_design
 regenerate_bd_layout
 save_bd_design
+
+# Simulation fileset
+add_files -fileset sim_1 -norecurse tb/tb_mips.v
+set_property top tb_mips [get_filesets sim_1]
+update_compile_order -fileset sim_1

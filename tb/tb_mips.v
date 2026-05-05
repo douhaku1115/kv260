@@ -21,6 +21,7 @@ module tb_mips;
         .dbg_reg_data(dbg_reg_data)
     );
 
+    initial clk = 0;
     always #10 clk = ~clk; // 50MHz
 
     // プログラムロードタスク
@@ -53,7 +54,7 @@ module tb_mips;
         $dumpfile("tb_mips.vcd");
         $dumpvars(0, tb_mips);
 
-        clk = 0; reset = 1; halt = 1;
+        reset = 1; halt = 1;
         imem_we = 0; imem_waddr = 0; imem_wdata = 0;
         dbg_reg_addr = 0;
 
