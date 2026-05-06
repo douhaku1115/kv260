@@ -10,28 +10,32 @@
 //
 // 【メインデコーダ 真理値表】
 //
-//   命令  | opcode   | RW RD AS BR MW MR JP | alu_op | jr
-//   ------+----------+----------------------+--------+----
-//   R型   | 000000   |  1  1  0  0  0  0  0 |  10    |  0  (*funct で演算決定)
-//   jr    | 000000   |  0  x  x  0  0  x  0 |  10    |  1  (funct=001000)
-//   addi  | 001000   |  1  0  1  0  0  0  0 |  00    |  0
-//   lw    | 100011   |  1  0  1  0  0  1  0 |  00    |  0
-//   sw    | 101011   |  0  x  1  0  1  x  0 |  00    |  0
-//   beq   | 000100   |  0  x  0  1  0  x  0 |  01    |  0
-//   j     | 000010   |  0  x  x  0  0  x  1 |  00    |  0
-//   jal   | 000011   |  1  x  x  0  0  x  1 |  00    |  0  (RW=1 で jal 識別)
+//   命令  | opcode   | IZ RW RD AS BR MW MR BN JP | alu_op | jr
+//   ------+----------+-----------------------------+--------+----
+//   R型   | 000000   |  0  1  1  0  0  0  0  0  0 |  10    |  0  (*funct で演算決定)
+//   jr    | 000000   |  0  0  x  x  0  0  x  0  0 |  10    |  1  (funct=001000)
+//   addi  | 001000   |  0  1  0  1  0  0  0  0  0 |  00    |  0
+//   lw    | 100011   |  0  1  0  1  0  0  1  0  0 |  00    |  0
+//   sw    | 101011   |  0  0  x  1  0  1  x  0  0 |  00    |  0
+//   beq   | 000100   |  0  0  x  0  1  0  x  0  0 |  01    |  0
+//   bne   | 000101   |  0  0  x  0  0  0  x  1  0 |  01    |  0  (BN=1 で beq と区別)
+//   j     | 000010   |  0  0  x  x  0  0  x  0  1 |  00    |  0
+//   jal   | 000011   |  0  1  x  x  0  0  x  0  1 |  00    |  0  (RW=1 で jal 識別)
+//   lui   | 001111   |  0  1  0  1  0  0  0  0  0 |  00    |  0  (datapath 側で特別処理)
+//   ori   | 001101   |  1  1  0  1  0  0  0  0  0 |  11    |  0  (IZ=1: ゼロ拡張即値)
 //
-//   RW=reg_write, RD=reg_dst, AS=alu_src, BR=branch,
-//   MW=mem_write, MR=mem_to_reg, JP=jump
+//   IZ=imm_zero(ゼロ拡張選択), RW=reg_write, RD=reg_dst, AS=alu_src,
+//   BR=branch(beq), MW=mem_write, MR=mem_to_reg, BN=branch_ne(bne), JP=jump
 //
 // 【ALUデコーダ】
-//   alu_op=00 → ADD (addi, lw, sw用)
-//   alu_op=01 → SUB (beq: a-b=0 なら分岐)
+//   alu_op=00 → ADD (addi, lw, sw, lui用)
+//   alu_op=01 → SUB (beq/bne: a-b=0 なら分岐)
 //   alu_op=10 → funct フィールドで演算を決定 (R型)
+//   alu_op=11 → OR  (ori: ゼロ拡張即値との OR)
 //
-// 【controls ビット割り当て (8bit)】
-//   [7] reg_write  [6] reg_dst  [5] alu_src  [4] branch
-//   [3] mem_write  [2] mem_to_reg  [1] (未使用)  [0] jump
+// 【controls ビット割り当て (9bit)】
+//   [8] imm_zero  [7] reg_write  [6] reg_dst  [5] alu_src  [4] branch
+//   [3] mem_write  [2] mem_to_reg  [1] branch_ne  [0] jump
 
 module control (
     input  [5:0] opcode,
@@ -40,14 +44,16 @@ module control (
     output       reg_dst,
     output       alu_src,
     output       branch,
+    output       branch_ne,   // bne 専用フラグ (beq とは独立)
     output       mem_write,
     output       mem_to_reg,
     output       jump,
     output       jr,          // jr 専用フラグ (jump とは独立)
+    output       imm_zero,    // 1=ゼロ拡張即値 (ori用), 0=符号拡張即値
     output [3:0] alu_control
 );
 
-    reg [7:0] controls;
+    reg [8:0] controls;
     reg [1:0] alu_op;
 
     // メインデコーダ
@@ -56,26 +62,31 @@ module control (
             6'b000000: begin
                 // R型命令: funct=001000 のみ jr (reg_write=0, jump=0)
                 // それ以外は通常R型 (reg_write=1, reg_dst=1)
-                if (funct == 6'b001000) controls = 8'b00000000; // jr
-                else                    controls = 8'b11000000; // R型
+                if (funct == 6'b001000) controls = 9'b000000000; // jr
+                else                    controls = 9'b011000000; // R型
                 alu_op = 2'b10;
             end
-            6'b001000: begin controls = 8'b10100000; alu_op = 2'b00; end // addi
-            6'b100011: begin controls = 8'b10100100; alu_op = 2'b00; end // lw
-            6'b101011: begin controls = 8'b00101000; alu_op = 2'b00; end // sw
-            6'b000100: begin controls = 8'b00010000; alu_op = 2'b01; end // beq
-            6'b000010: begin controls = 8'b00000001; alu_op = 2'b00; end // j
-            6'b000011: begin controls = 8'b10000001; alu_op = 2'b00; end // jal (reg_write=1 で jal と識別)
-            default:   begin controls = 8'b00000000; alu_op = 2'b00; end
+            6'b001000: begin controls = 9'b010100000; alu_op = 2'b00; end // addi
+            6'b100011: begin controls = 9'b010100100; alu_op = 2'b00; end // lw
+            6'b101011: begin controls = 9'b000101000; alu_op = 2'b00; end // sw
+            6'b000100: begin controls = 9'b000010000; alu_op = 2'b01; end // beq
+            6'b000101: begin controls = 9'b000000010; alu_op = 2'b01; end // bne  (branch_ne=1, SUB)
+            6'b000010: begin controls = 9'b000000001; alu_op = 2'b00; end // j
+            6'b000011: begin controls = 9'b010000001; alu_op = 2'b00; end // jal (reg_write=1 で jal と識別)
+            6'b001111: begin controls = 9'b010100000; alu_op = 2'b00; end // lui  (datapath 側で {imm,16'b0} に書き戻し)
+            6'b001101: begin controls = 9'b110100000; alu_op = 2'b11; end // ori  (imm_zero=1, OR演算)
+            default:   begin controls = 9'b000000000; alu_op = 2'b00; end
         endcase
     end
 
+    assign imm_zero   = controls[8];
     assign reg_write  = controls[7];
     assign reg_dst    = controls[6];
     assign alu_src    = controls[5];
     assign branch     = controls[4];
     assign mem_write  = controls[3];
     assign mem_to_reg = controls[2];
+    assign branch_ne  = controls[1];
     assign jump       = controls[0];
 
     // jr は opcode=000000 かつ funct=001000 の組み合わせで判定
@@ -86,8 +97,8 @@ module control (
     reg [3:0] alu_ctrl_r;
     always @(*) begin
         case (alu_op)
-            2'b00: alu_ctrl_r = 4'b0010; // ADD (addi, lw, sw)
-            2'b01: alu_ctrl_r = 4'b0110; // SUB (beq: 差がゼロなら分岐)
+            2'b00: alu_ctrl_r = 4'b0010; // ADD (addi, lw, sw, lui)
+            2'b01: alu_ctrl_r = 4'b0110; // SUB (beq/bne: 差がゼロか否かで分岐)
             2'b10: begin
                 // R型: funct フィールドで演算を選択
                 case (funct)
@@ -99,6 +110,7 @@ module control (
                     default:   alu_ctrl_r = 4'b0000;
                 endcase
             end
+            2'b11: alu_ctrl_r = 4'b0001; // OR (ori: rs | zero_extend(imm16))
             default: alu_ctrl_r = 4'b0010;
         endcase
     end

@@ -15,11 +15,12 @@
 //         │      └──── jal: $31 ← PC+4 ─────┘        │
 //         └──────────────────────────────────────────┘
 //
-// 【実装済み命令セット (Step 1〜3)】
+// 【実装済み命令セット (Step 1〜4)】
 //
 //  Step 1: addi, add, sub, and, or, slt
 //  Step 2: lw, sw, beq
 //  Step 3: j, jal, jr
+//  Step 4: bne, lui, ori
 //
 // 【外部インターフェース】
 //   - PS(ARM)側から AXI 経由でプログラムロード・実行制御・デバッグ読み出し
@@ -33,7 +34,7 @@ module mips_top (
 
     // 命令メモリ書き込みポート (PS側からプログラムをロードする)
     input         imem_we,
-    input  [7:0]  imem_waddr,
+    input  [11:0] imem_waddr,
     input  [31:0] imem_wdata,
 
     // デバッグ出力 (AXI経由でPS側から読み出す)
@@ -49,10 +50,12 @@ module mips_top (
     wire        reg_dst;     // 書き込み先レジスタ: 1=rd (R型), 0=rt (I型)
     wire        alu_src;     // ALU入力B: 1=即値, 0=レジスタ
     wire        branch;      // beq 分岐命令
+    wire        branch_ne;   // bne 分岐命令
     wire        mem_write;   // データメモリ書き込み許可 (sw)
     wire        mem_to_reg;  // レジスタ書き戻し元: 1=メモリ, 0=ALU結果
     wire        jump;        // j/jal ジャンプ命令
     wire        jr;          // jr ジャンプレジスタ命令
+    wire        imm_zero;    // ゼロ拡張即値選択 (ori用)
     wire [3:0]  alu_control; // ALU演算種別
 
     // 命令メモリ (256ワード x 32bit デュアルポートRAM)
@@ -73,10 +76,12 @@ module mips_top (
         .reg_dst(reg_dst),
         .alu_src(alu_src),
         .branch(branch),
+        .branch_ne(branch_ne),
         .mem_write(mem_write),
         .mem_to_reg(mem_to_reg),
         .jump(jump),
         .jr(jr),
+        .imm_zero(imm_zero),
         .alu_control(alu_control)
     );
 
@@ -89,10 +94,12 @@ module mips_top (
         .reg_dst(reg_dst),
         .alu_src(alu_src),
         .branch(branch),
+        .branch_ne(branch_ne),
         .mem_write(mem_write),
         .mem_to_reg(mem_to_reg),
         .jump(jump),
         .jr(jr),
+        .imm_zero(imm_zero),
         .alu_control(alu_control),
         .pc(pc),
         .instr(instr),

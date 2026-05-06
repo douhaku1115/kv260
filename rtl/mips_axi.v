@@ -80,7 +80,7 @@ module mips_axi #(
     // 0x14: imem_wdata (書き込み時にimem_weをアサート)
     reg [31:0] reg_ctrl;
     reg [4:0]  reg_dbg_addr;
-    reg [7:0]  reg_imem_waddr;
+    reg [11:0] reg_imem_waddr;
 
     // MIPS制御信号
     wire mips_reset = reg_ctrl[0];
@@ -165,7 +165,7 @@ module mips_axi #(
                 case (axi_awaddr[4:2])
                     3'd0: reg_ctrl <= S_AXI_WDATA;           // 0x00
                     3'd2: reg_dbg_addr <= S_AXI_WDATA[4:0];  // 0x08
-                    3'd4: reg_imem_waddr <= S_AXI_WDATA[7:0]; // 0x10
+                    3'd4: reg_imem_waddr <= S_AXI_WDATA[11:0]; // 0x10
                     3'd5: begin                                // 0x14
                         imem_wdata <= S_AXI_WDATA;
                         imem_we <= 1'b1;
@@ -224,7 +224,7 @@ module mips_axi #(
                 3'd1: axi_rdata <= mips_pc;
                 3'd2: axi_rdata <= {27'b0, reg_dbg_addr};
                 3'd3: axi_rdata <= mips_dbg_reg_data;
-                3'd4: axi_rdata <= {24'b0, reg_imem_waddr};
+                3'd4: axi_rdata <= {20'b0, reg_imem_waddr};
                 default: axi_rdata <= 32'b0;
             endcase
         end

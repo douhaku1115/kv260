@@ -24,7 +24,7 @@
 //   4. mips_read_reg()    — DBG_ADDR/DATA でレジスタ値を確認
 //
 // 【注意: imem のアドレス循環】
-//   imem は 256ワード (1KB) しかないため、PC が 0x400 を超えると
+//   imem は 4096ワード (16KB) あるため、PC が 0x4000 を超えると
 //   アドレスが循環して命令が再実行される。テストプログラムの末尾には
 //   必ず無限ループ (j 自身) を入れて PC を停止させること。
 
@@ -188,6 +188,50 @@ static void run_test3(void)
     xil_printf("  $31= 0x%08x\r\n", mips_read_reg(31));
 }
 
+// ============================================================
+// Test 4: lui, ori, bne (Step 4)
+// ============================================================
+// lui + ori で 32bit 即値をレジスタにロードし、
+// bne を使ったカウントアップループで動作を確認する。
+//
+// 実行順序:
+//   0x00: lui  $1, 0xCAFE       → $1 = 0xCAFE0000
+//   0x04: ori  $1, $1, 0xBABE   → $1 = 0xCAFEBABE
+//   0x08: lui  $2, 0x1234       → $2 = 0x12340000
+//   0x0C: ori  $2, $2, 0x5678   → $2 = 0x12345678
+//   0x10: addi $3, $0, 0        → $3 = 0  (ループカウンタ)
+//   0x14: addi $4, $0, 5        → $4 = 5  (ループ終了値)
+//   0x18: addi $3, $3, 1        → $3++    ← ループ先頭
+//   0x1C: bne  $3, $4, -2       → $3≠$4 なら 0x18 へ戻る
+//   0x20: j    0x20             → 無限ループ (停止)
+//
+// 期待値: $1=0xCAFEBABE, $2=0x12345678, $3=5, $4=5
+static const u32 test4_program[] = {
+    0x3C01CAFE,  // lui  $1, 0xCAFE
+    0x3421BABE,  // ori  $1, $1, 0xBABE   → $1 = 0xCAFEBABE
+    0x3C021234,  // lui  $2, 0x1234
+    0x34425678,  // ori  $2, $2, 0x5678   → $2 = 0x12345678
+    0x20030000,  // addi $3, $0, 0         → $3 = 0 (カウンタ初期化)
+    0x20040005,  // addi $4, $0, 5         → $4 = 5 (ループ回数)
+    0x20630001,  // addi $3, $3, 1         ← ループ先頭 (PC=0x18)
+    0x1464FFFE,  // bne  $3, $4, -2        → $3≠$4 なら PC=0x18 に戻る
+    0x08000008,  // j    0x20              → 無限ループ
+};
+#define TEST4_COUNT  (sizeof(test4_program) / sizeof(test4_program[0]))
+
+static void run_test4(void)
+{
+    xil_printf("=== Test 4: lui, ori, bne ===\r\n");
+
+    mips_reset();
+    mips_load_program(test4_program, TEST4_COUNT);
+    mips_run_cycles(100);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=0xCAFEBABE, $2=0x12345678, $3=5, $4=5\r\n");
+    mips_dump_regs(1, 4);
+}
+
 int main(void)
 {
     xil_printf("\r\n==== MIPS Processor Test ====\r\n\r\n");
@@ -196,6 +240,8 @@ int main(void)
     run_test2();
     xil_printf("\r\n");
     run_test3();
+    xil_printf("\r\n");
+    run_test4();
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }
