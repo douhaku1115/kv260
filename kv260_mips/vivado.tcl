@@ -101,3 +101,8 @@ update_compile_order -fileset sources_1
 validate_bd_design
 regenerate_bd_layout
 save_bd_design
+
+# Simulation fileset
+add_files -fileset sim_1 -norecurse tb/tb_mips.v
+set_property top tb_mips [get_filesets sim_1]
+update_compile_order -fileset sim_1
