@@ -232,6 +232,59 @@ static void run_test4(void)
     mips_dump_regs(1, 4);
 }
 
+// ============================================================
+// Test 5: andi, xori, slti, addiu, sll, srl, sra (Step 5)
+// ============================================================
+// 即値論理演算 (ゼロ拡張)、符号付き比較即値、シフト命令の動作確認。
+//
+// 実行順序:
+//   0x00: addi  $1, $0, 0xFF    → $1 = 0xFF
+//   0x04: andi  $1, $1, 0x0F   → $1 = 0x0F  (0xFF & 0x0F)
+//   0x08: addi  $2, $0, 0xFF    → $2 = 0xFF
+//   0x0C: xori  $2, $2, 0xFF   → $2 = 0x00  (0xFF ^ 0xFF)
+//   0x10: addi  $3, $0, 5       → $3 = 5
+//   0x14: slti  $3, $3, 10     → $3 = 1  (5 < 10 → true)
+//   0x18: addiu $4, $0, 42     → $4 = 42
+//   0x1C: addi  $5, $0, 1       → $5 = 1
+//   0x20: sll   $5, $5, 4      → $5 = 16  (1 << 4)
+//   0x24: lui   $6, 0x8000     → $6 = 0x80000000
+//   0x28: srl   $6, $6, 1      → $6 = 0x40000000 (論理シフト)
+//   0x2C: lui   $7, 0x8000     → $7 = 0x80000000
+//   0x30: sra   $7, $7, 1      → $7 = 0xC0000000 (算術シフト: 符号bit保持)
+//   0x34: j     0x34           → 無限ループ
+//
+// 期待値: $1=0x0F, $2=0, $3=1, $4=42, $5=16, $6=0x40000000, $7=0xC0000000
+static const u32 test5_program[] = {
+    0x200100FF,  // addi  $1, $0, 0xFF
+    0x3021000F,  // andi  $1, $1, 0x0F   → $1 = 0x0F
+    0x200200FF,  // addi  $2, $0, 0xFF
+    0x384200FF,  // xori  $2, $2, 0xFF   → $2 = 0x00
+    0x20030005,  // addi  $3, $0, 5
+    0x2863000A,  // slti  $3, $3, 10     → $3 = 1
+    0x2404002A,  // addiu $4, $0, 42     → $4 = 42
+    0x20050001,  // addi  $5, $0, 1
+    0x00052900,  // sll   $5, $5, 4      → $5 = 16
+    0x3C068000,  // lui   $6, 0x8000     → $6 = 0x80000000
+    0x00063042,  // srl   $6, $6, 1      → $6 = 0x40000000
+    0x3C078000,  // lui   $7, 0x8000     → $7 = 0x80000000
+    0x00073843,  // sra   $7, $7, 1      → $7 = 0xC0000000
+    0x0800000D,  // j     0x34           → 無限ループ
+};
+#define TEST5_COUNT  (sizeof(test5_program) / sizeof(test5_program[0]))
+
+static void run_test5(void)
+{
+    xil_printf("=== Test 5: andi, xori, slti, addiu, sll, srl, sra ===\r\n");
+
+    mips_reset();
+    mips_load_program(test5_program, TEST5_COUNT);
+    mips_run_cycles(100);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=0x0F, $2=0, $3=1, $4=42, $5=16, $6=0x40000000, $7=0xC0000000\r\n");
+    mips_dump_regs(1, 7);
+}
+
 int main(void)
 {
     xil_printf("\r\n==== MIPS Processor Test ====\r\n\r\n");
@@ -242,6 +295,8 @@ int main(void)
     run_test3();
     xil_printf("\r\n");
     run_test4();
+    xil_printf("\r\n");
+    run_test5();
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }

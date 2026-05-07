@@ -25,9 +25,14 @@
 //   lui は opcode=001111 で検出し、ALUをバイパスして
 //   {imm16, 16'b0} を直接レジスタに書き戻す
 //
-// 【ori の即値ゼロ拡張】
-//   addi/lw/sw は符号拡張 (sign_imm)、ori/andi はゼロ拡張 (zero_imm)
+// 【ori/andi/xori の即値ゼロ拡張】
+//   addi/lw/sw は符号拡張 (sign_imm)、ori/andi/xori はゼロ拡張 (zero_imm)
 //   imm_zero=1 のとき zero_imm を ALU 入力 B に使用する
+//
+// 【sll/srl/sra のシフト入力】
+//   shift_instr=1 のとき ALU 入力を切り替え:
+//     alu_a = rd2 (rt レジスタ = シフト対象の値)
+//     alu_b = {27'b0, shamt} (5bit シフト量をゼロ拡張)
 //
 // 【halt 信号】
 //   halt=1 の間は PC が停止し、AXI経由でレジスタを安全に読み出せる
@@ -74,13 +79,20 @@ module datapath (
     wire [4:0]  rs    = instr[25:21];
     wire [4:0]  rt    = instr[20:16];
     wire [4:0]  rd    = instr[15:11];
+    wire [4:0]  shamt = instr[10:6];   // シフト量 (sll/srl/sra で使用)
     wire [15:0] imm16  = instr[15:0];
     wire [25:0] addr26 = instr[25:0];
 
     // 即値の符号拡張 (addi, lw, sw, beq, bne で使用)
     wire [31:0] sign_imm = {{16{imm16[15]}}, imm16};
-    // ゼロ拡張 (ori, andi で使用: 上位16bitを0埋め)
+    // ゼロ拡張 (ori, andi, xori で使用: 上位16bitを0埋め)
     wire [31:0] zero_imm = {16'b0, imm16};
+
+    // sll/srl/sra 検出: opcode=000000 かつ funct が 000000/000010/000011
+    wire shift_instr = (instr[31:26] == 6'b000000) &&
+                       ((instr[5:0] == 6'b000000) ||
+                        (instr[5:0] == 6'b000010) ||
+                        (instr[5:0] == 6'b000011));
 
     // ---- jal/lui 識別 ----
     // jal: jump=1 かつ reg_write=1 (j は reg_write=0 なので区別できる)
@@ -111,13 +123,17 @@ module datapath (
     assign dbg_reg_data = dbg_rd3;
 
     // ---- ALU ----
-    // imm_zero=1 (ori) のときゼロ拡張、それ以外は符号拡張を使用
-    wire [31:0] alu_b      = alu_src ? (imm_zero ? zero_imm : sign_imm) : rd2;
+    // shift_instr のとき: a=rd2(シフト対象), b=shamt(シフト量)
+    // I型即値のとき: b=zero_imm(ゼロ拡張) or sign_imm(符号拡張)
+    // R型レジスタのとき: a=rd1(rs), b=rd2(rt)
+    wire [31:0] alu_a      = shift_instr ? rd2 : rd1;
+    wire [31:0] alu_b      = shift_instr  ? {27'b0, shamt}                    :
+                             alu_src       ? (imm_zero ? zero_imm : sign_imm) : rd2;
     wire [31:0] alu_result;
     wire        alu_zero;  // 結果=0 なら 1 (beq の分岐判定に使用)
 
     alu alu_inst (
-        .a(rd1),
+        .a(alu_a),
         .b(alu_b),
         .alu_control(alu_control),
         .result(alu_result),

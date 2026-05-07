@@ -8,8 +8,13 @@ set_property INCREMENTAL_CHECKPOINT {} [get_runs synth_1]
 set bd_file [get_files design_1.bd]
 generate_target all $bd_file
 
+# 全合成ランをリセット（OOC合成ランを含む）
+# synth_1 だけでなく mips_axi の OOC ランも強制的にリセットする
+foreach run [get_runs -filter {IS_SYNTHESIS == 1}] {
+    reset_run $run
+}
+
 # 合成 → 配置配線 → ビットストリーム生成
-reset_run synth_1
 launch_runs synth_1 -jobs 4
 wait_on_run synth_1
 launch_runs impl_1 -to_step write_bitstream -jobs 4

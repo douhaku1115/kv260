@@ -79,6 +79,20 @@ PS (ARM) ──AXI4-Lite──► mips_axi ──► mips_top
 
 > **lui + ori** の組み合わせで 32bit 即値をレジスタにロードできる
 
+### Step 5 — 即値論理演算・シフト命令
+
+| 命令  | 形式 | opcode / funct | 動作                              |
+|------|------|----------------|----------------------------------|
+| andi | I型  | op=001100      | rt = rs & zero_extend(imm)       |
+| xori | I型  | op=001110      | rt = rs ^ zero_extend(imm)       |
+| slti | I型  | op=001010      | rt = (rs < sign_imm) ? 1 : 0    |
+| addiu| I型  | op=001001      | rt = rs + imm (オーバーフロー無視) |
+| sll  | R型  | fn=000000      | rd = rt << shamt                 |
+| srl  | R型  | fn=000010      | rd = rt >> shamt (論理)           |
+| sra  | R型  | fn=000011      | rd = rt >>> shamt (算術)          |
+
+> **sll/srl/sra** は rs フィールドを無視し、shamt[10:6] をシフト量として使用する
+
 ---
 
 ## ファイル構成
@@ -93,9 +107,9 @@ kv260_mips/
 │   ├── imem.v        — 命令メモリ (4096ワード / 16KB, デュアルポートRAM)
 │   ├── dmem.v        — データメモリ (lw/sw 用)
 │   ├── regfile.v     — レジスタファイル ($0〜$31)
-│   └── alu.v         — ALU (add/sub/and/or/slt/or)
+│   └── alu.v         — ALU (add/sub/and/or/slt/xor/sll/srl/sra)
 ├── vitis_src/
-│   └── main.c        — PS 側テストプログラム (Step 1〜4)
+│   └── main.c        — PS 側テストプログラム (Step 1〜5)
 ├── rebuild.tcl       — Vivado バッチ再ビルドスクリプト
 └── README.md         — 本ファイル
 ```
@@ -107,8 +121,8 @@ kv260_mips/
 ### Vivado (RTL 変更後)
 
 ```tcl
-# Vivado バッチモードで再ビルド
-vivado.bat -mode batch -source rebuild.tcl
+# Vivado バッチモードで再ビルド (フルパス指定)
+vivado.bat -mode batch -source E:/fpga/kria260/kv260_mips/rebuild.tcl
 ```
 
 `rebuild.tcl` の内容:
@@ -133,7 +147,7 @@ RTL を変更してビットストリームを更新した場合、**新しい V
 
 ```
 controls[8:0]:
-  [8] imm_zero  — 1=ゼロ拡張即値 (ori), 0=符号拡張即値
+  [8] imm_zero  — 1=ゼロ拡張即値 (ori/andi/xori), 0=符号拡張即値
   [7] reg_write — レジスタ書き込み許可
   [6] reg_dst   — 書き込み先: 1=rd (R型), 0=rt (I型)
   [5] alu_src   — ALU 入力 B: 1=即値, 0=レジスタ
@@ -143,6 +157,20 @@ controls[8:0]:
   [1] branch_ne — bne 分岐有効
   [0] jump      — j/jal ジャンプ
 ```
+
+### ALU 制御コード (alu_control[3:0])
+
+| コード | 演算 | 使用命令 |
+|--------|------|---------|
+| 0000   | AND  | and, andi |
+| 0001   | OR   | or, ori |
+| 0010   | ADD  | add, addi, addiu, lw, sw |
+| 0110   | SUB  | sub, beq, bne |
+| 0111   | SLT  | slt, slti |
+| 1000   | XOR  | xori |
+| 1001   | SLL  | sll |
+| 1010   | SRL  | srl |
+| 1011   | SRA  | sra |
 
 ---
 
@@ -154,3 +182,4 @@ controls[8:0]:
 | 2    | lw, sw, beq             | ✓    |
 | 3    | j, jal, jr              | ✓    |
 | 4    | lui, ori, bne (ループ5回) | ✓   |
+| 5    | andi, xori, slti, addiu, sll, srl, sra | ✓ |
