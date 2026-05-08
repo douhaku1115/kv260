@@ -1,17 +1,13 @@
 # KV260 MIPS プロジェクト — 現在の状態
 
 ## 現在地
-**Step 6 完了・push済み**
+**Step 7 完了・push済み**
 
-- Step 1〜6: 実機動作確認済み、origin/main の kv260_mips/ に push 済み
-- 次: Step 7 → Step 8 の順で実装
+- Step 1〜7: 実機動作確認済み、origin/master の kv260_mips/ に push 済み
+- 次: Step 8 の実装
+- クロック: 20MHz（32bit 組み合わせ除算器のタイミング対策、rebuild.tcl で設定）
 
 ## 今後のロードマップ
-
-### Step 7（HI/LO レジスタ新規追加）
-mult, mflo, mfhi, div, multu, divu
-- HI/LOレジスタ（regfile外の専用レジスタ）新規追加
-- datapath.v / control.v / alu.v 変更必要
 
 ### Step 8（dmem バイト enable 対応）
 lb, lbu, lh, lhu, sb, sh
@@ -28,5 +24,5 @@ lb, lbu, lh, lhu, sb, sh
 - Vivado: `E:\vivado\2025.2\Vivado\bin\vivado.bat`
 - プロジェクト: `E:\fpga\kria260\kv260_mips\`
 - XSA: `E:\fpga\kria260\kv260_mips\project_1\design_1_wrapper.xsa`
-- Vitis WS: `E:\Xilinx\project_vitis\kv_mips2`（kv_mips は古い）
+- Vitis WS: `E:\Xilinx\project_vitis\kv_mips8`（kv_mips2〜7 は古い）
 - git: https://github.com/douhaku1115/kv260.git

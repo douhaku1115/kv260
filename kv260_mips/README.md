@@ -93,6 +93,20 @@ PS (ARM) ──AXI4-Lite──► mips_axi ──► mips_top
 
 > **sll/srl/sra** は rs フィールドを無視し、shamt[10:6] をシフト量として使用する
 
+### Step 7 — HI/LO レジスタ・乗除算命令
+
+| 命令  | 形式 | funct  | 動作                                         |
+|------|------|--------|---------------------------------------------|
+| mult | R型  | 011000 | {HI,LO} = $signed(rs) × $signed(rt)         |
+| multu| R型  | 011001 | {HI,LO} = rs × rt (符号なし)                 |
+| div  | R型  | 011010 | LO = $signed(rs) / $signed(rt), HI = 余り    |
+| divu | R型  | 011011 | LO = rs / rt (符号なし), HI = 余り            |
+| mfhi | R型  | 010000 | rd = HI                                     |
+| mflo | R型  | 010010 | rd = LO                                     |
+
+> HI/LO は regfile 外の専用 32bit レジスタ。  
+> **タイミング注意**: 32bit 組み合わせ除算器のクリティカルパスが約 42ns のため、クロックを 20MHz に設定している（rebuild.tcl の clk_wiz 設定）。
+
 ### Step 6 — 符号なし演算・NOR・可変シフト命令
 
 | 命令  | 形式 | opcode / funct | 動作                                    |
@@ -125,7 +139,7 @@ kv260_mips/
 │   ├── regfile.v     — レジスタファイル ($0〜$31)
 │   └── alu.v         — ALU (add/sub/and/or/slt/sltu/xor/nor/sll/srl/sra)
 ├── vitis_src/
-│   └── main.c        — PS 側テストプログラム (Step 1〜6)
+│   └── main.c        — PS 側テストプログラム (Step 1〜7)
 ├── rebuild.tcl       — Vivado バッチ再ビルドスクリプト
 └── README.md         — 本ファイル
 ```
@@ -202,3 +216,4 @@ controls[8:0]:
 | 4    | lui, ori, bne (ループ5回) | ✓   |
 | 5    | andi, xori, slti, addiu, sll, srl, sra | ✓ |
 | 6    | addu, subu, sltu, sltiu, nor, sllv, srlv, srav | ✓ |
+| 7    | mult, multu, div, divu, mfhi, mflo             | ✓ |

@@ -83,10 +83,21 @@ module datapath (
 
     wire [63:0] mult_s  = $signed(rd1) * $signed(rd2);   // mult  (符号付き)
     wire [63:0] mult_u  = rd1 * rd2;                      // multu (符号なし)
-    wire [31:0] div_q_s = $signed(rd1) / $signed(rd2);   // div 商
-    wire [31:0] div_r_s = $signed(rd1) % $signed(rd2);   // div 余り
-    wire [31:0] div_q_u = rd1 / rd2;                      // divu 商
-    wire [31:0] div_r_u = rd1 % rd2;                      // divu 余り
+    // div (符号付き除算) を $signed() ではなく abs値+符号なし除算で実装する。
+    // $signed(a)/$signed(b) は符号付き除算器を合成し WNS=-22ns のタイミング違反を起こすが、
+    // 符号なし除算器 (divu と同じパス) は動作周波数を満たすため共有する。
+    wire [31:0] div_rs_abs   = rd1[31] ? (~rd1 + 1) : rd1;  // abs(rs)
+    wire [31:0] div_rt_abs   = rd2[31] ? (~rd2 + 1) : rd2;  // abs(rt)
+    // hilo_op==2'b10 (div) なら絶対値を入力、2'b11 (divu) ならそのまま
+    wire [31:0] div_in1      = (hilo_op == 2'b10) ? div_rs_abs : rd1;
+    wire [31:0] div_in2      = (hilo_op == 2'b10) ? div_rt_abs : rd2;
+    wire [31:0] div_q_common = div_in1 / div_in2;            // 符号なし商 (共用)
+    wire [31:0] div_r_common = div_in1 % div_in2;            // 符号なし余り (共用)
+    // div: 商の符号 = rs XOR rt の符号; 余りの符号 = rs の符号
+    wire [31:0] div_q_s = (rd1[31] ^ rd2[31]) ? (~div_q_common + 1) : div_q_common;
+    wire [31:0] div_r_s = rd1[31]             ? (~div_r_common + 1) : div_r_common;
+    wire [31:0] div_q_u = div_q_common;
+    wire [31:0] div_r_u = div_r_common;
 
     // ---- PC レジスタ ----
     reg [31:0] pc_reg;
