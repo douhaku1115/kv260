@@ -396,6 +396,91 @@ static void run_test7(void)
     mips_dump_regs(1, 11);
 }
 
+// ============================================================
+// Test 8: lb, lbu, lh, lhu, sb, sh (Step 8)
+// ============================================================
+// バイト/ハーフワードアクセス命令の動作確認 (ビッグエンディアン)。
+//
+// 【ビッグエンディアンのメモリレイアウト】
+//   sw $r(=0xDEADBEEF), 0($0) を実行すると:
+//     byte addr 0 → 0xDE (MSB)  mem[0][31:24]
+//     byte addr 1 → 0xAD        mem[0][23:16]
+//     byte addr 2 → 0xBE        mem[0][15:8]
+//     byte addr 3 → 0xEF (LSB)  mem[0][7:0]
+//
+// 実行順序:
+//   0x00: lui   $9, 0xDEAD        → $9 = 0xDEAD0000
+//   0x04: ori   $9, $9, 0xBEEF   → $9 = 0xDEADBEEF
+//   0x08: sw    $9, 0($0)         → mem[0] = 0xDEADBEEF
+//   0x0C: lb    $1, 0($0)         → byte0=0xDE → $1 = 0xFFFFFFDE (符号拡張)
+//   0x10: lbu   $2, 0($0)         → byte0=0xDE → $2 = 0x000000DE (ゼロ拡張)
+//   0x14: lh    $3, 0($0)         → half0=0xDEAD → $3 = 0xFFFFDEAD (符号拡張)
+//   0x18: lhu   $4, 0($0)         → half0=0xDEAD → $4 = 0x0000DEAD (ゼロ拡張)
+//   0x1C: lb    $5, 3($0)         → byte3=0xEF → $5 = 0xFFFFFFEF (符号拡張)
+//
+//   // sb で addr 4〜7 に 0x11/0x22/0x33/0x44 を1バイトずつ書き込む
+//   0x20: addi  $10, $0, 0x11     → $10 = 0x11
+//   0x24: sb    $10, 4($0)        → mem[1] byte0 (addr4) = 0x11
+//   0x28: addi  $10, $0, 0x22     → $10 = 0x22
+//   0x2C: sb    $10, 5($0)        → mem[1] byte1 (addr5) = 0x22
+//   0x30: addi  $10, $0, 0x33     → $10 = 0x33
+//   0x34: sb    $10, 6($0)        → mem[1] byte2 (addr6) = 0x33
+//   0x38: addi  $10, $0, 0x44     → $10 = 0x44
+//   0x3C: sb    $10, 7($0)        → mem[1] byte3 (addr7) = 0x44
+//   0x40: lw    $6, 4($0)         → $6 = 0x11223344
+//
+//   // sh で addr 8〜11 に 0xABCD/0x1234 を書き込む
+//   0x44: ori   $11, $0, 0xABCD   → $11 = 0x0000ABCD
+//   0x48: sh    $11, 8($0)        → mem[2] upper half = 0xABCD
+//   0x4C: ori   $12, $0, 0x1234   → $12 = 0x00001234
+//   0x50: sh    $12, 10($0)       → mem[2] lower half = 0x1234
+//   0x54: lw    $7, 8($0)         → $7 = 0xABCD1234
+//   0x58: j     0x58              → 無限ループ
+//
+// 期待値:
+//   $1 = 0xFFFFFFDE, $2 = 0x000000DE, $3 = 0xFFFFDEAD, $4 = 0x0000DEAD
+//   $5 = 0xFFFFFFEF, $6 = 0x11223344, $7 = 0xABCD1234
+static const u32 test8_program[] = {
+    0x3C09DEAD,  // lui   $9, 0xDEAD        → $9 = 0xDEAD0000
+    0x3529BEEF,  // ori   $9, $9, 0xBEEF   → $9 = 0xDEADBEEF
+    0xAC090000,  // sw    $9, 0($0)         → mem[0] = 0xDEADBEEF
+    0x80010000,  // lb    $1, 0($0)         → $1 = 0xFFFFFFDE
+    0x90020000,  // lbu   $2, 0($0)         → $2 = 0x000000DE
+    0x84030000,  // lh    $3, 0($0)         → $3 = 0xFFFFDEAD
+    0x94040000,  // lhu   $4, 0($0)         → $4 = 0x0000DEAD
+    0x80050003,  // lb    $5, 3($0)         → $5 = 0xFFFFFFEF
+    0x200A0011,  // addi  $10, $0, 0x11
+    0xA00A0004,  // sb    $10, 4($0)        → addr4 = 0x11
+    0x200A0022,  // addi  $10, $0, 0x22
+    0xA00A0005,  // sb    $10, 5($0)        → addr5 = 0x22
+    0x200A0033,  // addi  $10, $0, 0x33
+    0xA00A0006,  // sb    $10, 6($0)        → addr6 = 0x33
+    0x200A0044,  // addi  $10, $0, 0x44
+    0xA00A0007,  // sb    $10, 7($0)        → addr7 = 0x44
+    0x8C060004,  // lw    $6, 4($0)         → $6 = 0x11223344
+    0x340BABCD,  // ori   $11, $0, 0xABCD   → $11 = 0x0000ABCD
+    0xA40B0008,  // sh    $11, 8($0)        → upper half = 0xABCD
+    0x340C1234,  // ori   $12, $0, 0x1234   → $12 = 0x00001234
+    0xA40C000A,  // sh    $12, 10($0)       → lower half = 0x1234
+    0x8C070008,  // lw    $7, 8($0)         → $7 = 0xABCD1234
+    0x08000016,  // j     0x58              → 無限ループ
+};
+#define TEST8_COUNT  (sizeof(test8_program) / sizeof(test8_program[0]))
+
+static void run_test8(void)
+{
+    xil_printf("=== Test 8: lb, lbu, lh, lhu, sb, sh (big-endian) ===\r\n");
+
+    mips_reset();
+    mips_load_program(test8_program, TEST8_COUNT);
+    mips_run_cycles(100);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=0xFFFFFFDE, $2=0x000000DE, $3=0xFFFFDEAD, $4=0x0000DEAD\r\n");
+    xil_printf("          $5=0xFFFFFFEF, $6=0x11223344, $7=0xABCD1234\r\n");
+    mips_dump_regs(1, 7);
+}
+
 int main(void)
 {
     xil_printf("\r\n==== MIPS Processor Test ====\r\n\r\n");
@@ -412,6 +497,8 @@ int main(void)
     run_test6();
     xil_printf("\r\n");
     run_test7();
+    xil_printf("\r\n");
+    run_test8();
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }

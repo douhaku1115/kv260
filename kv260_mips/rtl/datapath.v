@@ -5,47 +5,42 @@
 // 【1クロックの処理の流れ】
 //
 //   PC → imem → [命令デコード] → regfile(読み出し)
-//        → ALU → dmem(lw/sw) → regfile(書き戻し) → PC更新
+//        → ALU → dmem(lw/sw等) → regfile(書き戻し) → PC更新
 //
 // 【PC更新ロジック (優先順位: jr > jump > branch > +4)】
 //
-//   jr    : PC ← rs レジスタの値 (jr $ra など)
-//   j/jal : PC ← {PC+4[31:28], addr26, 2'b00}  (26bitアドレス)
+//   jr    : PC ← rs レジスタの値
+//   j/jal : PC ← {PC+4[31:28], addr26, 2'b00}
 //   beq   : PC ← PC+4 + sign_extend(imm16)<<2  (条件成立時)
 //   bne   : PC ← PC+4 + sign_extend(imm16)<<2  (条件不成立時: rs≠rt)
 //   通常  : PC ← PC + 4
 //
 // 【jal の特別処理】
-//   jal は jump=1 かつ reg_write=1 で識別する (control.v参照)
-//   - 書き込み先レジスタ: $31 (ra レジスタ) に固定
-//   - 書き込みデータ:     PC+4 (関数呼び出しのリターンアドレス)
-//   jr で $31 に戻ることで関数呼び出し/復帰が実現できる
+//   jal は jump=1 かつ reg_write=1 で識別する。
+//   書き込み先: $31, 書き込みデータ: PC+4
 //
 // 【lui の特別処理】
-//   lui は opcode=001111 で検出し、ALUをバイパスして
-//   {imm16, 16'b0} を直接レジスタに書き戻す
-//
-// 【ori/andi/xori の即値ゼロ拡張】
-//   addi/lw/sw は符号拡張 (sign_imm)、ori/andi/xori はゼロ拡張 (zero_imm)
-//   imm_zero=1 のとき zero_imm を ALU 入力 B に使用する
-//
-// 【sll/srl/sra のシフト入力】
-//   shift_instr=1 のとき ALU 入力を切り替え:
-//     alu_a = rd2 (rt レジスタ = シフト対象の値)
-//     alu_b = {27'b0, shamt} (5bit シフト量をゼロ拡張)
-//
-// 【sllv/srlv/srav の可変シフト入力】
-//   var_shift_instr=1 のとき ALU 入力を切り替え:
-//     alu_a = rd2 (rt レジスタ = シフト対象の値)
-//     alu_b = rd1 (rs レジスタ = 可変シフト量: ALU は b[4:0] を使用)
+//   opcode=001111 で検出し、{imm16, 16'b0} を直接書き戻す。
 //
 // 【HI/LO レジスタ (mult/multu/div/divu/mfhi/mflo)】
-//   HI/LO は regfile 外の専用 32bit レジスタ。
-//   hilo_write=1 のクロックエッジで hilo_op に応じた演算結果を書き込む。
-//   mfhilo=1 のとき write_data = sel_hi ? HI : LO としてレジスタへ読み出す。
+//   hilo_write=1 のクロックエッジで演算結果を書き込む。
+//   mfhilo=1 のとき write_data = sel_hi ? HI : LO。
+//
+// 【バイト/ハーフワードアクセス (lb/lbu/lh/lhu/sb/sh) — ビッグエンディアン】
+//   書き込み (sb/sh):
+//     write_data_mem: バイト/ハーフワードを4回/2回複製して渡す
+//     byte_en: alu_result[1:0] と mem_size から生成
+//       sb addr[1:0]=00 → byte_en=4'b1000 (mem[31:24])
+//       sb addr[1:0]=01 → byte_en=4'b0100
+//       sb addr[1:0]=10 → byte_en=4'b0010
+//       sb addr[1:0]=11 → byte_en=4'b0001 (mem[7:0])
+//       sh addr[1]=0    → byte_en=4'b1100 (mem[31:16])
+//       sh addr[1]=1    → byte_en=4'b0011 (mem[15:0])
+//   読み出し (lb/lbu/lh/lhu):
+//     dmem から常にワード読み出し後、addr[1:0]/addr[1] でスライス+符号拡張
 //
 // 【halt 信号】
-//   halt=1 の間は PC が停止し、AXI経由でレジスタを安全に読み出せる
+//   halt=1 の間は PC が停止し、byte_en=0 で書き込みも禁止する。
 
 module datapath (
     input         clk,
@@ -53,27 +48,29 @@ module datapath (
     input         halt,
 
     // 制御信号 (control.v から入力)
-    input         reg_write,   // レジスタ書き込み許可
-    input         reg_dst,     // 書き込み先: 1=rd, 0=rt
-    input         alu_src,     // ALU入力B: 1=即値, 0=レジスタ
-    input         branch,      // beq 分岐有効
-    input         branch_ne,   // bne 分岐有効 (branch と排他的に使用)
-    input         mem_write,   // データメモリ書き込み (sw)
-    input         mem_to_reg,  // 書き戻し元: 1=メモリ, 0=ALU
-    input         jump,        // j/jal ジャンプ
-    input         jr,          // jr ジャンプレジスタ
-    input         imm_zero,    // 1=ゼロ拡張即値 (ori), 0=符号拡張即値
-    input  [3:0]  alu_control, // ALU演算種別
-    input         hilo_write,  // 1=HI/LOに書き込む (mult/multu/div/divu)
-    input  [1:0]  hilo_op,     // 00=mult,01=multu,10=div,11=divu
-    input         mfhilo,      // 1=HI/LOからレジスタへ読み出す (mfhi/mflo)
-    input         sel_hi,      // 1=HIレジスタ選択(mfhi), 0=LOレジスタ選択(mflo)
+    input         reg_write,
+    input         reg_dst,
+    input         alu_src,
+    input         branch,
+    input         branch_ne,
+    input         mem_write,
+    input         mem_to_reg,
+    input         jump,
+    input         jr,
+    input         imm_zero,
+    input  [3:0]  alu_control,
+    input         hilo_write,
+    input  [1:0]  hilo_op,
+    input         mfhilo,
+    input         sel_hi,
+    input  [1:0]  mem_size,      // 00=byte, 01=halfword, 10=word
+    input         mem_unsigned,  // 1=ゼロ拡張ロード (lbu/lhu), 0=符号拡張 (lb/lh)
 
-    // 命令メモリ (imem との接続)
+    // 命令メモリ
     output [31:0] pc,
     input  [31:0] instr,
 
-    // デバッグ用レジスタ読み出し (AXI経由でPS側から参照)
+    // デバッグ用レジスタ読み出し
     input  [4:0]  dbg_reg_addr,
     output [31:0] dbg_reg_data
 );
@@ -81,19 +78,14 @@ module datapath (
     // ---- HI/LO レジスタ ----
     reg [31:0] hi_reg, lo_reg;
 
-    wire [63:0] mult_s  = $signed(rd1) * $signed(rd2);   // mult  (符号付き)
-    wire [63:0] mult_u  = rd1 * rd2;                      // multu (符号なし)
-    // div (符号付き除算) を $signed() ではなく abs値+符号なし除算で実装する。
-    // $signed(a)/$signed(b) は符号付き除算器を合成し WNS=-22ns のタイミング違反を起こすが、
-    // 符号なし除算器 (divu と同じパス) は動作周波数を満たすため共有する。
-    wire [31:0] div_rs_abs   = rd1[31] ? (~rd1 + 1) : rd1;  // abs(rs)
-    wire [31:0] div_rt_abs   = rd2[31] ? (~rd2 + 1) : rd2;  // abs(rt)
-    // hilo_op==2'b10 (div) なら絶対値を入力、2'b11 (divu) ならそのまま
+    wire [63:0] mult_s  = $signed(rd1) * $signed(rd2);
+    wire [63:0] mult_u  = rd1 * rd2;
+    wire [31:0] div_rs_abs   = rd1[31] ? (~rd1 + 1) : rd1;
+    wire [31:0] div_rt_abs   = rd2[31] ? (~rd2 + 1) : rd2;
     wire [31:0] div_in1      = (hilo_op == 2'b10) ? div_rs_abs : rd1;
     wire [31:0] div_in2      = (hilo_op == 2'b10) ? div_rt_abs : rd2;
-    wire [31:0] div_q_common = div_in1 / div_in2;            // 符号なし商 (共用)
-    wire [31:0] div_r_common = div_in1 % div_in2;            // 符号なし余り (共用)
-    // div: 商の符号 = rs XOR rt の符号; 余りの符号 = rs の符号
+    wire [31:0] div_q_common = div_in1 / div_in2;
+    wire [31:0] div_r_common = div_in1 % div_in2;
     wire [31:0] div_q_s = (rd1[31] ^ rd2[31]) ? (~div_q_common + 1) : div_q_common;
     wire [31:0] div_r_s = rd1[31]             ? (~div_r_common + 1) : div_r_common;
     wire [31:0] div_q_u = div_q_common;
@@ -103,49 +95,38 @@ module datapath (
     reg [31:0] pc_reg;
     wire [31:0] pc_next, pc_plus4, pc_branch, pc_jump;
 
-    assign pc      = pc_reg;
+    assign pc       = pc_reg;
     assign pc_plus4 = pc_reg + 32'd4;
 
     // ---- 命令フィールド分解 ----
-    // MIPS 命令フォーマット:
-    //   R型: [31:26]=opcode [25:21]=rs [20:16]=rt [15:11]=rd [10:6]=shamt [5:0]=funct
-    //   I型: [31:26]=opcode [25:21]=rs [20:16]=rt [15:0]=imm16
-    //   J型: [31:26]=opcode [25:0]=addr26
     wire [4:0]  rs    = instr[25:21];
     wire [4:0]  rt    = instr[20:16];
     wire [4:0]  rd    = instr[15:11];
-    wire [4:0]  shamt = instr[10:6];   // シフト量 (sll/srl/sra で使用)
+    wire [4:0]  shamt = instr[10:6];
     wire [15:0] imm16  = instr[15:0];
     wire [25:0] addr26 = instr[25:0];
 
-    // 即値の符号拡張 (addi, lw, sw, beq, bne で使用)
     wire [31:0] sign_imm = {{16{imm16[15]}}, imm16};
-    // ゼロ拡張 (ori, andi, xori で使用: 上位16bitを0埋め)
     wire [31:0] zero_imm = {16'b0, imm16};
 
-    // sll/srl/sra 検出: opcode=000000 かつ funct が 000000/000010/000011
+    // sll/srl/sra 検出
     wire shift_instr = (instr[31:26] == 6'b000000) &&
                        ((instr[5:0] == 6'b000000) ||
                         (instr[5:0] == 6'b000010) ||
                         (instr[5:0] == 6'b000011));
 
-    // sllv/srlv/srav 検出: opcode=000000 かつ funct が 000100/000110/000111
-    // シフト量はシフト量フィールドではなく rs レジスタから取る
+    // sllv/srlv/srav 検出
     wire var_shift_instr = (instr[31:26] == 6'b000000) &&
                            ((instr[5:0] == 6'b000100) ||
                             (instr[5:0] == 6'b000110) ||
                             (instr[5:0] == 6'b000111));
 
     // ---- jal/lui 識別 ----
-    // jal: jump=1 かつ reg_write=1 (j は reg_write=0 なので区別できる)
     wire jal_instr = jump & reg_write;
-    // lui: opcode=001111 (control.v で imm_zero=0 のまま処理するため datapath 側で識別)
     wire lui_instr = (instr[31:26] == 6'b001111);
 
     // ---- レジスタファイル ----
-    // jal: 書き込み先を $31 (ra) に固定、書き込み値を PC+4 にする
-    // 他:  reg_dst=1 なら rd (R型)、0 なら rt (I型)
-    wire [4:0]  write_reg  = jal_instr ? 5'd31 : (reg_dst ? rd : rt);
+    wire [4:0]  write_reg = jal_instr ? 5'd31 : (reg_dst ? rd : rt);
     wire [31:0] rd1, rd2, dbg_rd3;
     wire [31:0] write_data;
 
@@ -165,16 +146,12 @@ module datapath (
     assign dbg_reg_data = dbg_rd3;
 
     // ---- ALU ----
-    // shift_instr(sll/srl/sra) のとき: a=rd2(rt シフト対象), b={27'b0,shamt}
-    // var_shift_instr(sllv/srlv/srav) のとき: a=rd2(rt シフト対象), b=rd1(rs 可変シフト量)
-    // I型即値のとき: a=rd1(rs), b=zero_imm(ゼロ拡張) or sign_imm(符号拡張)
-    // R型レジスタのとき: a=rd1(rs), b=rd2(rt)
-    wire [31:0] alu_a      = (shift_instr | var_shift_instr) ? rd2 : rd1;
-    wire [31:0] alu_b      = shift_instr     ? {27'b0, shamt}                   :
-                             var_shift_instr  ? rd1                               :
-                             alu_src          ? (imm_zero ? zero_imm : sign_imm) : rd2;
+    wire [31:0] alu_a = (shift_instr | var_shift_instr) ? rd2 : rd1;
+    wire [31:0] alu_b = shift_instr    ? {27'b0, shamt}                   :
+                        var_shift_instr ? rd1                               :
+                        alu_src         ? (imm_zero ? zero_imm : sign_imm) : rd2;
     wire [31:0] alu_result;
-    wire        alu_zero;  // 結果=0 なら 1 (beq の分岐判定に使用)
+    wire        alu_zero;
 
     alu alu_inst (
         .a(alu_a),
@@ -184,46 +161,78 @@ module datapath (
         .zero(alu_zero)
     );
 
-    // ---- データメモリ (lw/sw) ----
-    // アドレス = ALU結果 (ベースレジスタ + 符号拡張オフセット)
-    // halt 中は書き込み禁止 (AXIデバッグ読み出し中の誤書き込み防止)
+    // ---- データメモリ (lw/sw/lb/lbu/lh/lhu/sb/sh) ----
+
+    // byte_en 生成 (ビッグエンディアン)
+    // halt 中は書き込み禁止
+    reg [3:0] byte_en;
+    always @(*) begin
+        if (!(mem_write & ~halt))
+            byte_en = 4'b0000;
+        else case (mem_size)
+            2'b00: // sb: バイト単位
+                case (alu_result[1:0])
+                    2'b00: byte_en = 4'b1000; // offset 0 → mem[31:24]
+                    2'b01: byte_en = 4'b0100; // offset 1 → mem[23:16]
+                    2'b10: byte_en = 4'b0010; // offset 2 → mem[15:8]
+                    2'b11: byte_en = 4'b0001; // offset 3 → mem[7:0]
+                endcase
+            2'b01: // sh: ハーフワード単位
+                byte_en = alu_result[1] ? 4'b0011 : 4'b1100;
+            default: // sw: ワード
+                byte_en = 4'b1111;
+        endcase
+    end
+
+    // 書き込みデータのバイト複製 (byte_en で必要なバイトのみ確定)
+    wire [31:0] write_data_mem = (mem_size == 2'b00) ? {4{rd2[7:0]}}  : // sb
+                                 (mem_size == 2'b01) ? {2{rd2[15:0]}} : // sh
+                                                        rd2;             // sw
+
     wire [31:0] mem_read_data;
 
     dmem dmem_inst (
         .clk(clk),
-        .mem_write(mem_write & ~halt),
+        .byte_en(byte_en),
         .addr(alu_result),
-        .write_data(rd2),
+        .write_data(write_data_mem),
         .read_data(mem_read_data)
     );
 
+    // 読み出しデータのスライスと符号/ゼロ拡張 (ビッグエンディアン)
+    wire [7:0] mem_byte =
+        (alu_result[1:0] == 2'b00) ? mem_read_data[31:24] :
+        (alu_result[1:0] == 2'b01) ? mem_read_data[23:16] :
+        (alu_result[1:0] == 2'b10) ? mem_read_data[15: 8] :
+                                      mem_read_data[ 7: 0];
+
+    wire [15:0] mem_half =
+        alu_result[1] ? mem_read_data[15:0] : mem_read_data[31:16];
+
+    wire [31:0] mem_data_final =
+        (mem_size == 2'b00) ? (mem_unsigned ? {24'b0,          mem_byte}
+                                            : {{24{mem_byte[7]}}, mem_byte}) :
+        (mem_size == 2'b01) ? (mem_unsigned ? {16'b0,          mem_half}
+                                            : {{16{mem_half[15]}}, mem_half}) :
+                               mem_read_data;
+
     // ---- レジスタ書き戻しデータの選択 ----
-    // jal    : PC+4 (リターンアドレスを $31 に保存)
-    // lui    : {imm16, 16'b0} (上位16bitに即値をセット、ALUバイパス)
-    // mfhi/lo: HI または LO レジスタの値
-    // lw     : メモリ読み出しデータ
-    // その他 : ALU演算結果
     assign write_data = jal_instr  ? pc_plus4                   :
                         lui_instr  ? {imm16, 16'b0}              :
                         mfhilo     ? (sel_hi ? hi_reg : lo_reg)  :
-                        mem_to_reg ? mem_read_data                :
+                        mem_to_reg ? mem_data_final               :
                                      alu_result;
 
     // ---- PC 次値の計算 ----
-    // beq: PC+4 + 符号拡張(imm16)<<2  (ワード単位オフセット)
-    // j/jal: {PC+4の上位4bit, addr26, 2'b00}  (同一 256MB セグメント内)
     assign pc_branch = pc_plus4 + (sign_imm << 2);
     assign pc_jump   = {pc_plus4[31:28], addr26, 2'b00};
 
-    // beq: rs==rt (alu_zero=1) のとき分岐
-    // bne: rs!=rt (alu_zero=0) のとき分岐
-    wire branch_taken = (branch & alu_zero) | (branch_ne & ~alu_zero);
+    wire branch_taken    = (branch & alu_zero) | (branch_ne & ~alu_zero);
     wire [31:0] pc_branch_mux = branch_taken ? pc_branch : pc_plus4;
 
-    // PC選択 MUX (優先順位: jr > jump > branch/通常)
-    assign pc_next = jr   ? rd1     :  // jr: PC = rs レジスタ
-                     jump ? pc_jump :  // j/jal: 26bitアドレスジャンプ
-                            pc_branch_mux; // beq or PC+4
+    assign pc_next = jr   ? rd1     :
+                     jump ? pc_jump :
+                            pc_branch_mux;
 
     // ---- PC レジスタ更新 ----
     always @(posedge clk) begin
@@ -240,10 +249,10 @@ module datapath (
             lo_reg <= 32'b0;
         end else if (hilo_write & ~halt) begin
             case (hilo_op)
-                2'b00: {hi_reg, lo_reg} <= mult_s;                          // mult
-                2'b01: {hi_reg, lo_reg} <= mult_u;                          // multu
-                2'b10: begin hi_reg <= div_r_s; lo_reg <= div_q_s; end      // div
-                2'b11: begin hi_reg <= div_r_u; lo_reg <= div_q_u; end      // divu
+                2'b00: {hi_reg, lo_reg} <= mult_s;
+                2'b01: {hi_reg, lo_reg} <= mult_u;
+                2'b10: begin hi_reg <= div_r_s; lo_reg <= div_q_s; end
+                2'b11: begin hi_reg <= div_r_u; lo_reg <= div_q_u; end
             endcase
         end
     end

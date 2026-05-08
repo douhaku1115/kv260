@@ -93,20 +93,6 @@ PS (ARM) ──AXI4-Lite──► mips_axi ──► mips_top
 
 > **sll/srl/sra** は rs フィールドを無視し、shamt[10:6] をシフト量として使用する
 
-### Step 7 — HI/LO レジスタ・乗除算命令
-
-| 命令  | 形式 | funct  | 動作                                         |
-|------|------|--------|---------------------------------------------|
-| mult | R型  | 011000 | {HI,LO} = $signed(rs) × $signed(rt)         |
-| multu| R型  | 011001 | {HI,LO} = rs × rt (符号なし)                 |
-| div  | R型  | 011010 | LO = $signed(rs) / $signed(rt), HI = 余り    |
-| divu | R型  | 011011 | LO = rs / rt (符号なし), HI = 余り            |
-| mfhi | R型  | 010000 | rd = HI                                     |
-| mflo | R型  | 010010 | rd = LO                                     |
-
-> HI/LO は regfile 外の専用 32bit レジスタ。  
-> **タイミング注意**: 32bit 組み合わせ除算器のクリティカルパスが約 42ns のため、クロックを 20MHz に設定している（rebuild.tcl の clk_wiz 設定）。
-
 ### Step 6 — 符号なし演算・NOR・可変シフト命令
 
 | 命令  | 形式 | opcode / funct | 動作                                    |
@@ -123,6 +109,34 @@ PS (ARM) ──AXI4-Lite──► mips_axi ──► mips_top
 > **sllv/srlv/srav** はシフト量を shamt フィールドではなく **rs レジスタの下位 5bit** から取る（datapath.v で切り替え）  
 > **sltiu** は即値を符号拡張した後、符号なし整数として比較する
 
+### Step 7 — HI/LO レジスタ・乗除算命令
+
+| 命令  | 形式 | funct  | 動作                                         |
+|------|------|--------|---------------------------------------------|
+| mult | R型  | 011000 | {HI,LO} = $signed(rs) × $signed(rt)         |
+| multu| R型  | 011001 | {HI,LO} = rs × rt (符号なし)                 |
+| div  | R型  | 011010 | LO = $signed(rs) / $signed(rt), HI = 余り    |
+| divu | R型  | 011011 | LO = rs / rt (符号なし), HI = 余り            |
+| mfhi | R型  | 010000 | rd = HI                                     |
+| mflo | R型  | 010010 | rd = LO                                     |
+
+> HI/LO は regfile 外の専用 32bit レジスタ。  
+> **タイミング注意**: 32bit 組み合わせ除算器のクリティカルパスが約 42ns のため、クロックを 20MHz に設定している（rebuild.tcl の clk_wiz 設定）。
+
+### Step 8 — バイト/ハーフワードメモリアクセス命令
+
+| 命令  | 形式 | opcode   | 動作                                          |
+|------|------|----------|---------------------------------------------|
+| lb   | I型  | op=100000 | rt = sign_extend(mem[rs+imm][7:0])          |
+| lbu  | I型  | op=100100 | rt = zero_extend(mem[rs+imm][7:0])          |
+| lh   | I型  | op=100001 | rt = sign_extend(mem[rs+imm][15:0])         |
+| lhu  | I型  | op=100101 | rt = zero_extend(mem[rs+imm][15:0])         |
+| sb   | I型  | op=101000 | mem[rs+imm][7:0] = rt[7:0]                 |
+| sh   | I型  | op=101001 | mem[rs+imm][15:0] = rt[15:0]               |
+
+> **ビッグエンディアン** (MIPS 標準)。バイトアドレス offset 0 が MSB 側 (mem[31:24])。  
+> dmem.v はバイトイネーブル書き込み対応。`mem_size[1:0]` と `addr[1:0]` から byte_en を生成。
+
 ---
 
 ## ファイル構成
@@ -135,11 +149,11 @@ kv260_mips/
 │   ├── control.v     — 制御ユニット (メインデコーダ + ALUデコーダ)
 │   ├── datapath.v    — データパス (PC・レジスタ・ALU・メモリ)
 │   ├── imem.v        — 命令メモリ (4096ワード / 16KB, デュアルポートRAM)
-│   ├── dmem.v        — データメモリ (lw/sw 用)
+│   ├── dmem.v        — データメモリ (lw/sw/lb/lbu/lh/lhu/sb/sh 用, バイトイネーブル付き)
 │   ├── regfile.v     — レジスタファイル ($0〜$31)
 │   └── alu.v         — ALU (add/sub/and/or/slt/sltu/xor/nor/sll/srl/sra)
 ├── vitis_src/
-│   └── main.c        — PS 側テストプログラム (Step 1〜7)
+│   └── main.c        — PS 側テストプログラム (Step 1〜8)
 ├── rebuild.tcl       — Vivado バッチ再ビルドスクリプト
 └── README.md         — 本ファイル
 ```
@@ -217,3 +231,4 @@ controls[8:0]:
 | 5    | andi, xori, slti, addiu, sll, srl, sra | ✓ |
 | 6    | addu, subu, sltu, sltiu, nor, sllv, srlv, srav | ✓ |
 | 7    | mult, multu, div, divu, mfhi, mflo             | ✓ |
+| 8    | lb, lbu, lh, lhu, sb, sh (ビッグエンディアン)   | ✓ |

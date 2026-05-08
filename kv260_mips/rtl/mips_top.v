@@ -15,7 +15,7 @@
 //         │      └──── jal: $31 ← PC+4 ─────┘        │
 //         └──────────────────────────────────────────┘
 //
-// 【実装済み命令セット (Step 1〜7)】
+// 【実装済み命令セット (Step 1〜8)】
 //
 //  Step 1: addi, add, sub, and, or, slt
 //  Step 2: lw, sw, beq
@@ -24,6 +24,7 @@
 //  Step 5: andi, xori, slti, addiu, sll, srl, sra
 //  Step 6: addu, subu, sltu, sltiu, nor, sllv, srlv, srav
 //  Step 7: mult, multu, div, divu, mfhi, mflo
+//  Step 8: lb, lbu, lh, lhu, sb, sh (バイト/ハーフワードアクセス, ビッグエンディアン)
 //
 // 【外部インターフェース】
 //   - PS(ARM)側から AXI 経由でプログラムロード・実行制御・デバッグ読み出し
@@ -35,12 +36,12 @@ module mips_top (
     input         reset,
     input         halt,
 
-    // 命令メモリ書き込みポート (PS側からプログラムをロードする)
+    // 命令メモリ書き込みポート
     input         imem_we,
     input  [11:0] imem_waddr,
     input  [31:0] imem_wdata,
 
-    // デバッグ出力 (AXI経由でPS側から読み出す)
+    // デバッグ出力
     output [31:0] pc,
     input  [4:0]  dbg_reg_addr,
     output [31:0] dbg_reg_data
@@ -48,24 +49,26 @@ module mips_top (
 
     wire [31:0] instr;
 
-    // 制御信号 (control → datapath)
-    wire        reg_write;   // レジスタ書き込み許可
-    wire        reg_dst;     // 書き込み先レジスタ: 1=rd (R型), 0=rt (I型)
-    wire        alu_src;     // ALU入力B: 1=即値, 0=レジスタ
-    wire        branch;      // beq 分岐命令
-    wire        branch_ne;   // bne 分岐命令
-    wire        mem_write;   // データメモリ書き込み許可 (sw)
-    wire        mem_to_reg;  // レジスタ書き戻し元: 1=メモリ, 0=ALU結果
-    wire        jump;        // j/jal ジャンプ命令
-    wire        jr;          // jr ジャンプレジスタ命令
-    wire        imm_zero;    // ゼロ拡張即値選択 (ori用)
-    wire [3:0]  alu_control; // ALU演算種別
-    wire        hilo_write;  // HI/LO書き込み許可 (mult/multu/div/divu)
-    wire [1:0]  hilo_op;     // HI/LO演算種別
-    wire        mfhilo;      // mfhi/mflo フラグ
-    wire        sel_hi;      // 1=mfhi, 0=mflo
+    // 制御信号
+    wire        reg_write;
+    wire        reg_dst;
+    wire        alu_src;
+    wire        branch;
+    wire        branch_ne;
+    wire        mem_write;
+    wire        mem_to_reg;
+    wire        jump;
+    wire        jr;
+    wire        imm_zero;
+    wire [3:0]  alu_control;
+    wire        hilo_write;
+    wire [1:0]  hilo_op;
+    wire        mfhilo;
+    wire        sel_hi;
+    wire [1:0]  mem_size;      // 00=byte, 01=halfword, 10=word
+    wire        mem_unsigned;  // 1=ゼロ拡張ロード (lbu/lhu)
 
-    // 命令メモリ (256ワード x 32bit デュアルポートRAM)
+    // 命令メモリ
     imem imem_inst (
         .addr_a(pc),
         .instr(instr),
@@ -75,7 +78,7 @@ module mips_top (
         .din_b(imem_wdata)
     );
 
-    // 制御ユニット (opcode/funct → 制御信号)
+    // 制御ユニット
     control ctrl (
         .opcode(instr[31:26]),
         .funct(instr[5:0]),
@@ -93,10 +96,12 @@ module mips_top (
         .hilo_write(hilo_write),
         .hilo_op(hilo_op),
         .mfhilo(mfhilo),
-        .sel_hi(sel_hi)
+        .sel_hi(sel_hi),
+        .mem_size(mem_size),
+        .mem_unsigned(mem_unsigned)
     );
 
-    // データパス (レジスタ・ALU・メモリ・PC更新)
+    // データパス
     datapath dp (
         .clk(clk),
         .reset(reset),
@@ -116,6 +121,8 @@ module mips_top (
         .hilo_op(hilo_op),
         .mfhilo(mfhilo),
         .sel_hi(sel_hi),
+        .mem_size(mem_size),
+        .mem_unsigned(mem_unsigned),
         .pc(pc),
         .instr(instr),
         .dbg_reg_addr(dbg_reg_addr),
