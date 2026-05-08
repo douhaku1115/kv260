@@ -93,6 +93,36 @@ PS (ARM) ──AXI4-Lite──► mips_axi ──► mips_top
 
 > **sll/srl/sra** は rs フィールドを無視し、shamt[10:6] をシフト量として使用する
 
+### Step 7 — HI/LO レジスタ・乗除算命令
+
+| 命令  | 形式 | funct  | 動作                                         |
+|------|------|--------|---------------------------------------------|
+| mult | R型  | 011000 | {HI,LO} = $signed(rs) × $signed(rt)         |
+| multu| R型  | 011001 | {HI,LO} = rs × rt (符号なし)                 |
+| div  | R型  | 011010 | LO = $signed(rs) / $signed(rt), HI = 余り    |
+| divu | R型  | 011011 | LO = rs / rt (符号なし), HI = 余り            |
+| mfhi | R型  | 010000 | rd = HI                                     |
+| mflo | R型  | 010010 | rd = LO                                     |
+
+> HI/LO は regfile 外の専用 32bit レジスタ。  
+> **タイミング注意**: 32bit 組み合わせ除算器のクリティカルパスが約 42ns のため、クロックを 20MHz に設定している（rebuild.tcl の clk_wiz 設定）。
+
+### Step 6 — 符号なし演算・NOR・可変シフト命令
+
+| 命令  | 形式 | opcode / funct | 動作                                    |
+|------|------|----------------|----------------------------------------|
+| addu | R型  | fn=100001      | rd = rs + rt (オーバーフロー無視)         |
+| subu | R型  | fn=100011      | rd = rs - rt (オーバーフロー無視)         |
+| sltu | R型  | fn=101011      | rd = (rs < rt) ? 1 : 0 (符号なし比較)   |
+| sltiu| I型  | op=001011      | rt = (rs < sign_imm) ? 1 : 0 (符号なし) |
+| nor  | R型  | fn=100111      | rd = ~(rs \| rt)                       |
+| sllv | R型  | fn=000100      | rd = rt << rs[4:0] (可変シフト量)        |
+| srlv | R型  | fn=000110      | rd = rt >> rs[4:0] (論理, 可変)          |
+| srav | R型  | fn=000111      | rd = rt >>> rs[4:0] (算術, 可変)         |
+
+> **sllv/srlv/srav** はシフト量を shamt フィールドではなく **rs レジスタの下位 5bit** から取る（datapath.v で切り替え）  
+> **sltiu** は即値を符号拡張した後、符号なし整数として比較する
+
 ---
 
 ## ファイル構成
@@ -107,9 +137,9 @@ kv260_mips/
 │   ├── imem.v        — 命令メモリ (4096ワード / 16KB, デュアルポートRAM)
 │   ├── dmem.v        — データメモリ (lw/sw 用)
 │   ├── regfile.v     — レジスタファイル ($0〜$31)
-│   └── alu.v         — ALU (add/sub/and/or/slt/xor/sll/srl/sra)
+│   └── alu.v         — ALU (add/sub/and/or/slt/sltu/xor/nor/sll/srl/sra)
 ├── vitis_src/
-│   └── main.c        — PS 側テストプログラム (Step 1〜5)
+│   └── main.c        — PS 側テストプログラム (Step 1〜7)
 ├── rebuild.tcl       — Vivado バッチ再ビルドスクリプト
 └── README.md         — 本ファイル
 ```
@@ -164,13 +194,15 @@ controls[8:0]:
 |--------|------|---------|
 | 0000   | AND  | and, andi |
 | 0001   | OR   | or, ori |
-| 0010   | ADD  | add, addi, addiu, lw, sw |
-| 0110   | SUB  | sub, beq, bne |
+| 0010   | ADD  | add, addu, addi, addiu, lw, sw |
+| 0110   | SUB  | sub, subu, beq, bne |
 | 0111   | SLT  | slt, slti |
 | 1000   | XOR  | xori |
-| 1001   | SLL  | sll |
-| 1010   | SRL  | srl |
-| 1011   | SRA  | sra |
+| 1001   | SLL  | sll, sllv |
+| 1010   | SRL  | srl, srlv |
+| 1011   | SRA  | sra, srav |
+| 1100   | SLTU | sltu, sltiu |
+| 1101   | NOR  | nor |
 
 ---
 
@@ -183,3 +215,5 @@ controls[8:0]:
 | 3    | j, jal, jr              | ✓    |
 | 4    | lui, ori, bne (ループ5回) | ✓   |
 | 5    | andi, xori, slti, addiu, sll, srl, sra | ✓ |
+| 6    | addu, subu, sltu, sltiu, nor, sllv, srlv, srav | ✓ |
+| 7    | mult, multu, div, divu, mfhi, mflo             | ✓ |

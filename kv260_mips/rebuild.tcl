@@ -1,5 +1,11 @@
 open_project E:/fpga/kria260/kv260_mips/project_1/project_1.xpr
 
+# clk_wiz を 20MHz に設定（32bit 除算器のタイミング対策: 50MHz では WNS=-22ns）
+open_bd_design [get_files design_1.bd]
+set_property CONFIG.CLKOUT1_REQUESTED_OUT_FREQ 20 [get_bd_cells clk_wiz_0]
+validate_bd_design
+save_bd_design
+
 # インクリメンタル合成の設定を無効化
 set_property AUTO_INCREMENTAL_CHECKPOINT 0 [get_runs synth_1]
 set_property INCREMENTAL_CHECKPOINT {} [get_runs synth_1]

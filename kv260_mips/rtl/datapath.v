@@ -34,6 +34,16 @@
 //     alu_a = rd2 (rt レジスタ = シフト対象の値)
 //     alu_b = {27'b0, shamt} (5bit シフト量をゼロ拡張)
 //
+// 【sllv/srlv/srav の可変シフト入力】
+//   var_shift_instr=1 のとき ALU 入力を切り替え:
+//     alu_a = rd2 (rt レジスタ = シフト対象の値)
+//     alu_b = rd1 (rs レジスタ = 可変シフト量: ALU は b[4:0] を使用)
+//
+// 【HI/LO レジスタ (mult/multu/div/divu/mfhi/mflo)】
+//   HI/LO は regfile 外の専用 32bit レジスタ。
+//   hilo_write=1 のクロックエッジで hilo_op に応じた演算結果を書き込む。
+//   mfhilo=1 のとき write_data = sel_hi ? HI : LO としてレジスタへ読み出す。
+//
 // 【halt 信号】
 //   halt=1 の間は PC が停止し、AXI経由でレジスタを安全に読み出せる
 
@@ -54,6 +64,10 @@ module datapath (
     input         jr,          // jr ジャンプレジスタ
     input         imm_zero,    // 1=ゼロ拡張即値 (ori), 0=符号拡張即値
     input  [3:0]  alu_control, // ALU演算種別
+    input         hilo_write,  // 1=HI/LOに書き込む (mult/multu/div/divu)
+    input  [1:0]  hilo_op,     // 00=mult,01=multu,10=div,11=divu
+    input         mfhilo,      // 1=HI/LOからレジスタへ読み出す (mfhi/mflo)
+    input         sel_hi,      // 1=HIレジスタ選択(mfhi), 0=LOレジスタ選択(mflo)
 
     // 命令メモリ (imem との接続)
     output [31:0] pc,
@@ -63,6 +77,27 @@ module datapath (
     input  [4:0]  dbg_reg_addr,
     output [31:0] dbg_reg_data
 );
+
+    // ---- HI/LO レジスタ ----
+    reg [31:0] hi_reg, lo_reg;
+
+    wire [63:0] mult_s  = $signed(rd1) * $signed(rd2);   // mult  (符号付き)
+    wire [63:0] mult_u  = rd1 * rd2;                      // multu (符号なし)
+    // div (符号付き除算) を $signed() ではなく abs値+符号なし除算で実装する。
+    // $signed(a)/$signed(b) は符号付き除算器を合成し WNS=-22ns のタイミング違反を起こすが、
+    // 符号なし除算器 (divu と同じパス) は動作周波数を満たすため共有する。
+    wire [31:0] div_rs_abs   = rd1[31] ? (~rd1 + 1) : rd1;  // abs(rs)
+    wire [31:0] div_rt_abs   = rd2[31] ? (~rd2 + 1) : rd2;  // abs(rt)
+    // hilo_op==2'b10 (div) なら絶対値を入力、2'b11 (divu) ならそのまま
+    wire [31:0] div_in1      = (hilo_op == 2'b10) ? div_rs_abs : rd1;
+    wire [31:0] div_in2      = (hilo_op == 2'b10) ? div_rt_abs : rd2;
+    wire [31:0] div_q_common = div_in1 / div_in2;            // 符号なし商 (共用)
+    wire [31:0] div_r_common = div_in1 % div_in2;            // 符号なし余り (共用)
+    // div: 商の符号 = rs XOR rt の符号; 余りの符号 = rs の符号
+    wire [31:0] div_q_s = (rd1[31] ^ rd2[31]) ? (~div_q_common + 1) : div_q_common;
+    wire [31:0] div_r_s = rd1[31]             ? (~div_r_common + 1) : div_r_common;
+    wire [31:0] div_q_u = div_q_common;
+    wire [31:0] div_r_u = div_r_common;
 
     // ---- PC レジスタ ----
     reg [31:0] pc_reg;
@@ -94,6 +129,13 @@ module datapath (
                         (instr[5:0] == 6'b000010) ||
                         (instr[5:0] == 6'b000011));
 
+    // sllv/srlv/srav 検出: opcode=000000 かつ funct が 000100/000110/000111
+    // シフト量はシフト量フィールドではなく rs レジスタから取る
+    wire var_shift_instr = (instr[31:26] == 6'b000000) &&
+                           ((instr[5:0] == 6'b000100) ||
+                            (instr[5:0] == 6'b000110) ||
+                            (instr[5:0] == 6'b000111));
+
     // ---- jal/lui 識別 ----
     // jal: jump=1 かつ reg_write=1 (j は reg_write=0 なので区別できる)
     wire jal_instr = jump & reg_write;
@@ -123,12 +165,14 @@ module datapath (
     assign dbg_reg_data = dbg_rd3;
 
     // ---- ALU ----
-    // shift_instr のとき: a=rd2(シフト対象), b=shamt(シフト量)
-    // I型即値のとき: b=zero_imm(ゼロ拡張) or sign_imm(符号拡張)
+    // shift_instr(sll/srl/sra) のとき: a=rd2(rt シフト対象), b={27'b0,shamt}
+    // var_shift_instr(sllv/srlv/srav) のとき: a=rd2(rt シフト対象), b=rd1(rs 可変シフト量)
+    // I型即値のとき: a=rd1(rs), b=zero_imm(ゼロ拡張) or sign_imm(符号拡張)
     // R型レジスタのとき: a=rd1(rs), b=rd2(rt)
-    wire [31:0] alu_a      = shift_instr ? rd2 : rd1;
-    wire [31:0] alu_b      = shift_instr  ? {27'b0, shamt}                    :
-                             alu_src       ? (imm_zero ? zero_imm : sign_imm) : rd2;
+    wire [31:0] alu_a      = (shift_instr | var_shift_instr) ? rd2 : rd1;
+    wire [31:0] alu_b      = shift_instr     ? {27'b0, shamt}                   :
+                             var_shift_instr  ? rd1                               :
+                             alu_src          ? (imm_zero ? zero_imm : sign_imm) : rd2;
     wire [31:0] alu_result;
     wire        alu_zero;  // 結果=0 なら 1 (beq の分岐判定に使用)
 
@@ -154,13 +198,15 @@ module datapath (
     );
 
     // ---- レジスタ書き戻しデータの選択 ----
-    // jal   : PC+4 (リターンアドレスを $31 に保存)
-    // lui   : {imm16, 16'b0} (上位16bitに即値をセット、ALUバイパス)
-    // lw    : メモリ読み出しデータ
-    // その他: ALU演算結果
-    assign write_data = jal_instr  ? pc_plus4          :
-                        lui_instr  ? {imm16, 16'b0}    :
-                        mem_to_reg ? mem_read_data      :
+    // jal    : PC+4 (リターンアドレスを $31 に保存)
+    // lui    : {imm16, 16'b0} (上位16bitに即値をセット、ALUバイパス)
+    // mfhi/lo: HI または LO レジスタの値
+    // lw     : メモリ読み出しデータ
+    // その他 : ALU演算結果
+    assign write_data = jal_instr  ? pc_plus4                   :
+                        lui_instr  ? {imm16, 16'b0}              :
+                        mfhilo     ? (sel_hi ? hi_reg : lo_reg)  :
+                        mem_to_reg ? mem_read_data                :
                                      alu_result;
 
     // ---- PC 次値の計算 ----
@@ -185,6 +231,21 @@ module datapath (
             pc_reg <= 32'b0;
         else if (!halt)
             pc_reg <= pc_next;
+    end
+
+    // ---- HI/LO レジスタ更新 ----
+    always @(posedge clk) begin
+        if (reset) begin
+            hi_reg <= 32'b0;
+            lo_reg <= 32'b0;
+        end else if (hilo_write & ~halt) begin
+            case (hilo_op)
+                2'b00: {hi_reg, lo_reg} <= mult_s;                          // mult
+                2'b01: {hi_reg, lo_reg} <= mult_u;                          // multu
+                2'b10: begin hi_reg <= div_r_s; lo_reg <= div_q_s; end      // div
+                2'b11: begin hi_reg <= div_r_u; lo_reg <= div_q_u; end      // divu
+            endcase
+        end
     end
 
 endmodule

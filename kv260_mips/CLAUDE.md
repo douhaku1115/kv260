@@ -1,29 +1,17 @@
 # KV260 MIPS プロジェクト — 現在の状態
 
 ## 現在地
-**Step 5 完了・git push 待ち**
+**Step 7 完了・push済み**
 
-- Step 1〜5: 実機動作確認済み
-- 次の作業: git commit & push → 次の Step を検討
+- Step 1〜7: 実機動作確認済み、origin/master の kv260_mips/ に push 済み
+- 次: Step 8 の実装
+- クロック: 20MHz（32bit 組み合わせ除算器のタイミング対策、rebuild.tcl で設定）
 
-## Step 5 で追加する命令（7命令）
+## 今後のロードマップ
 
-### Group A — control.v の case 追加のみ
-| 命令  | opcode   | 動作                        |
-|------|----------|---------------------------|
-| andi | 001100   | rt = rs & zero_extend(imm) |
-| xori | 001110   | rt = rs ^ zero_extend(imm) |
-| slti | 001010   | rt = (rs < sign_imm) ? 1:0 |
-| addiu| 001001   | rt = rs + imm（オーバーフロー無視）|
-
-### Group B — datapath / ALU 変更必要
-| 命令  | funct  | 動作                     |
-|------|--------|--------------------------|
-| sll  | 000000 | rd = rt << shamt         |
-| srl  | 000010 | rd = rt >> shamt（論理）  |
-| sra  | 000011 | rd = rt >>> shamt（算術） |
-
-> xori は ALU に XOR 追加、sll/srl/sra は shamt フィールドを datapath に配線する必要あり
+### Step 8（dmem バイト enable 対応）
+lb, lbu, lh, lhu, sb, sh
+- dmem.v にバイト/ハーフワード enable 対応が必要
 
 ## 標準フロー（毎 Step）
 1. RTL 変更
@@ -36,5 +24,5 @@
 - Vivado: `E:\vivado\2025.2\Vivado\bin\vivado.bat`
 - プロジェクト: `E:\fpga\kria260\kv260_mips\`
 - XSA: `E:\fpga\kria260\kv260_mips\project_1\design_1_wrapper.xsa`
-- Vitis WS: `E:\Xilinx\project_vitis\kv_mips2`（kv_mips は古い）
+- Vitis WS: `E:\Xilinx\project_vitis\kv_mips8`（kv_mips2〜7 は古い）
 - git: https://github.com/douhaku1115/kv260.git

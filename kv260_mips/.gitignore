@@ -3,6 +3,7 @@ project_1/
 
 # Vitis workspace
 vitis_workspace/
+_ide/
 
 # Temporary files
 *.jou

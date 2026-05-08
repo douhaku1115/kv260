@@ -285,6 +285,117 @@ static void run_test5(void)
     mips_dump_regs(1, 7);
 }
 
+// ============================================================
+// Test 6: addu, subu, sltu, sltiu, nor, sllv, srlv, srav (Step 6)
+// ============================================================
+// 符号なし演算、NOR、可変シフト命令の動作確認。
+//
+// 実行順序:
+//   0x00: addi  $1, $0, 5        → $1 = 5
+//   0x04: addi  $2, $0, 3        → $2 = 3
+//   0x08: addu  $3, $1, $2       → $3 = 8   (5+3)
+//   0x0C: subu  $4, $1, $2       → $4 = 2   (5-3)
+//   0x10: sltu  $5, $2, $1       → $5 = 1   (3 < 5 符号なし → 1)
+//   0x14: sltiu $6, $1, 10       → $6 = 1   (5 < 10 符号なし → 1)
+//   0x18: nor   $7, $1, $2       → $7 = ~(5|3) = 0xFFFFFFF8
+//   0x1C: addi  $8, $0, 4        → $8 = 4   (シフト量)
+//   0x20: sllv  $9, $1, $8       → $9 = 5 << 4 = 80 = 0x50
+//   0x24: srlv  $10, $7, $8      → $10 = 0xFFFFFFF8 >> 4 = 0x0FFFFFFF (論理)
+//   0x28: srav  $11, $7, $8      → $11 = 0xFFFFFFF8 >>> 4 = 0xFFFFFFFF (算術)
+//   0x2C: j     0x2C             → 無限ループ
+//
+// 期待値: $3=8, $4=2, $5=1, $6=1, $7=0xFFFFFFF8, $8=4, $9=0x50,
+//         $10=0x0FFFFFFF, $11=0xFFFFFFFF
+static const u32 test6_program[] = {
+    0x20010005,  // addi  $1, $0, 5
+    0x20020003,  // addi  $2, $0, 3
+    0x00221821,  // addu  $3, $1, $2       → $3 = 8
+    0x00222023,  // subu  $4, $1, $2       → $4 = 2
+    0x0041282B,  // sltu  $5, $2, $1       → $5 = 1  (3 < 5 符号なし)
+    0x2C26000A,  // sltiu $6, $1, 10       → $6 = 1  (5 < 10 符号なし)
+    0x00223827,  // nor   $7, $1, $2       → $7 = 0xFFFFFFF8
+    0x20080004,  // addi  $8, $0, 4        → $8 = 4  (シフト量)
+    0x01014804,  // sllv  $9, $1, $8       → $9 = 5 << 4 = 0x50
+    0x01075006,  // srlv  $10, $7, $8      → $10 = 0x0FFFFFFF
+    0x01075807,  // srav  $11, $7, $8      → $11 = 0xFFFFFFFF
+    0x0800000B,  // j     0x2C             → 無限ループ
+};
+#define TEST6_COUNT  (sizeof(test6_program) / sizeof(test6_program[0]))
+
+static void run_test6(void)
+{
+    xil_printf("=== Test 6: addu, subu, sltu, sltiu, nor, sllv, srlv, srav ===\r\n");
+
+    mips_reset();
+    mips_load_program(test6_program, TEST6_COUNT);
+    mips_run_cycles(100);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $3=8, $4=2, $5=1, $6=1, $7=0xFFFFFFF8\r\n");
+    xil_printf("          $8=4, $9=0x50, $10=0x0FFFFFFF, $11=0xFFFFFFFF\r\n");
+    mips_dump_regs(1, 11);
+}
+
+// ============================================================
+// Test 7: mult, multu, div, divu, mfhi, mflo (Step 7)
+// ============================================================
+// HI/LOレジスタを使う乗除算命令の動作確認。
+//
+// 実行順序:
+//   0x00: addi  $1, $0, 10          → $1 = 10
+//   0x04: addi  $2, $0, 3           → $2 = 3
+//   0x08: mult  $1, $2              → {HI,LO} = 10*3 = 30 → HI=0, LO=30
+//   0x0C: mflo  $3                  → $3 = 30
+//   0x10: mfhi  $4                  → $4 = 0
+//   0x14: div   $1, $2              → LO=10/3=3, HI=10%3=1
+//   0x18: mflo  $5                  → $5 = 3
+//   0x1C: mfhi  $6                  → $6 = 1
+//   0x20: lui   $7, 0x8000          → $7 = 0x80000000
+//   0x24: multu $7, $2              → {HI,LO} = 0x80000000*3 = 0x180000000
+//                                       HI=1, LO=0x80000000
+//   0x28: mflo  $8                  → $8 = 0x80000000
+//   0x2C: mfhi  $9                  → $9 = 1
+//   0x30: divu  $7, $2              → LO=0x80000000/3=0x2AAAAAAA, HI=2
+//   0x34: mflo  $10                 → $10 = 0x2AAAAAAA
+//   0x38: mfhi  $11                 → $11 = 2
+//   0x3C: j     0x3C                → 無限ループ
+//
+// 期待値: $3=30, $4=0, $5=3, $6=1, $7=0x80000000,
+//         $8=0x80000000, $9=1, $10=0x2AAAAAAA, $11=2
+static const u32 test7_program[] = {
+    0x2001000A,  // addi  $1, $0, 10
+    0x20020003,  // addi  $2, $0, 3
+    0x00220018,  // mult  $1, $2         → {HI,LO} = 30
+    0x00001812,  // mflo  $3             → $3 = 30
+    0x00002010,  // mfhi  $4             → $4 = 0
+    0x0022001A,  // div   $1, $2         → LO=3, HI=1
+    0x00002812,  // mflo  $5             → $5 = 3
+    0x00003010,  // mfhi  $6             → $6 = 1
+    0x3C078000,  // lui   $7, 0x8000     → $7 = 0x80000000
+    0x00E20019,  // multu $7, $2         → {HI,LO} = 0x180000000
+    0x00004012,  // mflo  $8             → $8 = 0x80000000
+    0x00004810,  // mfhi  $9             → $9 = 1
+    0x00E2001B,  // divu  $7, $2         → LO=0x2AAAAAAA, HI=2
+    0x00005012,  // mflo  $10            → $10 = 0x2AAAAAAA
+    0x00005810,  // mfhi  $11            → $11 = 2
+    0x0800000F,  // j     0x3C           → 無限ループ
+};
+#define TEST7_COUNT  (sizeof(test7_program) / sizeof(test7_program[0]))
+
+static void run_test7(void)
+{
+    xil_printf("=== Test 7: mult, multu, div, divu, mfhi, mflo ===\r\n");
+
+    mips_reset();
+    mips_load_program(test7_program, TEST7_COUNT);
+    mips_run_cycles(100);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $3=30, $4=0, $5=3, $6=1, $7=0x80000000\r\n");
+    xil_printf("          $8=0x80000000, $9=1, $10=0x2AAAAAAA, $11=2\r\n");
+    mips_dump_regs(1, 11);
+}
+
 int main(void)
 {
     xil_printf("\r\n==== MIPS Processor Test ====\r\n\r\n");
@@ -297,6 +408,10 @@ int main(void)
     run_test4();
     xil_printf("\r\n");
     run_test5();
+    xil_printf("\r\n");
+    run_test6();
+    xil_printf("\r\n");
+    run_test7();
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }
