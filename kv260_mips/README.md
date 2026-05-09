@@ -166,16 +166,13 @@ mips-linux-gnu-gcc (Ubuntu 12.x) — ビッグエンディアン MIPS1
 #   → ディレイスロット非実装の本ハードウェアで正常動作
 ```
 
-**テストプログラム (step10/test10.c)**
+**ハードウェア制約 (Cプログラム作成時の注意)**
 
-```c
-static int add(int a, int b) { return a + b; }
-int main(void) {
-    int x = add(10, 20);   // x = 30
-    int y = add(x, x);     // y = 60
-    return y;              // $v0 = 60
-}
-```
+| 制約 | 理由 |
+|------|------|
+| グローバル変数・static変数 **使用不可** | .data/.rodata は imem 領域に配置されるが lw は dmem しか読めない (Harvard アーキテクチャ) |
+| ローカル変数 (スタック) のみ使用可 | dmem は 0x000〜0x3FF の 1KB、`$sp = 0x3FC` で初期化済み |
+| `-O0` 固定 | `-O2` ではディレイスロットに有効命令が入り、本HWで結果が狂う |
 
 **起動シーケンス (step10/crt0.S)**
 
@@ -186,6 +183,106 @@ _start:
     nop                  # ディレイスロット (本HWではスキップ、無害)
 _halt:
     j _halt
+```
+
+---
+
+## C言語実行の流れ
+
+新しい C プログラムを MIPS コアで動かすまでのフローを説明する。
+
+### 全体の流れ
+
+```
+[1] tests/*.c を作成/編集
+        ↓
+[2] WSL で build_all.sh を実行
+        ↓  (mips-linux-gnu-gcc でコンパイル → uint32 配列を生成)
+[3] vitis_src/main.c が自動更新される
+        ↓
+[4] Vitis でプロジェクトをビルド
+        ↓
+[5] KV260 実機で実行 → UART でテスト結果確認
+```
+
+### ステップ詳細
+
+#### [1] C テストプログラムを作成する
+
+`step10/tests/` フォルダに `.c` ファイルを作成する。
+
+```c
+// DESCRIPTION: フィボナッチ数列 fib(10)
+// EXPECTED: 55
+int main(void) {
+    int a = 0, b = 1;
+    for (int i = 0; i < 9; i++) {
+        int t = a + b;
+        a = b;
+        b = t;
+    }
+    return b;   // $v0 = 55
+}
+```
+
+**書き方のルール:**
+- 先頭に `// DESCRIPTION:` と `// EXPECTED:` コメントを書く（結果表示に使われる）
+- グローバル変数・static変数は使わない（ローカル変数のみ）
+- `return` した値が `$v0` としてレポートされる
+
+#### [2] WSL でビルドスクリプトを実行する
+
+```bash
+# WSL を開いて実行
+cd /mnt/e/fpga/kria260/kv260_mips/step10
+bash build_all.sh
+```
+
+内部では `update_main.py` が呼ばれ:
+1. `tests/*.c` を全て `mips-linux-gnu-gcc -O0` でコンパイル
+2. 生成したバイナリを uint32 配列に変換
+3. `vitis_src/main.c` の `AUTO-GENERATED BEGIN〜END` マーカー間を自動書き換え
+
+#### [3] vitis_src/main.c の変化を確認する
+
+`vitis_src/main.c` 内の以下のマーカー区間が新しいテスト関数で置き換わる:
+
+```c
+// ==== AUTO-GENERATED C TESTS BEGIN (step10/build_all.sh) ====
+
+static const u32 prog_fibonacci[] = { 0x27BDFFFC, ... };
+static void run_c_fibonacci(void) { ... }
+
+static void run_all_c_tests(void) {
+    run_c_fibonacci();
+    run_c_factorial();
+    ...
+}
+
+// ==== AUTO-GENERATED C TESTS END ====
+```
+
+#### [4] Vitis でリビルド & 書き込む
+
+1. Vitis を開く（ワークスペース: `E:\Xilinx\project_vitis\kv_mips11`）
+2. `kv_mips_app` を右クリック → **Build** (ハンマーアイコン)
+3. **Run** (再生ボタン) → KV260 に書き込み実行
+
+#### [5] UART でテスト結果を確認する
+
+シリアルターミナル（115200bps）に以下のように出力される:
+
+```
+==== C Program Tests ====
+
+--- C: フィボナッチ数列 fib(10) ---
+PC = 0x00000044
+Expected: $v0 = 55
+  $v0 = 0x00000037 (55)  ← OK
+
+--- C: 階乗 fact(7) ---
+Expected: $v0 = 5040
+  $v0 = 0x000013B0 (5040)  ← OK
 ```
 
 ---
@@ -204,11 +301,19 @@ kv260_mips/
 │   ├── regfile.v     — レジスタファイル ($0〜$31)
 │   └── alu.v         — ALU (add/sub/and/or/slt/sltu/xor/nor/sll/srl/sra)
 ├── step10/
-│   ├── crt0.S        — ベアメタルスタートアップ (_start → main)
-│   ├── test10.c      — C テストプログラム (add 関数)
-│   ├── mips.ld       — リンカスクリプト (0x0000 起点)
-│   ├── build.sh      — ビルドスクリプト (WSL 用)
-│   └── bin2array.py  — バイナリ → uint32 配列変換ツール
+│   ├── crt0.S           — ベアメタルスタートアップ (_start → main, $sp初期化)
+│   ├── mips.ld          — リンカスクリプト (0x0000 起点, note セクション破棄)
+│   ├── build.sh         — 単体ビルドスクリプト (WSL 用)
+│   ├── build_all.sh     — テスト一括ビルド → main.c 自動更新 (WSL 用)
+│   ├── update_main.py   — C→バイナリ→uint32配列変換 & main.c 書き換えスクリプト
+│   ├── test10.c         — 最初のテストプログラム (add 関数, $v0=60)
+│   ├── bin2array.py     — バイナリ → uint32 配列変換ツール (単体用)
+│   └── tests/           — 一括実行テストプログラム
+│       ├── fibonacci.c  — fib(10) → $v0=55
+│       ├── factorial.c  — fact(7) → $v0=5040
+│       ├── sum_loop.c   — sum(1..10) → $v0=55
+│       ├── bubble_sort.c— バブルソート最小値 → $v0=1
+│       └── gcd.c        — gcd(48,18) → $v0=6
 ├── vitis_src/
 │   └── main.c        — PS 側テストプログラム (Step 1〜10)
 ├── rebuild.tcl       — Vivado バッチ再ビルドスクリプト
