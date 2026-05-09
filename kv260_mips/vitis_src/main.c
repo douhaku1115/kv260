@@ -560,6 +560,88 @@ static void run_test9(void)
     mips_dump_regs(4, 9);
 }
 
+// ============================================================
+// Test 10: C言語実行 (Step 10)
+// ============================================================
+// mips-linux-gnu-gcc でコンパイルした C プログラムを実行する。
+//
+// ソース (step10/test10.c):
+//   static int add(int a, int b) { return a + b; }
+//   int main(void) {
+//       int x = add(10, 20);   // x = 30
+//       int y = add(x, x);     // y = 60
+//       return y;
+//   }
+//
+// コンパイル: mips-linux-gnu-gcc -mips1 -mfp32 -EB -O0
+//             -ffreestanding -nostdlib -nostartfiles -fno-pic -mno-abicalls
+//             -Wl,-T,mips.ld -o test10.elf crt0.S test10.c
+//
+// 注: -O0 でコンパイルするとディレイスロットが NOP になり、
+//     ディレイスロット非実装の本ハードウェアで正常動作する。
+//
+// 期待値: $2 ($v0) = 60 (0x3C)
+static const u32 test10_program[] = {
+    0x3C1D0000,  // [  0] 0x0000  _start: lui sp, 0x0
+    0x37BD03FC,  // [  1] 0x0004          ori sp, sp, 0x3FC   ($sp = 0x3FC = dmem top)
+    0x03A0F025,  // [  2] 0x0008          move s8, sp
+    0x0C000016,  // [  3] 0x000C          jal 0x58 <main>
+    0x00000000,  // [  4] 0x0010          nop                  (delay slot)
+    0x08000005,  // [  5] 0x0014  _halt:  j _halt
+    0x00000000,  // [  6] 0x0018          nop
+    0x00000000,  // [  7] 0x001C          nop
+    0x27BDFFF8,  // [  8] 0x0020  add:    addiu sp, sp, -8
+    0xAFBE0004,  // [  9] 0x0024          sw s8, 4(sp)
+    0x03A0F025,  // [ 10] 0x0028          move s8, sp
+    0xAFC40008,  // [ 11] 0x002C          sw a0, 8(s8)
+    0xAFC5000C,  // [ 12] 0x0030          sw a1, 12(s8)
+    0x8FC30008,  // [ 13] 0x0034          lw v1, 8(s8)
+    0x8FC2000C,  // [ 14] 0x0038          lw v0, 12(s8)
+    0x00000000,  // [ 15] 0x003C          nop
+    0x00621021,  // [ 16] 0x0040          addu v0, v1, v0      ($v0 = a + b)
+    0x03C0E825,  // [ 17] 0x0044          move sp, s8
+    0x8FBE0004,  // [ 18] 0x0048          lw s8, 4(sp)
+    0x27BD0008,  // [ 19] 0x004C          addiu sp, sp, 8
+    0x03E00008,  // [ 20] 0x0050          jr ra
+    0x00000000,  // [ 21] 0x0054          nop                  (delay slot)
+    0x27BDFFE0,  // [ 22] 0x0058  main:   addiu sp, sp, -32
+    0xAFBF001C,  // [ 23] 0x005C          sw ra, 28(sp)
+    0xAFBE0018,  // [ 24] 0x0060          sw s8, 24(sp)
+    0x03A0F025,  // [ 25] 0x0064          move s8, sp
+    0x24050014,  // [ 26] 0x0068          li a1, 20
+    0x2404000A,  // [ 27] 0x006C          li a0, 10
+    0x0C000008,  // [ 28] 0x0070          jal 0x20 <add>       (add(10,20) → $v0=30)
+    0x00000000,  // [ 29] 0x0074          nop                  (delay slot)
+    0xAFC20010,  // [ 30] 0x0078          sw v0, 16(s8)        (x = 30)
+    0x8FC50010,  // [ 31] 0x007C          lw a1, 16(s8)        (a1 = x)
+    0x8FC40010,  // [ 32] 0x0080          lw a0, 16(s8)        (a0 = x)
+    0x0C000008,  // [ 33] 0x0084          jal 0x20 <add>       (add(x,x) → $v0=60)
+    0x00000000,  // [ 34] 0x0088          nop                  (delay slot)
+    0xAFC20014,  // [ 35] 0x008C          sw v0, 20(s8)        (y = 60)
+    0x8FC20014,  // [ 36] 0x0090          lw v0, 20(s8)        (return y)
+    0x03C0E825,  // [ 37] 0x0094          move sp, s8
+    0x8FBF001C,  // [ 38] 0x0098          lw ra, 28(sp)
+    0x8FBE0018,  // [ 39] 0x009C          lw s8, 24(sp)
+    0x27BD0020,  // [ 40] 0x00A0          addiu sp, sp, 32
+    0x03E00008,  // [ 41] 0x00A4          jr ra
+    0x00000000,  // [ 42] 0x00A8          nop                  (delay slot)
+    0x00000000,  // [ 43] 0x00AC          nop
+};
+#define TEST10_COUNT  (sizeof(test10_program) / sizeof(test10_program[0]))
+
+static void run_test10(void)
+{
+    xil_printf("=== Test 10: C language (add(10,20)=30, add(30,30)=60) ===\r\n");
+
+    mips_reset();
+    mips_load_program(test10_program, TEST10_COUNT);
+    mips_run_cycles(200);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $2(v0) = 60 (0x0000003C)\r\n");
+    xil_printf("  $2(v0) = 0x%08x (%d)\r\n", mips_read_reg(2), mips_read_reg(2));
+}
+
 int main(void)
 {
     xil_printf("\r\n==== MIPS Processor Test ====\r\n\r\n");
@@ -580,6 +662,8 @@ int main(void)
     run_test8();
     xil_printf("\r\n");
     run_test9();
+    xil_printf("\r\n");
+    run_test10();
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }

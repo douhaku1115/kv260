@@ -149,6 +149,45 @@ PS (ARM) ──AXI4-Lite──► mips_axi ──► mips_top
 > **ビッグエンディアン** (MIPS 標準)。バイトアドレス offset 0 が MSB 側 (mem[31:24])。  
 > dmem.v はバイトイネーブル書き込み対応。`mem_size[1:0]` と `addr[1:0]` から byte_en を生成。
 
+### Step 10 — C言語実行
+
+RTL 変更なし。mips-linux-gnu-gcc でコンパイルした C プログラムを MIPS コアで実行する。
+
+**コンパイル環境 (WSL Ubuntu 24.04)**
+
+```bash
+# ツールチェイン
+mips-linux-gnu-gcc (Ubuntu 12.x) — ビッグエンディアン MIPS1
+
+# コンパイルフラグ
+-mips1 -mfp32 -EB -O0 -ffreestanding -nostdlib -nostartfiles -fno-pic -mno-abicalls
+
+# -O0 を使う理由: ディレイスロットが NOP で埋まる
+#   → ディレイスロット非実装の本ハードウェアで正常動作
+```
+
+**テストプログラム (step10/test10.c)**
+
+```c
+static int add(int a, int b) { return a + b; }
+int main(void) {
+    int x = add(10, 20);   // x = 30
+    int y = add(x, x);     // y = 60
+    return y;              // $v0 = 60
+}
+```
+
+**起動シーケンス (step10/crt0.S)**
+
+```asm
+_start:
+    ori $sp, $0, 0x3FC   # $sp = 0x3FC (dmem 256ワード = 1KB の末尾)
+    jal main
+    nop                  # ディレイスロット (本HWではスキップ、無害)
+_halt:
+    j _halt
+```
+
 ---
 
 ## ファイル構成
@@ -164,8 +203,14 @@ kv260_mips/
 │   ├── dmem.v        — データメモリ (lw/sw/lb/lbu/lh/lhu/sb/sh 用, バイトイネーブル付き)
 │   ├── regfile.v     — レジスタファイル ($0〜$31)
 │   └── alu.v         — ALU (add/sub/and/or/slt/sltu/xor/nor/sll/srl/sra)
+├── step10/
+│   ├── crt0.S        — ベアメタルスタートアップ (_start → main)
+│   ├── test10.c      — C テストプログラム (add 関数)
+│   ├── mips.ld       — リンカスクリプト (0x0000 起点)
+│   ├── build.sh      — ビルドスクリプト (WSL 用)
+│   └── bin2array.py  — バイナリ → uint32 配列変換ツール
 ├── vitis_src/
-│   └── main.c        — PS 側テストプログラム (Step 1〜9)
+│   └── main.c        — PS 側テストプログラム (Step 1〜10)
 ├── rebuild.tcl       — Vivado バッチ再ビルドスクリプト
 └── README.md         — 本ファイル
 ```
@@ -245,3 +290,4 @@ controls[8:0]:
 | 7    | mult, multu, div, divu, mfhi, mflo             | ✓ |
 | 8    | lb, lbu, lh, lhu, sb, sh (ビッグエンディアン)   | ✓ |
 | 9    | bltz, bgez, blez, bgtz (rs と 0 の比較分岐)    | ✓ |
+| 10   | C言語実行 (mips-gcc コンパイル, 関数呼び出し・スタック) | ✓ |
