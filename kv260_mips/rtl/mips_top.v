@@ -25,6 +25,7 @@
 //  Step 6: addu, subu, sltu, sltiu, nor, sllv, srlv, srav
 //  Step 7: mult, multu, div, divu, mfhi, mflo
 //  Step 8: lb, lbu, lh, lhu, sb, sh (バイト/ハーフワードアクセス, ビッグエンディアン)
+//  Step 9: blez, bgtz, bltz, bgez (rs と 0 の比較分岐)
 //
 // 【外部インターフェース】
 //   - PS(ARM)側から AXI 経由でプログラムロード・実行制御・デバッグ読み出し
@@ -55,6 +56,10 @@ module mips_top (
     wire        alu_src;
     wire        branch;
     wire        branch_ne;
+    wire        branch_ltz;
+    wire        branch_gez;
+    wire        branch_lez;
+    wire        branch_gtz;
     wire        mem_write;
     wire        mem_to_reg;
     wire        jump;
@@ -82,11 +87,16 @@ module mips_top (
     control ctrl (
         .opcode(instr[31:26]),
         .funct(instr[5:0]),
+        .rt(instr[20:16]),
         .reg_write(reg_write),
         .reg_dst(reg_dst),
         .alu_src(alu_src),
         .branch(branch),
         .branch_ne(branch_ne),
+        .branch_ltz(branch_ltz),
+        .branch_gez(branch_gez),
+        .branch_lez(branch_lez),
+        .branch_gtz(branch_gtz),
         .mem_write(mem_write),
         .mem_to_reg(mem_to_reg),
         .jump(jump),
@@ -111,6 +121,10 @@ module mips_top (
         .alu_src(alu_src),
         .branch(branch),
         .branch_ne(branch_ne),
+        .branch_ltz(branch_ltz),
+        .branch_gez(branch_gez),
+        .branch_lez(branch_lez),
+        .branch_gtz(branch_gtz),
         .mem_write(mem_write),
         .mem_to_reg(mem_to_reg),
         .jump(jump),

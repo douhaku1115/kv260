@@ -481,6 +481,85 @@ static void run_test8(void)
     mips_dump_regs(1, 7);
 }
 
+// ============================================================
+// Test 9: blez, bgtz, bltz, bgez (Step 9)
+// ============================================================
+// rs と 0 を比較する条件分岐命令の動作確認。
+// 各命令について「分岐成立」と「分岐不成立」の両方を検証する。
+//
+// 実行順序:
+//   0x00: addi $1, $0, -5   → $1 = -5  (負数)
+//   0x04: addi $2, $0, 5    → $2 = 5   (正数)
+//   0x08: addi $3, $0, 0    → $3 = 0   (ゼロ)
+//
+//   // bltz $1 (-5 < 0 → taken)
+//   0x0C: bltz $1, +1       → taken, 0x10 をスキップ
+//   0x10: addi $4, $0, 99   → SKIPPED
+//   0x14: addi $4, $0, 1    → $4 = 1 (taken の証拠)
+//
+//   // bgez $2 (5 >= 0 → taken)
+//   0x18: bgez $2, +1       → taken, 0x1C をスキップ
+//   0x1C: addi $5, $0, 99   → SKIPPED
+//   0x20: addi $5, $0, 2    → $5 = 2
+//
+//   // blez $3 (0 <= 0 → taken)
+//   0x24: blez $3, +1       → taken, 0x28 をスキップ
+//   0x28: addi $6, $0, 99   → SKIPPED
+//   0x2C: addi $6, $0, 3    → $6 = 3
+//
+//   // bgtz $2 (5 > 0 → taken)
+//   0x30: bgtz $2, +1       → taken, 0x34 をスキップ
+//   0x34: addi $7, $0, 99   → SKIPPED
+//   0x38: addi $7, $0, 4    → $7 = 4
+//
+//   // bltz $2 (5 < 0? NO → not taken)
+//   0x3C: bltz $2, +1       → NOT taken
+//   0x40: addi $8, $0, 5    → EXECUTED → $8 = 5
+//
+//   // blez $2 (5 <= 0? NO → not taken)
+//   0x44: blez $2, +1       → NOT taken
+//   0x48: addi $9, $0, 6    → EXECUTED → $9 = 6
+//
+//   0x4C: j 0x4C            → 無限ループ
+//
+// 期待値: $4=1, $5=2, $6=3, $7=4, $8=5, $9=6
+static const u32 test9_program[] = {
+    0x2001FFFB,  // addi  $1, $0, -5
+    0x20020005,  // addi  $2, $0, 5
+    0x20030000,  // addi  $3, $0, 0
+    0x04200001,  // bltz  $1, +1       → taken (-5<0)
+    0x20040063,  // addi  $4, $0, 99  → SKIPPED
+    0x20040001,  // addi  $4, $0, 1   → $4 = 1
+    0x04410001,  // bgez  $2, +1      → taken (5>=0)
+    0x20050063,  // addi  $5, $0, 99  → SKIPPED
+    0x20050002,  // addi  $5, $0, 2   → $5 = 2
+    0x18600001,  // blez  $3, +1      → taken (0<=0)
+    0x20060063,  // addi  $6, $0, 99  → SKIPPED
+    0x20060003,  // addi  $6, $0, 3   → $6 = 3
+    0x1C400001,  // bgtz  $2, +1      → taken (5>0)
+    0x20070063,  // addi  $7, $0, 99  → SKIPPED
+    0x20070004,  // addi  $7, $0, 4   → $7 = 4
+    0x04400001,  // bltz  $2, +1      → NOT taken (5>=0)
+    0x20080005,  // addi  $8, $0, 5   → EXECUTED → $8 = 5
+    0x18400001,  // blez  $2, +1      → NOT taken (5>0)
+    0x20090006,  // addi  $9, $0, 6   → EXECUTED → $9 = 6
+    0x08000013,  // j     0x4C        → 無限ループ
+};
+#define TEST9_COUNT  (sizeof(test9_program) / sizeof(test9_program[0]))
+
+static void run_test9(void)
+{
+    xil_printf("=== Test 9: blez, bgtz, bltz, bgez ===\r\n");
+
+    mips_reset();
+    mips_load_program(test9_program, TEST9_COUNT);
+    mips_run_cycles(100);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $4=1, $5=2, $6=3, $7=4, $8=5, $9=6\r\n");
+    mips_dump_regs(4, 9);
+}
+
 int main(void)
 {
     xil_printf("\r\n==== MIPS Processor Test ====\r\n\r\n");
@@ -499,6 +578,8 @@ int main(void)
     run_test7();
     xil_printf("\r\n");
     run_test8();
+    xil_printf("\r\n");
+    run_test9();
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }

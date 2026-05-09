@@ -123,6 +123,18 @@ PS (ARM) ──AXI4-Lite──► mips_axi ──► mips_top
 > HI/LO は regfile 外の専用 32bit レジスタ。  
 > **タイミング注意**: 32bit 組み合わせ除算器のクリティカルパスが約 42ns のため、クロックを 20MHz に設定している（rebuild.tcl の clk_wiz 設定）。
 
+### Step 9 — rs と 0 の比較分岐命令
+
+| 命令  | 形式 | opcode        | 動作                               |
+|------|------|---------------|------------------------------------|
+| bltz | I型  | op=000001/rt=0 | if (rs < 0) PC += imm<<2          |
+| bgez | I型  | op=000001/rt=1 | if (rs >= 0) PC += imm<<2         |
+| blez | I型  | op=000110     | if (rs <= 0) PC += imm<<2         |
+| bgtz | I型  | op=000111     | if (rs > 0) PC += imm<<2          |
+
+> **bltz/bgez** は opcode=0x01 (REGIMM) の共通エンコーディングで、rt フィールドで命令を区別する。  
+> 分岐条件は `rs` の符号ビット (`rd1[31]`) と ゼロ判定 (`rd1==0`) から組み合わせて判定する。ALU 結果は使用しない。
+
 ### Step 8 — バイト/ハーフワードメモリアクセス命令
 
 | 命令  | 形式 | opcode   | 動作                                          |
@@ -153,7 +165,7 @@ kv260_mips/
 │   ├── regfile.v     — レジスタファイル ($0〜$31)
 │   └── alu.v         — ALU (add/sub/and/or/slt/sltu/xor/nor/sll/srl/sra)
 ├── vitis_src/
-│   └── main.c        — PS 側テストプログラム (Step 1〜8)
+│   └── main.c        — PS 側テストプログラム (Step 1〜9)
 ├── rebuild.tcl       — Vivado バッチ再ビルドスクリプト
 └── README.md         — 本ファイル
 ```
@@ -232,3 +244,4 @@ controls[8:0]:
 | 6    | addu, subu, sltu, sltiu, nor, sllv, srlv, srav | ✓ |
 | 7    | mult, multu, div, divu, mfhi, mflo             | ✓ |
 | 8    | lb, lbu, lh, lhu, sb, sh (ビッグエンディアン)   | ✓ |
+| 9    | bltz, bgez, blez, bgtz (rs と 0 の比較分岐)    | ✓ |

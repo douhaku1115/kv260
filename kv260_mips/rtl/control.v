@@ -10,21 +10,22 @@
 //
 // 【メインデコーダ 真理値表】
 //
-//   命令  | opcode   | IZ RW RD AS BR MW MR BN JP | alu_op | jr | HW HO MF SH | SZ SU
-//   ------+----------+-----------------------------+--------+----+-------------+------
-//   R型   | 000000   |  0  1  1  0  0  0  0  0  0 | 010    |  0 |  0  -  0  - | 10  -
-//   jr    | 000000   |  0  0  x  x  0  0  x  0  0 | 010    |  1 |  0  -  0  - | 10  -
-//   mult  | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 00  0  - | 10  -
-//   multu | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 01  0  - | 10  -
-//   div   | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 10  0  - | 10  -
-//   divu  | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 11  0  - | 10  -
-//   mfhi  | 000000   |  0  1  1  0  0  0  0  0  0 | 010    |  0 |  0  -  1  1 | 10  -
-//   mflo  | 000000   |  0  1  1  0  0  0  0  0  0 | 010    |  0 |  0  -  1  0 | 10  -
+//   命令  | opcode   | IZ RW RD AS BR MW MR BN JP | alu_op | jr | HW HO MF SH | SZ SU | LT GE LE GT
+//   ------+----------+-----------------------------+--------+----+-------------+-------+-----------
+//   R型   | 000000   |  0  1  1  0  0  0  0  0  0 | 010    |  0 |  0  -  0  - | 10  - |  0  0  0  0
+//   jr    | 000000   |  0  0  x  x  0  0  x  0  0 | 010    |  1 |  0  -  0  - | 10  - |  0  0  0  0
+//   mult  | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 00  0  - | 10  - |  0  0  0  0
+//   multu | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 01  0  - | 10  - |  0  0  0  0
+//   div   | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 10  0  - | 10  - |  0  0  0  0
+//   divu  | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 11  0  - | 10  - |  0  0  0  0
+//   mfhi  | 000000   |  0  1  1  0  0  0  0  0  0 | 010    |  0 |  0  -  1  1 | 10  - |  0  0  0  0
+//   mflo  | 000000   |  0  1  1  0  0  0  0  0  0 | 010    |  0 |  0  -  1  0 | 10  - |  0  0  0  0
 //
 //   HW=hilo_write, HO=hilo_op[1:0], MF=mfhilo, SH=sel_hi
 //   SZ=mem_size[1:0](00=byte/01=half/10=word), SU=mem_unsigned(1=ゼロ拡張)
+//   LT=branch_ltz, GE=branch_gez, LE=branch_lez, GT=branch_gtz
 //
-//   addi  | 001000   |  0  1  0  1  0  0  0  0  0 | 000    |  0 | ...         | 10  -
+//   addi  | 001000   |  0  1  0  1  0  0  0  0  0 | 000    |  0 | ...         | 10  - |  0  0  0  0
 //   addiu | 001001   |  0  1  0  1  0  0  0  0  0 | 000    |  0
 //   slti  | 001010   |  0  1  0  1  0  0  0  0  0 | 110    |  0
 //   sltiu | 001011   |  0  1  0  1  0  0  0  0  0 | 111    |  0
@@ -40,13 +41,18 @@
 //   sw    | 101011   |  0  0  x  1  0  1  x  0  0 | 000    |  0 | ...         | 10  -
 //   sb    | 101000   |  0  0  x  1  0  1  x  0  0 | 000    |  0 | ...         | 00  -
 //   sh    | 101001   |  0  0  x  1  0  1  x  0  0 | 000    |  0 | ...         | 01  -
-//   beq   | 000100   |  0  0  x  0  1  0  x  0  0 | 001    |  0
-//   bne   | 000101   |  0  0  x  0  0  0  x  1  0 | 001    |  0
+//   beq   | 000100   |  0  0  x  0  1  0  x  0  0 | 001    |  0 | ...         |    - |  0  0  0  0
+//   bne   | 000101   |  0  0  x  0  0  0  x  1  0 | 001    |  0 | ...         |    - |  0  0  0  0
+//   bltz  | 000001/0 |  0  0  x  0  0  0  x  0  0 | 000    |  0 | ...         |    - |  1  0  0  0
+//   bgez  | 000001/1 |  0  0  x  0  0  0  x  0  0 | 000    |  0 | ...         |    - |  0  1  0  0
+//   blez  | 000110   |  0  0  x  0  0  0  x  0  0 | 000    |  0 | ...         |    - |  0  0  1  0
+//   bgtz  | 000111   |  0  0  x  0  0  0  x  0  0 | 000    |  0 | ...         |    - |  0  0  0  1
 //   j     | 000010   |  0  0  x  x  0  0  x  0  1 | 000    |  0
 //   jal   | 000011   |  0  1  x  x  0  0  x  0  1 | 000    |  0
 //
 //   IZ=imm_zero, RW=reg_write, RD=reg_dst, AS=alu_src, BR=branch,
 //   MW=mem_write, MR=mem_to_reg, BN=branch_ne, JP=jump
+//   bltz/bgez は opcode=000001 で rt[0] が 0=bltz / 1=bgez を区別する
 //
 // 【ALUデコーダ (3bit alu_op)】
 //   alu_op=000 → ADD  (addi, addiu, lw, sw, lb, lbu, lh, lhu, sb, sh, lui)
@@ -65,11 +71,16 @@
 module control (
     input  [5:0] opcode,
     input  [5:0] funct,
+    input  [4:0] rt,          // REGIMM (bltz/bgez) の区別に使用
     output       reg_write,
     output       reg_dst,
     output       alu_src,
     output       branch,
     output       branch_ne,   // bne 専用フラグ
+    output       branch_ltz,  // bltz: rs < 0 なら分岐
+    output       branch_gez,  // bgez: rs >= 0 なら分岐
+    output       branch_lez,  // blez: rs <= 0 なら分岐
+    output       branch_gtz,  // bgtz: rs > 0 なら分岐
     output       mem_write,
     output       mem_to_reg,
     output       jump,
@@ -128,6 +139,9 @@ module control (
                         mem_size_r = 2'b01; end
             6'b000100: begin controls = 9'b000010000; alu_op = 3'b001; end // beq
             6'b000101: begin controls = 9'b000000010; alu_op = 3'b001; end // bne
+            6'b000001: begin controls = 9'b000000000; alu_op = 3'b000; end // bltz/bgez
+            6'b000110: begin controls = 9'b000000000; alu_op = 3'b000; end // blez
+            6'b000111: begin controls = 9'b000000000; alu_op = 3'b000; end // bgtz
             6'b000010: begin controls = 9'b000000001; alu_op = 3'b000; end // j
             6'b000011: begin controls = 9'b010000001; alu_op = 3'b000; end // jal
             default:   begin controls = 9'b000000000; alu_op = 3'b000; end
@@ -145,6 +159,11 @@ module control (
     assign jump        = controls[0];
 
     assign jr = (opcode == 6'b000000) && (funct == 6'b001000);
+
+    assign branch_ltz = (opcode == 6'b000001) && (rt == 5'b00000); // bltz
+    assign branch_gez = (opcode == 6'b000001) && (rt == 5'b00001); // bgez
+    assign branch_lez = (opcode == 6'b000110);                     // blez
+    assign branch_gtz = (opcode == 6'b000111);                     // bgtz
 
     assign hilo_write = (opcode == 6'b000000) &&
                         ((funct == 6'b011000) || (funct == 6'b011001) ||

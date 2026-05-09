@@ -52,7 +52,11 @@ module datapath (
     input         reg_dst,
     input         alu_src,
     input         branch,
-    input         branch_ne,
+    input         branch_ne,   // bne
+    input         branch_ltz,  // bltz: rs < 0
+    input         branch_gez,  // bgez: rs >= 0
+    input         branch_lez,  // blez: rs <= 0
+    input         branch_gtz,  // bgtz: rs > 0
     input         mem_write,
     input         mem_to_reg,
     input         jump,
@@ -227,7 +231,14 @@ module datapath (
     assign pc_branch = pc_plus4 + (sign_imm << 2);
     assign pc_jump   = {pc_plus4[31:28], addr26, 2'b00};
 
-    wire branch_taken    = (branch & alu_zero) | (branch_ne & ~alu_zero);
+    wire alu_neg     = rd1[31];
+    wire rs_zero     = (rd1 == 32'b0);
+    wire branch_taken = (branch     &  alu_zero)              // beq
+                      | (branch_ne  & ~alu_zero)              // bne
+                      | (branch_ltz &  alu_neg)               // bltz: rs<0
+                      | (branch_gez & ~alu_neg)               // bgez: rs>=0
+                      | (branch_lez & (alu_neg | rs_zero))    // blez: rs<=0
+                      | (branch_gtz & ~alu_neg & ~rs_zero);   // bgtz: rs>0
     wire [31:0] pc_branch_mux = branch_taken ? pc_branch : pc_plus4;
 
     assign pc_next = jr   ? rd1     :
