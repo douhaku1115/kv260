@@ -3,7 +3,7 @@
 // ============================================================
 //
 // 【役割】
-//   命令の opcode (31:26) と funct (5:0) を見て、データパスへの
+//   命令の opcode (31:26), rs (25:21), funct (5:0) を見て、データパスへの
 //   制御信号を生成する。2段構成:
 //     1. メインデコーダ: opcode → 制御信号ベクタ + alu_op
 //     2. ALUデコーダ:   alu_op + funct → alu_control
@@ -20,12 +20,13 @@
 //   divu  | 000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  1 11  0  - | 10  - |  0  0  0  0
 //   mfhi  | 000000   |  0  1  1  0  0  0  0  0  0 | 010    |  0 |  0  -  1  1 | 10  - |  0  0  0  0
 //   mflo  | 000000   |  0  1  1  0  0  0  0  0  0 | 010    |  0 |  0  -  1  0 | 10  - |  0  0  0  0
+//   syscall|000000   |  0  0  x  0  0  0  x  0  0 | 010    |  0 |  0  -  0  - | 10  - |  0  0  0  0
 //
 //   HW=hilo_write, HO=hilo_op[1:0], MF=mfhilo, SH=sel_hi
 //   SZ=mem_size[1:0](00=byte/01=half/10=word), SU=mem_unsigned(1=ゼロ拡張)
 //   LT=branch_ltz, GE=branch_gez, LE=branch_lez, GT=branch_gtz
 //
-//   addi  | 001000   |  0  1  0  1  0  0  0  0  0 | 000    |  0 | ...         | 10  - |  0  0  0  0
+//   addi  | 001000   |  0  1  0  1  0  0  0  0  0 | 000    |  0
 //   addiu | 001001   |  0  1  0  1  0  0  0  0  0 | 000    |  0
 //   slti  | 001010   |  0  1  0  1  0  0  0  0  0 | 110    |  0
 //   sltiu | 001011   |  0  1  0  1  0  0  0  0  0 | 111    |  0
@@ -33,22 +34,25 @@
 //   ori   | 001101   |  1  1  0  1  0  0  0  0  0 | 011    |  0
 //   xori  | 001110   |  1  1  0  1  0  0  0  0  0 | 101    |  0
 //   lui   | 001111   |  0  1  0  1  0  0  0  0  0 | 000    |  0
-//   lw    | 100011   |  0  1  0  1  0  0  1  0  0 | 000    |  0 | ...         | 10  -
-//   lb    | 100000   |  0  1  0  1  0  0  1  0  0 | 000    |  0 | ...         | 00  0
-//   lbu   | 100100   |  0  1  0  1  0  0  1  0  0 | 000    |  0 | ...         | 00  1
-//   lh    | 100001   |  0  1  0  1  0  0  1  0  0 | 000    |  0 | ...         | 01  0
-//   lhu   | 100101   |  0  1  0  1  0  0  1  0  0 | 000    |  0 | ...         | 01  1
-//   sw    | 101011   |  0  0  x  1  0  1  x  0  0 | 000    |  0 | ...         | 10  -
-//   sb    | 101000   |  0  0  x  1  0  1  x  0  0 | 000    |  0 | ...         | 00  -
-//   sh    | 101001   |  0  0  x  1  0  1  x  0  0 | 000    |  0 | ...         | 01  -
-//   beq   | 000100   |  0  0  x  0  1  0  x  0  0 | 001    |  0 | ...         |    - |  0  0  0  0
-//   bne   | 000101   |  0  0  x  0  0  0  x  1  0 | 001    |  0 | ...         |    - |  0  0  0  0
-//   bltz  | 000001/0 |  0  0  x  0  0  0  x  0  0 | 000    |  0 | ...         |    - |  1  0  0  0
-//   bgez  | 000001/1 |  0  0  x  0  0  0  x  0  0 | 000    |  0 | ...         |    - |  0  1  0  0
-//   blez  | 000110   |  0  0  x  0  0  0  x  0  0 | 000    |  0 | ...         |    - |  0  0  1  0
-//   bgtz  | 000111   |  0  0  x  0  0  0  x  0  0 | 000    |  0 | ...         |    - |  0  0  0  1
+//   lw    | 100011   |  0  1  0  1  0  0  1  0  0 | 000    |  0
+//   lb    | 100000   |  0  1  0  1  0  0  1  0  0 | 000    |  0
+//   lbu   | 100100   |  0  1  0  1  0  0  1  0  0 | 000    |  0
+//   lh    | 100001   |  0  1  0  1  0  0  1  0  0 | 000    |  0
+//   lhu   | 100101   |  0  1  0  1  0  0  1  0  0 | 000    |  0
+//   sw    | 101011   |  0  0  x  1  0  1  x  0  0 | 000    |  0
+//   sb    | 101000   |  0  0  x  1  0  1  x  0  0 | 000    |  0
+//   sh    | 101001   |  0  0  x  1  0  1  x  0  0 | 000    |  0
+//   beq   | 000100   |  0  0  x  0  1  0  x  0  0 | 001    |  0
+//   bne   | 000101   |  0  0  x  0  0  0  x  1  0 | 001    |  0
+//   bltz  | 000001/0 |  0  0  x  0  0  0  x  0  0 | 000    |  0
+//   bgez  | 000001/1 |  0  0  x  0  0  0  x  0  0 | 000    |  0
+//   blez  | 000110   |  0  0  x  0  0  0  x  0  0 | 000    |  0
+//   bgtz  | 000111   |  0  0  x  0  0  0  x  0  0 | 000    |  0
 //   j     | 000010   |  0  0  x  x  0  0  x  0  1 | 000    |  0
 //   jal   | 000011   |  0  1  x  x  0  0  x  0  1 | 000    |  0
+//   mfc0  | 010000   |  0  1  0  0  0  0  0  0  0 | 000    |  0  (rs=00000)
+//   mtc0  | 010000   |  0  0  x  0  0  0  x  0  0 | 000    |  0  (rs=00100)
+//   eret  | 010000   |  0  0  x  0  0  0  x  0  0 | 000    |  0  (rs=10000)
 //
 //   IZ=imm_zero, RW=reg_write, RD=reg_dst, AS=alu_src, BR=branch,
 //   MW=mem_write, MR=mem_to_reg, BN=branch_ne, JP=jump
@@ -67,10 +71,18 @@
 // 【controls ビット割り当て (9bit)】
 //   [8] imm_zero  [7] reg_write  [6] reg_dst  [5] alu_src  [4] branch
 //   [3] mem_write  [2] mem_to_reg  [1] branch_ne  [0] jump
+//
+// 【例外処理関連出力 (Step 11)】
+//   is_mfc0:   mfc0 命令 (CP0 → GPR)
+//   is_mtc0:   mtc0 命令 (GPR → CP0)
+//   is_syscall: syscall 命令 (例外コード=8)
+//   is_eret:   eret 命令 (PC ← EPC, SR.EXL ← 0)
+//   exc_on_ov: オーバーフロー例外を発生させる命令 (add/addi/sub)
 
 module control (
     input  [5:0] opcode,
     input  [5:0] funct,
+    input  [4:0] rs,          // COP0 サブオペコード判別に使用
     input  [4:0] rt,          // REGIMM (bltz/bgez) の区別に使用
     output       reg_write,
     output       reg_dst,
@@ -92,7 +104,13 @@ module control (
     output       mfhilo,      // 1=HI/LO からレジスタへ読み出す (mfhi/mflo)
     output       sel_hi,      // 1=HI 選択 (mfhi), 0=LO 選択 (mflo)
     output [1:0] mem_size,    // 00=byte, 01=halfword, 10=word
-    output       mem_unsigned // 1=ゼロ拡張ロード (lbu/lhu), 0=符号拡張 (lb/lh)
+    output       mem_unsigned, // 1=ゼロ拡張ロード (lbu/lhu), 0=符号拡張 (lb/lh)
+    // 例外処理 (Step 11)
+    output       is_mfc0,
+    output       is_mtc0,
+    output       is_syscall,
+    output       is_eret,
+    output       exc_on_ov
 );
 
     reg [8:0] controls;
@@ -107,9 +125,10 @@ module control (
         mem_unsigned_r = 1'b0;
         case (opcode)
             6'b000000: begin
-                if (funct == 6'b001000 ||
-                    funct == 6'b011000 || funct == 6'b011001 ||
-                    funct == 6'b011010 || funct == 6'b011011)
+                if (funct == 6'b001000 ||                              // jr
+                    funct == 6'b011000 || funct == 6'b011001 ||       // mult/multu
+                    funct == 6'b011010 || funct == 6'b011011 ||       // div/divu
+                    funct == 6'b001100)                                // syscall
                     controls = 9'b000000000;
                 else
                     controls = 9'b011000000;
@@ -144,6 +163,14 @@ module control (
             6'b000111: begin controls = 9'b000000000; alu_op = 3'b000; end // bgtz
             6'b000010: begin controls = 9'b000000001; alu_op = 3'b000; end // j
             6'b000011: begin controls = 9'b010000001; alu_op = 3'b000; end // jal
+            6'b010000: begin // COP0: mfc0/mtc0/eret
+                // mfc0 (rs=00000): GPR[rt] ← CP0[rd], reg_write=1
+                if (rs == 5'b00000)
+                    controls = 9'b010000000;
+                else
+                    controls = 9'b000000000;
+                alu_op = 3'b000;
+            end
             default:   begin controls = 9'b000000000; alu_op = 3'b000; end
         endcase
     end
@@ -175,6 +202,17 @@ module control (
 
     assign mem_size     = mem_size_r;
     assign mem_unsigned = mem_unsigned_r;
+
+    // 例外処理制御信号 (Step 11)
+    wire cop0 = (opcode == 6'b010000);
+    assign is_mfc0    = cop0 && (rs == 5'b00000);
+    assign is_mtc0    = cop0 && (rs == 5'b00100);
+    assign is_eret    = cop0 && (rs == 5'b10000) && (funct == 6'b011000);
+    assign is_syscall = (opcode == 6'b000000) && (funct == 6'b001100);
+    // add(funct=100000)/sub(funct=100010)/addi(opcode=001000) でオーバーフロー例外
+    assign exc_on_ov  = ((opcode == 6'b000000) &&
+                         ((funct == 6'b100000) || (funct == 6'b100010))) ||
+                        (opcode == 6'b001000);
 
     // ALUデコーダ
     reg [3:0] alu_ctrl_r;

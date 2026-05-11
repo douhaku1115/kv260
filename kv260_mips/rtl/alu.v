@@ -22,6 +22,11 @@
 //   result == 0 のとき 1 を出力する。
 //   beq/bne 命令で rs==rt を判定するために使用 (rs-rt=0 なら分岐)
 //
+// 【overflow 出力 (Step 11)】
+//   符号付き ADD/SUB でオーバーフロー発生時に 1 を出力する。
+//   add/addi/sub 命令のオーバーフロー例外検出に使用する。
+//   addu/addiu/subu では overflow=0 (例外なし)。
+//
 // 【シフト命令の入力】
 //   sll/srl/sra: datapath 側で a=rt, b={27'b0, shamt} に切り替えて渡す
 //   sllv/srlv/srav: datapath 側で a=rt, b=rs(レジスタ値) に切り替えて渡す
@@ -31,17 +36,25 @@ module alu (
     input  [31:0] b,
     input  [3:0]  alu_control,
     output reg [31:0] result,
-    output        zero
+    output        zero,
+    output reg    overflow
 );
 
     assign zero = (result == 32'b0);
 
     always @(*) begin
+        overflow = 1'b0;
         case (alu_control)
             4'b0000: result = a & b;                              // AND
             4'b0001: result = a | b;                              // OR
-            4'b0010: result = a + b;                              // ADD
-            4'b0110: result = a - b;                              // SUB
+            4'b0010: begin
+                result   = a + b;                                 // ADD
+                overflow = (a[31] == b[31]) && (result[31] != a[31]);
+            end
+            4'b0110: begin
+                result   = a - b;                                 // SUB
+                overflow = (a[31] != b[31]) && (result[31] != a[31]);
+            end
             4'b0111: result = {31'b0, $signed(a) < $signed(b)};  // SLT
             4'b1000: result = a ^ b;                              // XOR
             4'b1001: result = a << b[4:0];                        // SLL / SLLV

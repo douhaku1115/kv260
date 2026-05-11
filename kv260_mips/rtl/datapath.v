@@ -7,8 +7,10 @@
 //   PC → imem → [命令デコード] → regfile(読み出し)
 //        → ALU → dmem(lw/sw等) → regfile(書き戻し) → PC更新
 //
-// 【PC更新ロジック (優先順位: jr > jump > branch > +4)】
+// 【PC更新ロジック (優先順位: exception > eret > jr > jump > branch > +4)】
 //
+//   exception: PC ← EXC_VEC (0x00000080, imem内の固定例外ベクタ)
+//   eret  : PC ← CP0_EPC
 //   jr    : PC ← rs レジスタの値
 //   j/jal : PC ← {PC+4[31:28], addr26, 2'b00}
 //   beq   : PC ← PC+4 + sign_extend(imm16)<<2  (条件成立時)
@@ -41,6 +43,33 @@
 //
 // 【halt 信号】
 //   halt=1 の間は PC が停止し、byte_en=0 で書き込みも禁止する。
+//
+// 【CP0 レジスタと例外処理 (Step 11)】
+//   実装する CP0 レジスタ:
+//     $12 = Status Register (SR):   bit0 = EXL (例外処理中フラグ)
+//     $13 = Cause Register:         bits[6:2] = ExcCode
+//     $14 = EPC (Exception PC):     例外発生命令のアドレス
+//
+//   例外発生条件:
+//     - syscall 命令: ExcCode = 8
+//     - add/addi/sub の符号付きオーバーフロー: ExcCode = 12
+//
+//   例外発生時の動作 (1クロック):
+//     EPC    ← 例外発生命令のPC
+//     Cause  ← {24'b0, ExcCode, 2'b0}
+//     SR.EXL ← 1
+//     PC     ← EXC_VEC (0x0000_0080)
+//     reg_write は強制 0 (デスティネーションへの書き込み抑制)
+//
+//   eret の動作:
+//     PC     ← EPC
+//     SR.EXL ← 0
+//
+//   mfc0 rt, $Cn: GPR[rt] ← CP0[Cn]  ($12/$13/$14 のみ対応)
+//   mtc0 rt, $Cn: CP0[Cn] ← GPR[rt]
+//
+//   例外ベクタ: EXC_VEC = 32'h0000_0080 (imem word 32)
+//   例外ハンドラをここに配置すること。
 
 module datapath (
     input         clk,
@@ -69,6 +98,12 @@ module datapath (
     input         sel_hi,
     input  [1:0]  mem_size,      // 00=byte, 01=halfword, 10=word
     input         mem_unsigned,  // 1=ゼロ拡張ロード (lbu/lhu), 0=符号拡張 (lb/lh)
+    // 例外処理 (Step 11)
+    input         is_mfc0,
+    input         is_mtc0,
+    input         is_syscall,
+    input         is_eret,
+    input         exc_on_ov,
 
     // 命令メモリ
     output [31:0] pc,
@@ -94,6 +129,13 @@ module datapath (
     wire [31:0] div_r_s = rd1[31]             ? (~div_r_common + 1) : div_r_common;
     wire [31:0] div_q_u = div_q_common;
     wire [31:0] div_r_u = div_r_common;
+
+    // ---- CP0 レジスタ (Step 11) ----
+    reg  [31:0] cp0_sr;    // $12: bit0 = EXL
+    reg  [31:0] cp0_cause; // $13: bits[6:2] = ExcCode
+    reg  [31:0] cp0_epc;   // $14: 例外発生命令のPC
+
+    localparam EXC_VEC = 32'h00000080; // 例外ベクタ (imem word 32)
 
     // ---- PC レジスタ ----
     reg [31:0] pc_reg;
@@ -129,14 +171,26 @@ module datapath (
     wire jal_instr = jump & reg_write;
     wire lui_instr = (instr[31:26] == 6'b001111);
 
+    // ---- 例外検出 (Step 11) ----
+    wire alu_overflow; // ALU から
+    wire exception = (is_syscall | (exc_on_ov & alu_overflow)) & ~halt;
+    wire [4:0] exc_code = is_syscall ? 5'd8 : 5'd12; // 8=Syscall, 12=Overflow
+
+    // ---- CP0 読み出し (mfc0) ----
+    wire [31:0] cp0_read_data = (rd == 5'd12) ? cp0_sr    :
+                                (rd == 5'd13) ? cp0_cause :
+                                (rd == 5'd14) ? cp0_epc   : 32'b0;
+
     // ---- レジスタファイル ----
+    // 例外発生時はデスティネーションへの書き込みを抑制する
+    wire reg_write_actual = reg_write & ~exception;
     wire [4:0]  write_reg = jal_instr ? 5'd31 : (reg_dst ? rd : rt);
     wire [31:0] rd1, rd2, dbg_rd3;
     wire [31:0] write_data;
 
     regfile rf (
         .clk(clk),
-        .we3(reg_write),
+        .we3(reg_write_actual),
         .ra1(rs),
         .ra2(rt),
         .ra3(dbg_reg_addr),
@@ -162,7 +216,8 @@ module datapath (
         .b(alu_b),
         .alu_control(alu_control),
         .result(alu_result),
-        .zero(alu_zero)
+        .zero(alu_zero),
+        .overflow(alu_overflow)
     );
 
     // ---- データメモリ (lw/sw/lb/lbu/lh/lhu/sb/sh) ----
@@ -224,6 +279,7 @@ module datapath (
     assign write_data = jal_instr  ? pc_plus4                   :
                         lui_instr  ? {imm16, 16'b0}              :
                         mfhilo     ? (sel_hi ? hi_reg : lo_reg)  :
+                        is_mfc0    ? cp0_read_data               :
                         mem_to_reg ? mem_data_final               :
                                      alu_result;
 
@@ -241,9 +297,12 @@ module datapath (
                       | (branch_gtz & ~alu_neg & ~rs_zero);   // bgtz: rs>0
     wire [31:0] pc_branch_mux = branch_taken ? pc_branch : pc_plus4;
 
-    assign pc_next = jr   ? rd1     :
-                     jump ? pc_jump :
-                            pc_branch_mux;
+    // 例外が最優先。eret は jr/jump より優先。
+    assign pc_next = exception ? EXC_VEC     :
+                     is_eret   ? cp0_epc     :
+                     jr        ? rd1         :
+                     jump       ? pc_jump    :
+                                  pc_branch_mux;
 
     // ---- PC レジスタ更新 ----
     always @(posedge clk) begin
@@ -264,6 +323,31 @@ module datapath (
                 2'b01: {hi_reg, lo_reg} <= mult_u;
                 2'b10: begin hi_reg <= div_r_s; lo_reg <= div_q_s; end
                 2'b11: begin hi_reg <= div_r_u; lo_reg <= div_q_u; end
+            endcase
+        end
+    end
+
+    // ---- CP0 レジスタ更新 (Step 11) ----
+    always @(posedge clk) begin
+        if (reset) begin
+            cp0_sr    <= 32'b0;
+            cp0_cause <= 32'b0;
+            cp0_epc   <= 32'b0;
+        end else if (exception) begin
+            // 例外発生: EPC保存, Cause設定, EXL=1
+            cp0_epc   <= pc_reg;
+            cp0_cause <= {24'b0, exc_code, 2'b0}; // Cause[6:2] = ExcCode
+            cp0_sr    <= {cp0_sr[31:1], 1'b1};    // EXL=1
+        end else if (is_eret & ~halt) begin
+            // eret: EXL=0
+            cp0_sr <= {cp0_sr[31:1], 1'b0};
+        end else if (is_mtc0 & ~halt) begin
+            // mtc0: CP0[rd] ← GPR[rt]
+            case (rd)
+                5'd12: cp0_sr    <= rd2;
+                5'd13: cp0_cause <= rd2;
+                5'd14: cp0_epc   <= rd2;
+                default: ;
             endcase
         end
     end

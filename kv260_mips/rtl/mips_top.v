@@ -15,7 +15,7 @@
 //         │      └──── jal: $31 ← PC+4 ─────┘        │
 //         └──────────────────────────────────────────┘
 //
-// 【実装済み命令セット (Step 1〜8)】
+// 【実装済み命令セット (Step 1〜11)】
 //
 //  Step 1: addi, add, sub, and, or, slt
 //  Step 2: lw, sw, beq
@@ -26,6 +26,8 @@
 //  Step 7: mult, multu, div, divu, mfhi, mflo
 //  Step 8: lb, lbu, lh, lhu, sb, sh (バイト/ハーフワードアクセス, ビッグエンディアン)
 //  Step 9: blez, bgtz, bltz, bgez (rs と 0 の比較分岐)
+//  Step 10: C言語実行 (mips-linux-gnu-gcc クロスコンパイル)
+//  Step 11: 例外処理 (CP0: SR/Cause/EPC, syscall, overflow, mfc0/mtc0/eret)
 //
 // 【外部インターフェース】
 //   - PS(ARM)側から AXI 経由でプログラムロード・実行制御・デバッグ読み出し
@@ -72,6 +74,12 @@ module mips_top (
     wire        sel_hi;
     wire [1:0]  mem_size;      // 00=byte, 01=halfword, 10=word
     wire        mem_unsigned;  // 1=ゼロ拡張ロード (lbu/lhu)
+    // 例外処理 (Step 11)
+    wire        is_mfc0;
+    wire        is_mtc0;
+    wire        is_syscall;
+    wire        is_eret;
+    wire        exc_on_ov;
 
     // 命令メモリ
     imem imem_inst (
@@ -87,6 +95,7 @@ module mips_top (
     control ctrl (
         .opcode(instr[31:26]),
         .funct(instr[5:0]),
+        .rs(instr[25:21]),
         .rt(instr[20:16]),
         .reg_write(reg_write),
         .reg_dst(reg_dst),
@@ -108,7 +117,12 @@ module mips_top (
         .mfhilo(mfhilo),
         .sel_hi(sel_hi),
         .mem_size(mem_size),
-        .mem_unsigned(mem_unsigned)
+        .mem_unsigned(mem_unsigned),
+        .is_mfc0(is_mfc0),
+        .is_mtc0(is_mtc0),
+        .is_syscall(is_syscall),
+        .is_eret(is_eret),
+        .exc_on_ov(exc_on_ov)
     );
 
     // データパス
@@ -137,6 +151,11 @@ module mips_top (
         .sel_hi(sel_hi),
         .mem_size(mem_size),
         .mem_unsigned(mem_unsigned),
+        .is_mfc0(is_mfc0),
+        .is_mtc0(is_mtc0),
+        .is_syscall(is_syscall),
+        .is_eret(is_eret),
+        .exc_on_ov(exc_on_ov),
         .pc(pc),
         .instr(instr),
         .dbg_reg_addr(dbg_reg_addr),

@@ -642,6 +642,112 @@ static void run_test10(void)
     xil_printf("  $2(v0) = 0x%08x (%d)\r\n", mips_read_reg(2), mips_read_reg(2));
 }
 
+// ============================================================
+// Test 11: 例外処理 — syscall, オーバーフロー, mfc0/mtc0/eret (Step 11)
+// ============================================================
+//
+// 【例外ベクタ】 0x0000_0080 (imem word 32)
+//
+// 【CP0 レジスタ】
+//   $12 = SR (Status):  bit0 = EXL (例外処理中)
+//   $13 = Cause:        bits[6:2] = ExcCode  (8=syscall, 12=Overflow)
+//   $14 = EPC:          例外発生命令のPC
+//
+// 【例外ハンドラ (word 32 = 0x80)】
+//   addi  $1, $1, 1    → $1++ (呼び出し回数カウント)
+//   mfc0  $26, $14     → $26 = EPC
+//   addiu $26, $26, 4  → $26 = EPC+4 (次の命令へスキップ)
+//   mtc0  $26, $14     → EPC ← EPC+4
+//   eret               → PC ← EPC
+//
+// 【メインプログラム実行順序】
+//   0x00: addi $1, $0, 0          → $1 = 0 (カウンタ初期化)
+//   0x04: syscall                 → 例外! EPC=0x04, ExcCode=8
+//         (ハンドラ: $1=1, EPC→0x08, eret)
+//   0x08: mfc0 $2, $14            → $2 = 0x08 (ハンドラで EPC+4 された後の値)
+//   0x0C: mfc0 $3, $13            → $3 = 0x20 (ExcCode=8 → 8<<2)
+//   0x10: mfc0 $4, $12            → $4 = 0x00 (eret 後 EXL=0)
+//   0x14: lui  $5, 0x7FFF         → $5 = 0x7FFF0000
+//   0x18: ori  $5, $5, 0xFFFF     → $5 = 0x7FFFFFFF (INT_MAX)
+//   0x1C: addi $5, $5, 1          → オーバーフロー! EPC=0x1C, ExcCode=12
+//         (ハンドラ: $1=2, EPC→0x20, eret)  ※$5 は書き込み抑制 → 変化なし
+//   0x20: mfc0 $6, $13            → $6 = 0x30 (ExcCode=12 → 12<<2)
+//   0x24: j 0x24                  → 無限ループ
+//
+// 【期待値】
+//   $1 = 2    (例外2回)
+//   $2 = 0x00000008  (ハンドラで EPC+4 された後の値)
+//   $3 = 0x00000020  (Cause: ExcCode=8 → 8<<2=32=0x20)
+//   $4 = 0x00000000  (eret 後 SR.EXL=0)
+//   $5 = 0x7FFFFFFF  (オーバーフロー: 書き込み抑制でそのまま)
+//   $6 = 0x00000030  (Cause: ExcCode=12 → 12<<2=48=0x30)
+static const u32 test11_program[] = {
+    // ---- メインプログラム (word 0-9) ----
+    0x20010000,  // [0]  0x00: addi $1, $0, 0      | $1 = 0 (カウンタ初期化)
+    0x0000000C,  // [1]  0x04: syscall              | → 例外 (EPC=0x04, ExcCode=8)
+    0x40027000,  // [2]  0x08: mfc0 $2, $14         | $2 = 更新後 EPC = 0x08
+    0x40036800,  // [3]  0x0C: mfc0 $3, $13         | $3 = Cause = 0x20
+    0x40046000,  // [4]  0x10: mfc0 $4, $12         | $4 = SR = 0x00 (EXL=0)
+    0x3C057FFF,  // [5]  0x14: lui $5, 0x7FFF       | $5 = 0x7FFF0000
+    0x34A5FFFF,  // [6]  0x18: ori $5, $5, 0xFFFF   | $5 = 0x7FFFFFFF (INT_MAX)
+    0x20A50001,  // [7]  0x1C: addi $5, $5, 1       | → オーバーフロー! (EPC=0x1C, ExcCode=12)
+    0x40066800,  // [8]  0x20: mfc0 $6, $13         | $6 = Cause = 0x30
+    0x08000009,  // [9]  0x24: j 0x24               | 無限ループ
+    // ---- NOP padding (word 10-31, 0x28-0x7C) ----
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [10-13]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [14-17]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [18-21]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [22-25]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [26-29]
+    0x00000000, 0x00000000,                          // [30-31]
+    // ---- 例外ハンドラ (word 32 = 0x80) ----
+    0x20210001,  // [32] 0x80: addi $1, $1, 1       | $1++ (例外回数カウント)
+    0x401A7000,  // [33] 0x84: mfc0 $26, $14        | $26(k0) = EPC
+    0x275A0004,  // [34] 0x88: addiu $26, $26, 4    | $26 = EPC+4
+    0x409A7000,  // [35] 0x8C: mtc0 $26, $14        | EPC ← EPC+4
+    0x42000018,  // [36] 0x90: eret                 | PC ← EPC (次の命令へ)
+};
+#define TEST11_COUNT  (sizeof(test11_program) / sizeof(test11_program[0]))
+
+static void run_test11(void)
+{
+    xil_printf("=== Test 11: Exception (syscall, overflow, mfc0/mtc0/eret) ===\r\n");
+
+    mips_reset();
+    mips_load_program(test11_program, TEST11_COUNT);
+    mips_run_cycles(500);
+
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=2, $2=0x08, $3=0x20, $4=0x00, $5=0x7FFFFFFF, $6=0x30\r\n");
+    mips_dump_regs(1, 6);
+}
+
+// ---- test11b: mfc0/mtc0 単体診断テスト (例外なし) ----
+// 期待値: $4=0x55 (EPC経由), $6=0x15 (SR経由)
+// $4=$6=0 の場合: is_mfc0=0 でCP0パスが壊れている
+static const u32 test11b_program[] = {
+    0x20030055,  // [0] addi $3, $0, 0x55  → $3 = 0x55
+    0x40837000,  // [1] mtc0 $3, $14       → cp0_epc = 0x55
+    0x40047000,  // [2] mfc0 $4, $14       → $4 = cp0_epc (expected 0x55)
+    0x20050015,  // [3] addi $5, $0, 0x15  → $5 = 0x15
+    0x40856000,  // [4] mtc0 $5, $12       → cp0_sr = 0x15
+    0x40066000,  // [5] mfc0 $6, $12       → $6 = cp0_sr (expected 0x15)
+    0x08000006,  // [6] j 6               → 無限ループ (PC=0x18)
+};
+#define TEST11B_COUNT (sizeof(test11b_program) / sizeof(test11b_program[0]))
+
+static void run_test11b(void)
+{
+    xil_printf("=== Test 11b: mfc0/mtc0 standalone (no exception) ===\r\n");
+
+    mips_reset();
+    mips_load_program(test11b_program, TEST11B_COUNT);
+    mips_run_cycles(200);
+
+    xil_printf("Expected: $4=0x55, $6=0x15\r\n");
+    mips_dump_regs(4, 6);
+}
+
 // ==== AUTO-GENERATED C TESTS BEGIN (step10/build_all.sh) ====
 
 // --------------------------------------------------------
@@ -1106,6 +1212,10 @@ int main(void)
     xil_printf("\r\n");
     run_test10();
     run_all_c_tests();
+    xil_printf("\r\n");
+    run_test11b();
+    xil_printf("\r\n");
+    run_test11();
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }

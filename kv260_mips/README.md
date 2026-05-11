@@ -185,6 +185,52 @@ _halt:
     j _halt
 ```
 
+### Step 11 — 例外処理 (CP0/syscall/オーバーフロー)
+
+CP0 コプロセッサ、syscall 命令、オーバーフロー例外、mfc0/mtc0/eret を実装。
+
+**追加した CP0 レジスタ**
+
+| CP0番号 | 名前 | 内容 |
+|---------|------|------|
+| $12 | SR (Status)  | bit0 = EXL (例外処理中フラグ) |
+| $13 | Cause        | bits[6:2] = ExcCode (8=syscall, 12=Overflow) |
+| $14 | EPC          | 例外発生命令の PC |
+
+**追加した命令**
+
+| 命令 | エンコーディング | 動作 |
+|------|------------------|------|
+| syscall | opcode=000000, funct=001100 | 例外発生 (ExcCode=8) |
+| mfc0 rt, $rd | opcode=010000, rs=00000 | GPR[rt] ← CP0[rd] |
+| mtc0 rt, $rd | opcode=010000, rs=00100 | CP0[rd] ← GPR[rt] |
+| eret    | opcode=010000, rs=10000, funct=011000 | PC ← EPC, SR.EXL ← 0 |
+
+**例外動作 (datapath.v)**
+
+```
+例外発生時 (syscall | (exc_on_ov & alu_overflow)):
+  EPC    ← PC（発生した命令の PC）
+  Cause  ← {24'b0, ExcCode, 2'b0}
+  SR.EXL ← 1
+  PC     ← EXC_VEC = 0x0000_0080  ※imem の word 32
+  書き込み抑制: reg_write_actual = reg_write & ~exception
+```
+
+> **オーバーフロー対象**: `add` / `addi` / `sub` で `(a[31]==b[31]) && (result[31]!=a[31])`。`addu/addiu/subu` では発生しない（MIPS 仕様）。
+
+**例外ハンドラ例 (imem word 32 から配置)**
+
+```asm
+0x80: addi  $1, $1, 1     # 例外回数カウント
+0x84: mfc0  $26, $14      # $26(k0) = EPC
+0x88: addiu $26, $26, 4   # $26 = EPC+4 (発生命令をスキップ)
+0x8C: mtc0  $26, $14      # EPC ← EPC+4
+0x90: eret                # PC ← EPC (戻る)
+```
+
+> ハンドラが EPC を +4 して書き戻しているため、復帰後 `mfc0 $rt, $14` は **更新後の EPC = 元PC+4** を返す点に注意。
+
 ---
 
 ## C言語実行の流れ
@@ -396,3 +442,4 @@ controls[8:0]:
 | 8    | lb, lbu, lh, lhu, sb, sh (ビッグエンディアン)   | ✓ |
 | 9    | bltz, bgez, blez, bgtz (rs と 0 の比較分岐)    | ✓ |
 | 10   | C言語実行 (mips-gcc コンパイル, 関数呼び出し・スタック) | ✓ |
+| 11   | 例外処理 (CP0, syscall, overflow, mfc0/mtc0/eret) | ✓ |
