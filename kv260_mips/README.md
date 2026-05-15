@@ -233,6 +233,72 @@ CP0 コプロセッサ、syscall 命令、オーバーフロー例外、mfc0/mtc
 
 ---
 
+### Step 12 — 5段パイプライン化 (`mips_top_pipe.v`)
+
+単一サイクル版の `mips_top.v` を `mips_top_pipe.v` に置き換えて 5段パイプラインで実装。
+`mips_axi.v` は `mips_top_pipe` をインスタンス化する（単一サイクルに戻したい場合は
+`mips_top` に変更すれば良い）。
+
+**パイプライン構成**
+
+```
+IF → IF/ID → ID → ID/EX → EX → EX/MEM → MEM → MEM/WB → WB
+
+IF:   imem 読み出し・PC 更新
+ID:   命令デコード (control.v) + regfile 読み出し
+EX:   ALU 演算、分岐/jr 判定
+MEM:  dmem アクセス (lw/sw)
+WB:   regfile 書き戻し
+```
+
+**サブステップ実装履歴**
+
+| サブ | スコープ | 主要追加内容 |
+|------|---------|------------|
+| 12a  | パイプラインレジスタ確立 | IF/ID, ID/EX, EX/MEM, MEM/WB の 4 段。`addi/add/sub` で動作確認 |
+| 12b  | フォワーディング | EX/MEM→EX, MEM/WB→EX 直送 + WB→ID 同サイクルバイパス。R 型データ依存 OK |
+| 12c  | メモリ + ロードユース | lw/sw 追加。`lw → 直後に lw 結果を使う` を 1 サイクルストールで吸収 |
+| 12d  | 分岐・ジャンプ | beq/bne (EX 段で taken 判定, IF/ID + ID/EX フラッシュ), j/jal (ID 段, IF/ID フラッシュ), jr (EX 段, rs はフォワーディング) |
+
+**ハザード処理**
+
+| ハザード種別 | 解決方法 | ペナルティ |
+|------------|---------|----------|
+| データ (1 命令前) | EX/MEM → EX フォワーディング | 0 サイクル |
+| データ (2 命令前) | MEM/WB → EX フォワーディング | 0 サイクル |
+| データ (3 命令前, WB-ID 同サイクル) | WB→ID バイパス | 0 サイクル |
+| ロードユース (`lw` 直後で使用) | 1 サイクルストール + MEM/WB→EX フォワーディング | 1 サイクル |
+| 分岐 (taken) | IF/ID と ID/EX をフラッシュ | 2 サイクル |
+| ジャンプ (j/jal) | IF/ID をフラッシュ | 1 サイクル |
+| レジスタジャンプ (jr) | IF/ID と ID/EX をフラッシュ | 2 サイクル |
+
+**フラッシュ実装**
+
+- `flush_if_id = id_take_jump | ex_take_branch` — IF/ID 段に NOP (32'b0) を書き込む
+- `flush_id_ex = ex_take_branch` — ID/EX 段の制御信号を全 0 にする (バブル挿入)
+
+**jal の書き戻しデータパス**
+
+jal は `$31 ← PC+4` を書き戻すため、`id_ex_jal_instr` と `id_ex_pc_plus4` を
+EX/MEM, MEM/WB に伝搬し、WB 段の write_data mux で選択する：
+
+```
+wb_write_data = mem_wb_jal_instr   ? mem_wb_pc_plus4    // jal
+              : mem_wb_mem_to_reg  ? mem_wb_mem_data    // lw
+                                   : mem_wb_alu_result; // 通常
+```
+
+**Step 12 で対象外（Step 12e 以降の予定）**
+
+- `lui` の特殊書き戻し (`{imm16, 16'b0}`)
+- `ori/andi/xori` のゼロ拡張即値 (`imm_zero=1`)
+- `blez/bgtz/bltz/bgez` (rs と 0 の比較分岐)
+- mult/div/HI/LO
+- バイト/ハーフワードアクセス (lb/lbu/lh/lhu/sb/sh)
+- Step 11 の例外処理 (パイプライン例外は精密化が必要)
+
+---
+
 ## C言語実行の流れ
 
 新しい C プログラムを MIPS コアで動かすまでのフローを説明する。
@@ -338,14 +404,15 @@ Expected: $v0 = 5040
 ```
 kv260_mips/
 ├── rtl/
-│   ├── mips_axi.v    — AXI4-Lite スレーブラッパー
-│   ├── mips_top.v    — MIPS トップモジュール
-│   ├── control.v     — 制御ユニット (メインデコーダ + ALUデコーダ)
-│   ├── datapath.v    — データパス (PC・レジスタ・ALU・メモリ)
-│   ├── imem.v        — 命令メモリ (4096ワード / 16KB, デュアルポートRAM)
-│   ├── dmem.v        — データメモリ (lw/sw/lb/lbu/lh/lhu/sb/sh 用, バイトイネーブル付き)
-│   ├── regfile.v     — レジスタファイル ($0〜$31)
-│   └── alu.v         — ALU (add/sub/and/or/slt/sltu/xor/nor/sll/srl/sra)
+│   ├── mips_axi.v       — AXI4-Lite スレーブラッパー (mips_top_pipe をインスタンス化)
+│   ├── mips_top.v       — MIPS トップモジュール (単一サイクル版, Step 1〜11)
+│   ├── mips_top_pipe.v  — MIPS トップモジュール (5段パイプライン版, Step 12)
+│   ├── control.v        — 制御ユニット (メインデコーダ + ALUデコーダ)
+│   ├── datapath.v       — データパス (単一サイクル版, mips_top から参照)
+│   ├── imem.v           — 命令メモリ (4096ワード / 16KB, デュアルポートRAM)
+│   ├── dmem.v           — データメモリ (バイトイネーブル付き)
+│   ├── regfile.v        — レジスタファイル ($0〜$31)
+│   └── alu.v            — ALU (add/sub/and/or/slt/sltu/xor/nor/sll/srl/sra)
 ├── step10/
 │   ├── crt0.S           — ベアメタルスタートアップ (_start → main, $sp初期化)
 │   ├── mips.ld          — リンカスクリプト (0x0000 起点, note セクション破棄)
@@ -443,3 +510,7 @@ controls[8:0]:
 | 9    | bltz, bgez, blez, bgtz (rs と 0 の比較分岐)    | ✓ |
 | 10   | C言語実行 (mips-gcc コンパイル, 関数呼び出し・スタック) | ✓ |
 | 11   | 例外処理 (CP0, syscall, overflow, mfc0/mtc0/eret) | ✓ |
+| 12a  | 5段パイプライン基本構造 (addi/add/sub, 独立命令)       | ✓ |
+| 12b  | フォワーディング + WB→ID バイパス (R 型データ依存) | ✓ |
+| 12c  | lw/sw + ロードユースストール                           | ✓ |
+| 12d  | 分岐 (beq/bne) + ジャンプ (j/jal/jr) + フラッシュ      | ✓ |

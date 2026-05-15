@@ -107,7 +107,9 @@ module mips_axi #(
     wire [31:0] mips_pc;
     wire [31:0] mips_dbg_reg_data;
 
-    mips_top mips (
+    // Step 12: パイプライン化 — mips_top の代わりに mips_top_pipe を使用
+    // 単一サイクル版に戻す場合は mips_top_pipe → mips_top に変更
+    mips_top_pipe mips (
         .clk(S_AXI_ACLK),
         .reset(mips_reset),
         .halt(halt),

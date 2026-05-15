@@ -1,15 +1,26 @@
 # KV260 MIPS プロジェクト — 現在の状態
 
 ## 現在地
-**Step 11 完了・実機確認済み (push 未)**
+**Step 12d 完了・実機確認済み**
 
-- Step 1〜11: 実機動作確認済み
-- Step 1〜10: origin/main の kv260_mips/ に push 済み
-- クロック: 20MHz（32bit 組み合わせ除算器のタイミング対策、rebuild.tcl で設定）
+- Step 1〜12d: 実機動作確認済み
+- 単一サイクル版 (`mips_top.v`) は Step 11 で完成、`mips_top_pipe.v` (Step 12) に切替済み
+- 切り戻し: `mips_axi.v` で `mips_top_pipe` → `mips_top` に変更すれば単一サイクルに戻る
+- クロック: 20MHz（rebuild.tcl で設定）
+
+## Step 12 サブステップ進捗
+
+- 12a: パイプライン基本構造 ✓
+- 12b: フォワーディング + WB→ID バイパス ✓
+- 12c: lw/sw + ロードユースストール ✓
+- 12d: beq/bne + j/jal/jr + フラッシュ ✓
+- 12e: lui/ori/andi/xori/シフト/blez 系/addiu/addu/subu/sltu/nor 等 (未着手)
+- 12f: mult/div/HI/LO, バイト/ハーフワード (未着手)
+- 12g (Step 13 と統合検討): 例外処理 (Step 11) のパイプライン化 (未着手)
 
 ## 今後のロードマップ
 
-- Step 12: パイプライン化（5段 IF/ID/EX/MEM/WB）
+- Step 12e/f/g 順次対応 → 全 Step 1〜11 テストを再現
 
 ## 標準フロー（毎 Step）
 1. RTL 変更
@@ -22,6 +33,6 @@
 - Vivado: `E:\vivado\2025.2\Vivado\bin\vivado.bat`
 - プロジェクト: `E:\fpga\kria260\kv260_mips\`
 - XSA: `E:\fpga\kria260\kv260_mips\project_1\design_1_wrapper.xsa`
-- Vitis WS: `E:\Xilinx\project_vitis\kv_mips13`（kv_mips2〜12 は古い）
+- Vitis WS: `E:\Xilinx\project_vitis\kv_mips17`（kv_mips14〜16 は Step 12a〜c で使用済み, 古い）
 - main.c（編集はここのみ）: `E:\fpga\kria260\kv260_mips\vitis_src\main.c`
 - git: https://github.com/douhaku1115/kv260.git

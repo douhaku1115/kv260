@@ -1,5 +1,11 @@
 open_project E:/fpga/kria260/kv260_mips/project_1/project_1.xpr
 
+# Step 12: パイプライン版 RTL ファイルをプロジェクトに追加（既にあればスキップ）
+if {[llength [get_files -quiet rtl/mips_top_pipe.v]] == 0} {
+    add_files -norecurse E:/fpga/kria260/kv260_mips/rtl/mips_top_pipe.v
+    puts "Added rtl/mips_top_pipe.v to project"
+}
+
 # clk_wiz を 20MHz に設定（32bit 除算器のタイミング対策: 50MHz では WNS=-22ns）
 open_bd_design [get_files design_1.bd]
 set_property CONFIG.CLKOUT1_REQUESTED_OUT_FREQ 20 [get_bd_cells clk_wiz_0]

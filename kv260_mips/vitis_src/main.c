@@ -90,6 +90,59 @@ static void mips_dump_regs(int from, int to)
 }
 
 // ============================================================
+// Test Pipe A: パイプライン基本動作確認 (Step 12a)
+// ============================================================
+// データ依存のない addi 命令のみで、5段パイプラインが動作することを確認する。
+// フォワーディング未実装のため、依存命令を含めない (Step 12b で対応予定)。
+// 分岐/ジャンプ未実装のため、無限ループも入れない (PC は NOP を走り続ける)。
+static const u32 test_pipe_a_program[] = {
+    0x20010005, // addi $1, $0, 5    | $1 = 5
+    0x2002000A, // addi $2, $0, 10   | $2 = 10
+    0x2003000F, // addi $3, $0, 15   | $3 = 15
+    0x20040014, // addi $4, $0, 20   | $4 = 20
+    0x20050019, // addi $5, $0, 25   | $5 = 25
+    0x2006001E, // addi $6, $0, 30   | $6 = 30
+    0x20070023, // addi $7, $0, 35   | $7 = 35
+};
+#define TEST_PIPE_A_COUNT (sizeof(test_pipe_a_program) / sizeof(test_pipe_a_program[0]))
+
+static void run_test_pipe_a(void)
+{
+    xil_printf("--- Test Pipe A: パイプライン基本動作 (Step 12a) ---\r\n");
+    mips_reset();
+    mips_load_program(test_pipe_a_program, TEST_PIPE_A_COUNT);
+    mips_run_cycles(500);
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=5, $2=10, $3=15, $4=20, $5=25, $6=30, $7=35\r\n");
+    mips_dump_regs(1, 7);
+}
+
+// ============================================================
+// Test Pipe C: lw/sw + ロードユースハザード (Step 12c)
+// ============================================================
+// sw 直後の lw、lw 直後の使用 (ロードユース) で正しく動作するか確認する。
+static const u32 test_pipe_c_program[] = {
+    0x20010005, // addi $1, $0, 5    | $1 = 5
+    0xAC010000, // sw   $1, 0($0)    | mem[0] = 5
+    0x8C020000, // lw   $2, 0($0)    | $2 = 5
+    0x00422020, // add  $4, $2, $2   | $4 = 10  ← ロードユース (stall 1cycle + forwarding)
+    0x20030007, // addi $3, $0, 7    | $3 = 7
+    0x00832820, // add  $5, $4, $3   | $5 = 17  ← フォワーディング (EX/MEM → EX)
+};
+#define TEST_PIPE_C_COUNT (sizeof(test_pipe_c_program) / sizeof(test_pipe_c_program[0]))
+
+static void run_test_pipe_c(void)
+{
+    xil_printf("--- Test Pipe C: lw/sw + load-use (Step 12c) ---\r\n");
+    mips_reset();
+    mips_load_program(test_pipe_c_program, TEST_PIPE_C_COUNT);
+    mips_run_cycles(500);
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=5, $2=5, $3=7, $4=10, $5=17\r\n");
+    mips_dump_regs(1, 5);
+}
+
+// ============================================================
 // Test 1: addi + R型命令 (Step 1)
 // ============================================================
 // addi, add, sub, and, or, slt の動作確認
@@ -1191,31 +1244,28 @@ static void run_all_c_tests(void)
 
 int main(void)
 {
-    xil_printf("\r\n==== MIPS Processor Test ====\r\n\r\n");
+    xil_printf("\r\n==== MIPS Pipeline Test (Step 12d) ====\r\n\r\n");
+    run_test_pipe_a();
+    xil_printf("\r\n");
     run_test1();
     xil_printf("\r\n");
-    run_test2();
+    run_test_pipe_c();
     xil_printf("\r\n");
-    run_test3();
+    run_test2();           // Step 12d: lw/sw + beq
     xil_printf("\r\n");
+    run_test3();           // Step 12d: j, jal, jr
+    /* Step 12e 以降で順次再有効化する。
     run_test4();
-    xil_printf("\r\n");
     run_test5();
-    xil_printf("\r\n");
     run_test6();
-    xil_printf("\r\n");
     run_test7();
-    xil_printf("\r\n");
     run_test8();
-    xil_printf("\r\n");
     run_test9();
-    xil_printf("\r\n");
     run_test10();
     run_all_c_tests();
-    xil_printf("\r\n");
     run_test11b();
-    xil_printf("\r\n");
     run_test11();
+    */
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
 }
