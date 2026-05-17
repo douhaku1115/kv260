@@ -1,6 +1,6 @@
 # KV260 Pong
 
-KV260 の DisplayPort 出力 + PL (FPGA) の自作 AXI スレーブを使った、PS + PL 連携の Pong ゲーム。
+KV260 の HDMI 出力 + PL (FPGA) の自作 AXI スレーブを使った、PS + PL 連携の Pong ゲーム。
 
 ## 概要
 
@@ -14,8 +14,8 @@ KV260 の DisplayPort 出力 + PL (FPGA) の自作 AXI スレーブを使った�
 [PL の rect_axi_slave]  ──→  [rtl_top (VGA timing + 矩形描画)]
                                        │ 36bit live video
                                        ▼
-                              [PS の DPDMA / DP コントローラ]
-                                       │ DisplayPort
+                              [PS のビデオコントローラ]
+                                       │ HDMI
                                        ▼
                                    [HDMI モニタ]
 ```
@@ -52,7 +52,7 @@ PS Zynq UltraScale+ ────────────────────
   │                                              ↓ live video │
   │ dp_live_video_in ←─────────────────────────┘             │
   │                                                           │
-  │ DP コントローラ → DisplayPort コネクタ                    │
+  │ ビデオコントローラ → HDMI コネクタ                 │
   └───────────────────────────────────────────────────────────┘
 ```
 
@@ -82,7 +82,7 @@ kv260_pong/
 │   ├── cdc_synchronizer.v — クロックドメイン跨ぎ同期 (miya4649 由来)
 │   └── shift_register.v   — リセット遅延用
 ├── vitis_src/
-│   └── main.c             — PS 側ゲームロジック (DP 初期化 + UART + 衝突判定)
+│   └── main.c             — PS 側ゲームロジック (HDMI 出力初期化 + UART + 衝突判定)
 ├── pins.xdc               — ピン制約 (使用なしだが残置)
 ├── timings.xdc            — タイミング制約
 ├── vivado.tcl             — Vivado プロジェクト生成スクリプト
@@ -110,7 +110,7 @@ vivado.bat -mode batch -source E:/fpga/kria260/kv260_pong/vivado.tcl
 5. Build → Debug
    - Debug Configuration の **Reset APU** をチェック
 6. TeraTerm を **COM ポート 14** (or 環境次第)、**115200 / 8N1** で開く
-7. KV260 の DP → HDMI モニタに接続
+7. KV260 を HDMI モニタに接続
 8. プレイ開始
 
 ## ゲーム実装メモ
@@ -130,7 +130,7 @@ KV260 の USB-UART は **UART_1 (0xFF01_0000)**。BSP の stdin/stdout 設定が
 
 直接レジスタで RX するときは `UART_BASE = 0xFF010000` を使用。
 
-### DP 初期化のハマりポイント
+### HDMI 出力初期化のハマりポイント
 
 - `XSetupInterruptSystem` でハングする → 割込み設定は不要なら省略
 - `XDpPsu_CheckLinkStatus` を含む `do-while` ループもハングする可能性 → 1 回呼び切りに簡略化
@@ -150,5 +150,5 @@ KV260 の USB-UART は **UART_1 (0xFF01_0000)**。BSP の stdin/stdout 設定が
 
 ## 関連プロジェクト
 
-- `kv260_rect` — DP Live Video + 固定矩形描画 (Pong の出発点)
+- `kv260_rect` — HDMI Live Video + 固定矩形描画 (Pong の出発点)
 - `kv260_mips` — KV260 上の自作 MIPS プロセッサ

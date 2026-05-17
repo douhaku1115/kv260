@@ -49,7 +49,7 @@
 #include "xinterrupt_wrap.h"
 #endif
 
-/* DP / 割込み定義 (kv260_rect 由来) */
+/* HDMI 出力制御用ハードウェア定義 (Xilinx XPAR_PSU_DP_* は内部ドライバ名) */
 #ifndef SDT
 #define DPPSU_DEVICE_ID   XPAR_PSU_DP_DEVICE_ID
 #define AVBUF_DEVICE_ID   XPAR_PSU_DP_DEVICE_ID

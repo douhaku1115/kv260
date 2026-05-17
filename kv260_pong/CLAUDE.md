@@ -1,6 +1,6 @@
 # KV260 Pong プロジェクト
 
-KV260 の DP Live Video 出力で Pong ゲームを実装。PS 側 C プログラムから PL の AXI スレーブ経由で矩形位置を制御。
+KV260 の HDMI Live Video 出力で Pong ゲームを実装。PS 側 C プログラムから PL の AXI スレーブ経由で矩形位置を制御。
 
 ## アーキテクチャ
 
@@ -18,7 +18,7 @@ PS (C) ──M_AXI_HPM0_FPD──► AXI Interconnect ──► rect_axi_slave
                                                  dp_live_video_in
                                                        │
                                                        ▼
-                                                  DP コネクタ → HDMI モニタ
+                                                  HDMI コネクタ → HDMI モニタ
 ```
 
 ## AXI レジスタマップ (0xA0000000)
