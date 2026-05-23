@@ -259,6 +259,7 @@ WB:   regfile 書き戻し
 | 12b  | フォワーディング | EX/MEM→EX, MEM/WB→EX 直送 + WB→ID 同サイクルバイパス。R 型データ依存 OK |
 | 12c  | メモリ + ロードユース | lw/sw 追加。`lw → 直後に lw 結果を使う` を 1 サイクルストールで吸収 |
 | 12d  | 分岐・ジャンプ | beq/bne (EX 段で taken 判定, IF/ID + ID/EX フラッシュ), j/jal (ID 段, IF/ID フラッシュ), jr (EX 段, rs はフォワーディング) |
+| 12e  | 残り即値/ALU/分岐 | lui (EX で `{imm16,16'b0}` 生成), ori/andi/xori (ID でゼロ拡張即値), シフト sll/srl/sra・sllv/srlv/srav (EX でオペランド入替), bltz/bgez/blez/bgtz (EX で rs と 0 比較), addiu/addu/subu/sltu/sltiu/nor |
 
 **ハザード処理**
 
@@ -288,12 +289,17 @@ wb_write_data = mem_wb_jal_instr   ? mem_wb_pc_plus4    // jal
                                    : mem_wb_alu_result; // 通常
 ```
 
-**Step 12 で対象外（Step 12e 以降の予定）**
+**Step 12e の実装詳細**
 
-- `lui` の特殊書き戻し (`{imm16, 16'b0}`)
-- `ori/andi/xori` のゼロ拡張即値 (`imm_zero=1`)
-- `blez/bgtz/bltz/bgez` (rs と 0 の比較分岐)
-- mult/div/HI/LO
+- **lui**: EX 段で `id_ex_lui_instr` のとき `{id_ex_sign_imm[15:0], 16'b0}` を生成し、ALU 結果の代わりに EX/MEM へ伝搬（imm16 は伝搬済み即値の下位 16bit から取得、新規レジスタ不要）
+- **ゼロ拡張即値 (ori/andi/xori)**: ID 段で `imm_zero` により `{16'b0,imm16}` / 符号拡張を選択して ID/EX へ。分岐は imm_zero=0 なので分岐ターゲット計算に影響なし
+- **rs と 0 の比較分岐 (bltz/bgez/blez/bgtz)**: EX 段でフォワーディング後 rs (`alu_in_a`) の符号ビットとゼロ判定から taken を生成。beq/bne と同じフラッシュ機構を流用
+- **シフト (sll/srl/sra/sllv/srlv/srav)**: EX 段でオペランドを入替（`a=rt`, `b=shamt` or `rs`）。shamt は伝搬済み即値の `[10:6]` から取得。値オペランドは rt なので既存の `forward_b` がそのまま機能
+- **addiu/addu/subu/sltu/sltiu/nor**: 既存 ALU 経路でそのまま動作（追加ロジック不要）
+
+**Step 12f 以降の予定**
+
+- mult/div/HI/LO (mult/multu/div/divu/mfhi/mflo)
 - バイト/ハーフワードアクセス (lb/lbu/lh/lhu/sb/sh)
 - Step 11 の例外処理 (パイプライン例外は精密化が必要)
 
@@ -514,3 +520,4 @@ controls[8:0]:
 | 12b  | フォワーディング + WB→ID バイパス (R 型データ依存) | ✓ |
 | 12c  | lw/sw + ロードユースストール                           | ✓ |
 | 12d  | 分岐 (beq/bne) + ジャンプ (j/jal/jr) + フラッシュ      | ✓ |
+| 12e  | lui/ori/andi/xori/シフト/blez系/addiu/addu/subu/sltu/sltiu/nor | ✓ |

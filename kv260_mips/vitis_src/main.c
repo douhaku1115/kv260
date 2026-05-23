@@ -1244,7 +1244,7 @@ static void run_all_c_tests(void)
 
 int main(void)
 {
-    xil_printf("\r\n==== MIPS Pipeline Test (Step 12d) ====\r\n\r\n");
+    xil_printf("\r\n==== MIPS Pipeline Test (Step 12e) ====\r\n\r\n");
     run_test_pipe_a();
     xil_printf("\r\n");
     run_test1();
@@ -1254,17 +1254,21 @@ int main(void)
     run_test2();           // Step 12d: lw/sw + beq
     xil_printf("\r\n");
     run_test3();           // Step 12d: j, jal, jr
-    /* Step 12e 以降で順次再有効化する。
-    run_test4();
-    run_test5();
-    run_test6();
-    run_test7();
-    run_test8();
-    run_test9();
-    run_test10();
+    xil_printf("\r\n");
+    run_test4();           // Step 12e: lui, ori, bne (ループ)
+    xil_printf("\r\n");
+    run_test5();           // Step 12e: andi, xori, slti, addiu, sll, srl, sra
+    xil_printf("\r\n");
+    run_test6();           // Step 12e: addu, subu, sltu, sltiu, nor, sllv, srlv, srav
+    xil_printf("\r\n");
+    run_test9();           // Step 12e: bltz, bgez, blez, bgtz
+    /* Step 12f 以降で順次再有効化する。
+    run_test7();           // mult/div/HI/LO
+    run_test8();           // lb/lbu/lh/lhu/sb/sh
+    run_test10();          // C言語実行
     run_all_c_tests();
     run_test11b();
-    run_test11();
+    run_test11();          // 例外処理
     */
     xil_printf("\r\n==== Done ====\r\n");
     return 0;

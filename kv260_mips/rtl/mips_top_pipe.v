@@ -23,12 +23,20 @@
 //   - メモリアクセス追加: lw (word), sw (word)
 //   - ロードユースハザード検出 (1 サイクルストール)
 //
-// 【Step 12d スコープ】 (本ファイル)
+// 【Step 12d スコープ】 (完了)
 //   - 分岐: beq, bne (EX 段で判定、taken 時 IF/ID と ID/EX をフラッシュ)
 //   - ジャンプ: j (ID 段で判定、IF/ID をフラッシュ)
 //   - リンク付きジャンプ: jal (j + $31 ← PC+4)
 //   - レジスタジャンプ: jr (EX 段で判定、rs はフォワーディング適用)
 //   - 例外なし (Step 13 で別途)
+//
+// 【Step 12e スコープ】 (本ファイル)
+//   - ゼロ拡張即値: ori/andi/xori (ID 段で imm_zero により選択)
+//   - lui: {imm16, 16'b0} を EX 段で生成し WB へ
+//   - rs と 0 の比較分岐: bltz/bgez/blez/bgtz (EX 段, フォワーディング後 rs)
+//   - シフト: sll/srl/sra (a=rt, b=shamt), sllv/srlv/srav (a=rt, b=rs)
+//   - addiu/addu/subu/sltu/sltiu/nor は既存 ALU 経路でそのまま動作
+//   - mult/div/HI/LO・バイト/ハーフword・例外は Step 12f 以降
 //
 // 【フォワーディングロジック】
 //   ID/EX.rs が EX/MEM のデスティネーションと一致 → ALU 入力 a に EX/MEM 結果を直送
@@ -220,6 +228,19 @@ module mips_top_pipe (
     assign id_take_jump  = id_jump;                    // j と jal の両方
     assign id_jump_target = {if_id_pc_plus4[31:28], if_id_instr[25:0], 2'b00};
 
+    // Step 12e: lui / シフト命令検出 + ゼロ拡張即値
+    wire id_lui_instr = (id_opcode == 6'b001111);
+    wire id_shift_instr = (id_opcode == 6'b000000) &&
+                          ((id_funct == 6'b000000) ||   // sll
+                           (id_funct == 6'b000010) ||   // srl
+                           (id_funct == 6'b000011));    // sra
+    wire id_var_shift_instr = (id_opcode == 6'b000000) &&
+                          ((id_funct == 6'b000100) ||   // sllv
+                           (id_funct == 6'b000110) ||   // srlv
+                           (id_funct == 6'b000111));    // srav
+    // ori/andi/xori はゼロ拡張、それ以外は符号拡張
+    wire [31:0] id_imm_ext = id_imm_zero ? {16'b0, id_imm16} : id_sign_imm;
+
     // ============================================================
     // ID/EX パイプラインレジスタ
     // ============================================================
@@ -237,6 +258,13 @@ module mips_top_pipe (
     reg        id_ex_jr;           // Step 12d: jr
     reg        id_ex_jal_instr;    // Step 12d: jal ($31 ← PC+4)
     reg [31:0] id_ex_pc_plus4;     // Step 12d: jal の書き戻し用
+    reg        id_ex_branch_ltz;   // Step 12e: bltz
+    reg        id_ex_branch_gez;   // Step 12e: bgez
+    reg        id_ex_branch_lez;   // Step 12e: blez
+    reg        id_ex_branch_gtz;   // Step 12e: bgtz
+    reg        id_ex_lui_instr;    // Step 12e: lui
+    reg        id_ex_shift;        // Step 12e: sll/srl/sra
+    reg        id_ex_var_shift;    // Step 12e: sllv/srlv/srav
 
     assign id_ex_jr_w = id_ex_jr;  // forward declaration の wire と接続
 
@@ -263,6 +291,13 @@ module mips_top_pipe (
             id_ex_jr          <= 1'b0;
             id_ex_jal_instr   <= 1'b0;
             id_ex_pc_plus4    <= 32'b0;
+            id_ex_branch_ltz  <= 1'b0;
+            id_ex_branch_gez  <= 1'b0;
+            id_ex_branch_lez  <= 1'b0;
+            id_ex_branch_gtz  <= 1'b0;
+            id_ex_lui_instr   <= 1'b0;
+            id_ex_shift       <= 1'b0;
+            id_ex_var_shift   <= 1'b0;
         end else if (!halt) begin
             if (load_use_stall || flush_id_ex) begin
                 // バブル挿入 / フラッシュ: 制御信号を全 0 にする (NOP)
@@ -283,6 +318,13 @@ module mips_top_pipe (
                 id_ex_jr          <= 1'b0;
                 id_ex_jal_instr   <= 1'b0;
                 id_ex_pc_plus4    <= 32'b0;
+                id_ex_branch_ltz  <= 1'b0;
+                id_ex_branch_gez  <= 1'b0;
+                id_ex_branch_lez  <= 1'b0;
+                id_ex_branch_gtz  <= 1'b0;
+                id_ex_lui_instr   <= 1'b0;
+                id_ex_shift       <= 1'b0;
+                id_ex_var_shift   <= 1'b0;
             end else begin
                 id_ex_reg_write   <= id_reg_write;
                 id_ex_reg_dst     <= id_reg_dst;
@@ -290,7 +332,7 @@ module mips_top_pipe (
                 id_ex_alu_control <= id_alu_control;
                 id_ex_rd1         <= id_rd1_bypassed;
                 id_ex_rd2         <= id_rd2_bypassed;
-                id_ex_sign_imm    <= id_sign_imm;
+                id_ex_sign_imm    <= id_imm_ext;   // Step 12e: imm_zero でゼロ/符号拡張を選択
                 id_ex_rs          <= id_rs;
                 id_ex_rt          <= id_rt;
                 id_ex_rd          <= id_rd;
@@ -301,6 +343,13 @@ module mips_top_pipe (
                 id_ex_jr          <= id_jr;
                 id_ex_jal_instr   <= id_jal_instr;
                 id_ex_pc_plus4    <= if_id_pc_plus4;
+                id_ex_branch_ltz  <= id_branch_ltz;
+                id_ex_branch_gez  <= id_branch_gez;
+                id_ex_branch_lez  <= id_branch_lez;
+                id_ex_branch_gtz  <= id_branch_gtz;
+                id_ex_lui_instr   <= id_lui_instr;
+                id_ex_shift       <= id_shift_instr;
+                id_ex_var_shift   <= id_var_shift_instr;
             end
         end
     end
@@ -339,14 +388,23 @@ module mips_top_pipe (
     wire [31:0] alu_in_rt = (forward_b == 2'b10) ? ex_mem_alu_result :
                             (forward_b == 2'b01) ? wb_write_data     :
                                                    id_ex_rd2;
-    wire [31:0] ex_alu_b  = id_ex_alu_src ? id_ex_sign_imm : alu_in_rt;
+
+    // Step 12e: シフト命令はオペランドを入れ替える (datapath.v と同じ規約)
+    //   sll/srl/sra:    a = rt,  b = shamt(=imm[10:6])
+    //   sllv/srlv/srav: a = rt,  b = rs
+    //   それ以外:        a = rs,  b = (alu_src ? imm : rt)
+    wire [31:0] ex_alu_a = (id_ex_shift | id_ex_var_shift) ? alu_in_rt : alu_in_a;
+    wire [31:0] ex_alu_b = id_ex_shift     ? {27'b0, id_ex_sign_imm[10:6]} :
+                           id_ex_var_shift ? alu_in_a                       :
+                           id_ex_alu_src   ? id_ex_sign_imm                 :
+                                             alu_in_rt;
 
     wire [31:0] ex_alu_result;
     wire        ex_alu_zero;
     wire        ex_alu_overflow;
 
     alu alu_inst (
-        .a(alu_in_a),
+        .a(ex_alu_a),
         .b(ex_alu_b),
         .alu_control(id_ex_alu_control),
         .result(ex_alu_result),
@@ -354,16 +412,26 @@ module mips_top_pipe (
         .overflow(ex_alu_overflow)
     );
 
+    // Step 12e: lui は {imm16, 16'b0} を書き戻す (ALU 結果の代わり)
+    wire [31:0] ex_result = id_ex_lui_instr ? {id_ex_sign_imm[15:0], 16'b0} : ex_alu_result;
+
     // jal の write_reg は $31, それ以外は通常通り
     wire [4:0] ex_write_reg = id_ex_jal_instr ? 5'd31 :
                               id_ex_reg_dst   ? id_ex_rd : id_ex_rt;
 
-    // Step 12d: 分岐/jr 判定 (EX 段)
+    // Step 12d/12e: 分岐/jr 判定 (EX 段)
     // beq: branch=1 && rs==rt (alu_zero)
     // bne: branch_ne=1 && rs!=rt (~alu_zero)
+    // bltz/bgez/blez/bgtz: rs と 0 の比較 (フォワーディング後の rs = alu_in_a)
     // jr:  jr=1 (常に taken)
-    wire ex_branch_taken = (id_ex_branch    &  ex_alu_zero) |
-                           (id_ex_branch_ne & ~ex_alu_zero);
+    wire ex_rs_neg  = alu_in_a[31];
+    wire ex_rs_zero = (alu_in_a == 32'b0);
+    wire ex_branch_taken = (id_ex_branch     &  ex_alu_zero)             |
+                           (id_ex_branch_ne  & ~ex_alu_zero)             |
+                           (id_ex_branch_ltz &  ex_rs_neg)               |
+                           (id_ex_branch_gez & ~ex_rs_neg)               |
+                           (id_ex_branch_lez & (ex_rs_neg | ex_rs_zero)) |
+                           (id_ex_branch_gtz & ~ex_rs_neg & ~ex_rs_zero);
     assign ex_take_branch = ex_branch_taken | id_ex_jr;
     assign ex_branch_target = id_ex_pc_plus4 + (id_ex_sign_imm << 2);
     assign ex_jr_target = alu_in_a;  // フォワーディング後の rs 値
@@ -393,7 +461,7 @@ module mips_top_pipe (
             ex_mem_pc_plus4   <= 32'b0;
         end else if (!halt) begin
             ex_mem_reg_write  <= id_ex_reg_write;
-            ex_mem_alu_result <= ex_alu_result;
+            ex_mem_alu_result <= ex_result;       // Step 12e: lui 結果も含む
             ex_mem_write_reg  <= ex_write_reg;
             ex_mem_mem_write  <= id_ex_mem_write;
             ex_mem_mem_to_reg <= id_ex_mem_to_reg;
