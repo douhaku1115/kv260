@@ -1,0 +1,17 @@
+# Vivado 生成物
+project_1/
+*.jou
+*.log
+*.backup.*
+*.str
+.Xil/
+xsim.dir/
+
+# Vitis 生成物
+_ide/
+
+# 個人設定
+*.user
+
+# その他生成物
+dfx_runtime.txt
