@@ -66,18 +66,23 @@ CHIP-8:        キーボード:
 A 0 B F        z x c v
 ```
 
-| キー | 動作（Brix の場合） |
-|------|------|
-| `q` | パドル左 |
-| `e` | パドル右 |
-| `Enter` | リスタート |
+| キー | Brix | Space Invaders |
+|------|------|------|
+| `q` | パドル左 | 左移動 |
+| `e` | パドル右 | 右移動 |
+| `w` | — | 発射 |
+| `Enter` | リスタート | リスタート |
 
 ## チューニング (main.c 冒頭の #define)
 
 ```c
-#define CYCLES_PER_FRAME 7   // ゲーム全体の速度。下げると遅くなる
+#define CYCLES_PER_FRAME 15  // ゲーム全体の速度。下げると遅くなる (Brix=7, Invaders=15 程度)
 #define PHOSPHOR_FRAMES  2   // 残光フレーム数。ちらつくなら増、残像が嫌なら減
 #define KEY_HOLD_FRAMES  12  // UART キー押下の保持フレーム数（取りこぼし防止）
+
+// ROM ごとに挙動が変わる quirk (不具合が出たら切替)
+#define QUIRK_SHIFT_VY    0  // 1=8XY6/8XYE は VY をシフト(原典) / 0=VX(モダン)
+#define QUIRK_LOADSTORE_I 0  // 1=FX55/FX65 で I を加算(原典) / 0=不変(モダン)
 ```
 
 ## ビルド手順
@@ -110,10 +115,13 @@ vivado -mode batch -source vivado.tcl
 | C | UART キー入力 → 16 キー | ✅ |
 | D | delay/sound タイマー (60Hz) | ✅ |
 | E | 実ゲーム ROM (Brix) 動作確認 | ✅ |
+| F | Space Invaders 動作確認 | ✅ |
 
 ## CHIP-8 互換性 (quirk)
 
-モダン互換実装:
-- `FX55`/`FX65`: I レジスタを加算しない
-- `8XY6`/`8XYE` シフト: VX を使用（VY ではない）
-- `DXYN`: 画面端でクリップ（ラップしない）
+デフォルトはモダン互換。`QUIRK_*` の #define で原典挙動に切替可能:
+- `FX55`/`FX65`: I レジスタを加算しない（`QUIRK_LOADSTORE_I=1` で加算）
+- `8XY6`/`8XYE` シフト: VX を使用（`QUIRK_SHIFT_VY=1` で VY）
+- `DXYN`: 画面端でクリップ（ラップしない、固定）
+
+Brix・Space Invaders [David Winter] はともにモダン互換 (`QUIRK_*=0`) で動作確認済み。
