@@ -323,16 +323,49 @@ static void op_draw(uint8_t x, uint8_t y, uint8_t n)
     }
 }
 
+/* ============================================================
+ * chip8_cycle: 1 命令を フェッチ→デコード→実行 (CPU 本体)
+ * ============================================================
+ * CHIP-8 命令は全て 16bit 固定長・ビッグエンディアン。
+ * mem[pc] が上位バイト、mem[pc+1] が下位バイト。
+ * フェッチ後すぐ pc を +2 し、分岐/ジャンプ命令はその pc を上書きする。
+ * 条件スキップ命令 (3/4/5/9/E系) は pc をさらに +2 して次命令を飛ばす。
+ *
+ * 【命令フィールドの分解】(16bit を共通の名前で区切る)
+ *   x   = op[11:8]  第1レジスタ番号 (Vx)
+ *   y   = op[7:4]   第2レジスタ番号 (Vy)
+ *   n   = op[3:0]   下位4bit (DXYN のスプライト高さ等)
+ *   kk  = op[7:0]   8bit 即値
+ *   nnn = op[11:0]  12bit アドレス
+ *
+ * 【命令一覧】(上位4bit op&0xF000 で大分類)
+ *   00E0 CLS 画面消去        00EE RET サブルーチン復帰
+ *   1NNN JP nnn             2NNN CALL nnn        BNNN JP V0+nnn
+ *   3XKK SE  Vx,kk (==で skip)   4XKK SNE Vx,kk (!=で skip)
+ *   5XY0 SE  Vx,Vy (==で skip)   9XY0 SNE Vx,Vy (!=で skip)
+ *   6XKK LD  Vx,kk          7XKK ADD Vx,kk (桁上げ無視)
+ *   8XY0 = / 8XY1 OR / 8XY2 AND / 8XY3 XOR
+ *   8XY4 加算(VF=carry) / 8XY5 減算(VF=!borrow)
+ *   8XY6 右shift(VF=溢れbit) / 8XY7 逆減算 / 8XYE 左shift(VF=溢れbit)
+ *   ANNN LD I,nnn          CXKK RND Vx (乱数&kk)   DXYN DRW スプライト描画
+ *   EX9E key押下で skip      EXA1 key非押下で skip
+ *   FX07 Vx=DT  FX0A キー待ち  FX15 DT=Vx  FX18 ST=Vx  FX1E I+=Vx
+ *   FX29 I=フォント(Vx)  FX33 BCD  FX55 V0..Vx 保存  FX65 V0..Vx 復元
+ *
+ * 8XY6/8XYE と FX55/FX65 は ROM 互換のため QUIRK_* で挙動切替可能。
+ */
 static void chip8_cycle(void)
 {
+    /* 16bit 命令フェッチ (ビッグエンディアン) → pc を次へ進める */
     uint16_t op = (mem[pc] << 8) | mem[pc + 1];
     pc += 2;
 
-    uint8_t  x   = (op >> 8) & 0x0F;
-    uint8_t  y   = (op >> 4) & 0x0F;
-    uint8_t  n   = op & 0x0F;
-    uint8_t  kk  = op & 0xFF;
-    uint16_t nnn = op & 0x0FFF;
+    /* 命令フィールド分解 */
+    uint8_t  x   = (op >> 8) & 0x0F;  /* Vx レジスタ番号 */
+    uint8_t  y   = (op >> 4) & 0x0F;  /* Vy レジスタ番号 */
+    uint8_t  n   = op & 0x0F;         /* 下位4bit */
+    uint8_t  kk  = op & 0xFF;         /* 8bit 即値 */
+    uint16_t nnn = op & 0x0FFF;       /* 12bit アドレス */
 
     switch (op & 0xF000) {
     case 0x0000:
@@ -493,7 +526,22 @@ int main(void)
     return 0;
 }
 
-/* ===== DP 初期化 (Tetris/Pong と同一) ===== */
+/* ============================================================
+ * DisplayPort (HDMI) Live Video 初期化 (Tetris/Pong と同一)
+ * ============================================================
+ * KV260 の HDMI 出力は PS の DisplayPort コントローラが担う。
+ * PL が生成したライブ映像 (rtl_top の video_*) を DP に流すには
+ * 以下の順序で初期化が必要。これが無いと AXI は動くがモニタは無信号。
+ *   main() → InitDP() : ドライバ初期化 + AVBuf を Live 入力に設定
+ *          → RunDP()  : 接続確認 → TrainLink → SetupVideoStream
+ */
+
+/* InitDP: DP/AVBuf ドライバ初期化と映像経路の設定
+ *   - XDpPsu (DP TX) と XAVBuf (映像ブレンダ) を Config から初期化
+ *   - 入力 = Live Video(RGB 12bpc)、出力 = RGB 8bpc を選択
+ *   - 映像ストリーム1 を Live に、音声は無しに構成
+ *   - 映像クロックを PL クロック源に指定して AVBuf を SoftReset
+ *   戻り値: XST_SUCCESS / XST_FAILURE */
 static int InitDP(void)
 {
     XDpPsu_Config *Cfg;
@@ -525,6 +573,13 @@ static int InitDP(void)
     return XST_SUCCESS;
 }
 
+/* TrainLink: DP リンクトレーニング
+ *   ソース(KV260)とシンク(モニタ)間で電気的に最適な設定を交渉する。
+ *   - GetRxCapabilities: モニタ対応のレーン数/速度を取得
+ *   - SetLaneCount/SetLinkRate: 最大レーン数・2.7Gbps/lane(0x0A) に設定
+ *   - SetEnhancedFrameMode/SetDownspread: 拡張フレーミング・EMI対策
+ *   - EstablishLink: ★トレーニング本体(電圧振幅/プリエンファシス調整)
+ *   戻り値が FAILURE ならケーブル/モニタ側の問題。 */
 static u32 TrainLink(void)
 {
     if (XDpPsu_GetRxCapabilities(&DpPsu) != XST_SUCCESS) return XST_FAILURE;
@@ -539,6 +594,14 @@ static u32 TrainLink(void)
     return Status;
 }
 
+/* SetupVideoStream: 映像ストリームの確定と送出開始
+ *   リンク確立後、流す映像フォーマット(解像度・色)を設定して開始する。
+ *   - SetColorEncode/CfgMsaSetBpc: RGB / 8bit色
+ *   - CfgMsaUseStandardVideoMode: 1280x720 60Hz
+ *   - SOFT_RESET トグル: 映像パイプラインをリセット
+ *   - SetMsaValues: ★MSA(同期・解像度等のタイミング諸元)を HW に書込み
+ *   - 0xB124 トグル: DP ストリーム部の内部リセット(テンプレート固定手順)
+ *   - EnableMainLink(1): ★メインリンク ON → 映像が流れ始める */
 static void SetupVideoStream(void)
 {
     XDpPsu_SetColorEncode(&DpPsu, XDPPSU_CENC_RGB);
@@ -557,6 +620,13 @@ static void SetupVideoStream(void)
     xil_printf("Video stream started\r\n");
 }
 
+/* RunDP: DP 起動シーケンス全体 (DP 規格の標準手順)
+ *   1. EnableMainLink(0): 一旦リンクを止めてクリーンな状態に
+ *   2. IsConnected: ★ケーブル接続(HPD)確認。未接続なら中断
+ *   3. AuxWrite(SET_POWER): AUX チャネルでシンクを電源ON(スリープ解除)。
+ *      取りこぼし対策で 2 回送る
+ *   4. usleep(100ms): シンクの起動待ち
+ *   5. TrainLink 成功なら SetupVideoStream で映像送出開始 */
 static void RunDP(void)
 {
     XDpPsu_EnableMainLink(&DpPsu, 0);
