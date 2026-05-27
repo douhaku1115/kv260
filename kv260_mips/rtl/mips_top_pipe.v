@@ -36,7 +36,14 @@
 //   - rs と 0 の比較分岐: bltz/bgez/blez/bgtz (EX 段, フォワーディング後 rs)
 //   - シフト: sll/srl/sra (a=rt, b=shamt), sllv/srlv/srav (a=rt, b=rs)
 //   - addiu/addu/subu/sltu/sltiu/nor は既存 ALU 経路でそのまま動作
-//   - mult/div/HI/LO・バイト/ハーフword・例外は Step 12f 以降
+//
+// 【Step 12f スコープ】 (本ファイル)
+//   - mult/multu/div/divu: EX 段で HI/LO レジスタに書き込み (フォワーディング後オペランド)
+//   - mfhi/mflo: EX 段で HI/LO を読み ex_result 経由で WB へ
+//     (mfhi/mflo は mult/div の 1 命令以上後に EX へ来るため専用フォワーディング不要)
+//   - バイト/ハーフワード: lb/lbu/lh/lhu/sb/sh
+//     MEM 段で mem_size + addr[1:0] から byte_en 生成、読出しはスライス+符号/ゼロ拡張
+//   - 例外処理 (Step 11) のパイプライン化は Step 12g/13 で別途
 //
 // 【フォワーディングロジック】
 //   ID/EX.rs が EX/MEM のデスティネーションと一致 → ALU 入力 a に EX/MEM 結果を直送
@@ -265,6 +272,12 @@ module mips_top_pipe (
     reg        id_ex_lui_instr;    // Step 12e: lui
     reg        id_ex_shift;        // Step 12e: sll/srl/sra
     reg        id_ex_var_shift;    // Step 12e: sllv/srlv/srav
+    reg        id_ex_hilo_write;   // Step 12f: mult/multu/div/divu
+    reg [1:0]  id_ex_hilo_op;      // Step 12f: 00=mult,01=multu,10=div,11=divu
+    reg        id_ex_mfhilo;       // Step 12f: mfhi/mflo
+    reg        id_ex_sel_hi;       // Step 12f: 1=HI(mfhi), 0=LO(mflo)
+    reg [1:0]  id_ex_mem_size;     // Step 12f: 00=byte,01=half,10=word
+    reg        id_ex_mem_unsigned; // Step 12f: lbu/lhu=1
 
     assign id_ex_jr_w = id_ex_jr;  // forward declaration の wire と接続
 
@@ -298,6 +311,12 @@ module mips_top_pipe (
             id_ex_lui_instr   <= 1'b0;
             id_ex_shift       <= 1'b0;
             id_ex_var_shift   <= 1'b0;
+            id_ex_hilo_write  <= 1'b0;
+            id_ex_hilo_op     <= 2'b0;
+            id_ex_mfhilo      <= 1'b0;
+            id_ex_sel_hi      <= 1'b0;
+            id_ex_mem_size    <= 2'b10;
+            id_ex_mem_unsigned<= 1'b0;
         end else if (!halt) begin
             if (load_use_stall || flush_id_ex) begin
                 // バブル挿入 / フラッシュ: 制御信号を全 0 にする (NOP)
@@ -325,6 +344,12 @@ module mips_top_pipe (
                 id_ex_lui_instr   <= 1'b0;
                 id_ex_shift       <= 1'b0;
                 id_ex_var_shift   <= 1'b0;
+                id_ex_hilo_write  <= 1'b0;   // バブル中は HI/LO 書込み禁止
+                id_ex_hilo_op     <= 2'b0;
+                id_ex_mfhilo      <= 1'b0;
+                id_ex_sel_hi      <= 1'b0;
+                id_ex_mem_size    <= 2'b10;
+                id_ex_mem_unsigned<= 1'b0;
             end else begin
                 id_ex_reg_write   <= id_reg_write;
                 id_ex_reg_dst     <= id_reg_dst;
@@ -350,6 +375,12 @@ module mips_top_pipe (
                 id_ex_lui_instr   <= id_lui_instr;
                 id_ex_shift       <= id_shift_instr;
                 id_ex_var_shift   <= id_var_shift_instr;
+                id_ex_hilo_write  <= id_hilo_write;
+                id_ex_hilo_op     <= id_hilo_op;
+                id_ex_mfhilo      <= id_mfhilo;
+                id_ex_sel_hi      <= id_sel_hi;
+                id_ex_mem_size    <= id_mem_size;
+                id_ex_mem_unsigned<= id_mem_unsigned;
             end
         end
     end
@@ -412,8 +443,44 @@ module mips_top_pipe (
         .overflow(ex_alu_overflow)
     );
 
-    // Step 12e: lui は {imm16, 16'b0} を書き戻す (ALU 結果の代わり)
-    wire [31:0] ex_result = id_ex_lui_instr ? {id_ex_sign_imm[15:0], 16'b0} : ex_alu_result;
+    // ============================================================
+    // Step 12f: mult/div → HI/LO レジスタ (EX 段、フォワーディング後オペランド)
+    // ============================================================
+    // HI/LO は EX 段でレジスタ書き込み。後続の mfhi/mflo は 1 命令以上後に
+    // EX へ来るため、書き込み済みの HI/LO を読める (専用フォワーディング不要)。
+    wire [31:0] hilo_a = alu_in_a;   // rs (フォワーディング後)
+    wire [31:0] hilo_b = alu_in_rt;  // rt (フォワーディング後)
+
+    wire [63:0] mult_s = $signed(hilo_a) * $signed(hilo_b);
+    wire [63:0] mult_u = hilo_a * hilo_b;
+    wire [31:0] div_rs_abs = hilo_a[31] ? (~hilo_a + 1) : hilo_a;
+    wire [31:0] div_rt_abs = hilo_b[31] ? (~hilo_b + 1) : hilo_b;
+    wire [31:0] div_in1 = (id_ex_hilo_op == 2'b10) ? div_rs_abs : hilo_a;
+    wire [31:0] div_in2 = (id_ex_hilo_op == 2'b10) ? div_rt_abs : hilo_b;
+    wire [31:0] div_q_common = div_in1 / div_in2;
+    wire [31:0] div_r_common = div_in1 % div_in2;
+    wire [31:0] div_q_s = (hilo_a[31] ^ hilo_b[31]) ? (~div_q_common + 1) : div_q_common;
+    wire [31:0] div_r_s = hilo_a[31]                ? (~div_r_common + 1) : div_r_common;
+
+    reg [31:0] hi_reg, lo_reg;
+    always @(posedge clk) begin
+        if (reset) begin
+            hi_reg <= 32'b0;
+            lo_reg <= 32'b0;
+        end else if (id_ex_hilo_write & ~halt) begin
+            case (id_ex_hilo_op)
+                2'b00: {hi_reg, lo_reg} <= mult_s;          // mult
+                2'b01: {hi_reg, lo_reg} <= mult_u;          // multu
+                2'b10: begin hi_reg <= div_r_s;      lo_reg <= div_q_s;      end // div
+                2'b11: begin hi_reg <= div_r_common; lo_reg <= div_q_common; end // divu
+            endcase
+        end
+    end
+
+    // 書き戻しデータ: lui → mfhi/mflo → 通常 ALU の順で選択
+    wire [31:0] ex_result = id_ex_lui_instr ? {id_ex_sign_imm[15:0], 16'b0}     :
+                            id_ex_mfhilo    ? (id_ex_sel_hi ? hi_reg : lo_reg)  :
+                                              ex_alu_result;
 
     // jal の write_reg は $31, それ以外は通常通り
     wire [4:0] ex_write_reg = id_ex_jal_instr ? 5'd31 :
@@ -448,6 +515,8 @@ module mips_top_pipe (
     reg [31:0] ex_mem_rd2;
     reg        ex_mem_jal_instr;     // Step 12d
     reg [31:0] ex_mem_pc_plus4;      // Step 12d: jal の書き戻しデータ
+    reg [1:0]  ex_mem_mem_size;      // Step 12f: byte/half/word
+    reg        ex_mem_mem_unsigned;  // Step 12f: lbu/lhu
 
     always @(posedge clk) begin
         if (reset) begin
@@ -459,6 +528,8 @@ module mips_top_pipe (
             ex_mem_rd2        <= 32'b0;
             ex_mem_jal_instr  <= 1'b0;
             ex_mem_pc_plus4   <= 32'b0;
+            ex_mem_mem_size   <= 2'b10;
+            ex_mem_mem_unsigned <= 1'b0;
         end else if (!halt) begin
             ex_mem_reg_write  <= id_ex_reg_write;
             ex_mem_alu_result <= ex_result;       // Step 12e: lui 結果も含む
@@ -468,6 +539,8 @@ module mips_top_pipe (
             ex_mem_rd2        <= alu_in_rt;
             ex_mem_jal_instr  <= id_ex_jal_instr;
             ex_mem_pc_plus4   <= id_ex_pc_plus4;
+            ex_mem_mem_size   <= id_ex_mem_size;
+            ex_mem_mem_unsigned <= id_ex_mem_unsigned;
         end
     end
 
@@ -475,9 +548,31 @@ module mips_top_pipe (
     // MEM 段: dmem アクセス
     // ============================================================
 
-    // byte_en: Step 12c では word アクセスのみ。sw 時のみ 4'b1111、それ以外は 0
-    //          halt 中は書き込み禁止
-    wire [3:0] mem_byte_en = (ex_mem_mem_write & ~halt) ? 4'b1111 : 4'b0000;
+    // Step 12f: byte_en 生成 (mem_size + addr[1:0], ビッグエンディアン)
+    //           halt 中は書き込み禁止
+    reg [3:0] mem_byte_en;
+    always @(*) begin
+        if (!(ex_mem_mem_write & ~halt))
+            mem_byte_en = 4'b0000;
+        else case (ex_mem_mem_size)
+            2'b00: // sb
+                case (ex_mem_alu_result[1:0])
+                    2'b00: mem_byte_en = 4'b1000; // offset 0 → mem[31:24]
+                    2'b01: mem_byte_en = 4'b0100;
+                    2'b10: mem_byte_en = 4'b0010;
+                    2'b11: mem_byte_en = 4'b0001; // offset 3 → mem[7:0]
+                endcase
+            2'b01: // sh
+                mem_byte_en = ex_mem_alu_result[1] ? 4'b0011 : 4'b1100;
+            default: // sw
+                mem_byte_en = 4'b1111;
+        endcase
+    end
+
+    // 書き込みデータのバイト/ハーフ複製 (byte_en で必要バイトのみ確定)
+    wire [31:0] mem_write_data = (ex_mem_mem_size == 2'b00) ? {4{ex_mem_rd2[7:0]}}  : // sb
+                                 (ex_mem_mem_size == 2'b01) ? {2{ex_mem_rd2[15:0]}} : // sh
+                                                              ex_mem_rd2;             // sw
 
     wire [31:0] mem_read_data;
 
@@ -485,9 +580,25 @@ module mips_top_pipe (
         .clk(clk),
         .byte_en(mem_byte_en),
         .addr(ex_mem_alu_result),
-        .write_data(ex_mem_rd2),
+        .write_data(mem_write_data),
         .read_data(mem_read_data)
     );
+
+    // Step 12f: 読み出しデータのスライス + 符号/ゼロ拡張 (ビッグエンディアン)
+    wire [7:0] mem_byte_sel =
+        (ex_mem_alu_result[1:0] == 2'b00) ? mem_read_data[31:24] :
+        (ex_mem_alu_result[1:0] == 2'b01) ? mem_read_data[23:16] :
+        (ex_mem_alu_result[1:0] == 2'b10) ? mem_read_data[15: 8] :
+                                            mem_read_data[ 7: 0];
+    wire [15:0] mem_half_sel =
+        ex_mem_alu_result[1] ? mem_read_data[15:0] : mem_read_data[31:16];
+
+    wire [31:0] mem_data_final =
+        (ex_mem_mem_size == 2'b00) ? (ex_mem_mem_unsigned ? {24'b0,             mem_byte_sel}
+                                                          : {{24{mem_byte_sel[7]}},  mem_byte_sel}) :
+        (ex_mem_mem_size == 2'b01) ? (ex_mem_mem_unsigned ? {16'b0,             mem_half_sel}
+                                                          : {{16{mem_half_sel[15]}}, mem_half_sel}) :
+                                      mem_read_data;
 
     // ============================================================
     // MEM/WB パイプラインレジスタ
@@ -515,7 +626,7 @@ module mips_top_pipe (
             mem_wb_alu_result <= ex_mem_alu_result;
             mem_wb_write_reg  <= ex_mem_write_reg;
             mem_wb_mem_to_reg <= ex_mem_mem_to_reg;
-            mem_wb_mem_data   <= mem_read_data;
+            mem_wb_mem_data   <= mem_data_final;   // Step 12f: スライス+拡張済み
             mem_wb_jal_instr  <= ex_mem_jal_instr;
             mem_wb_pc_plus4   <= ex_mem_pc_plus4;
         end

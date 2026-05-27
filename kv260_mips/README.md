@@ -260,6 +260,7 @@ WB:   regfile 書き戻し
 | 12c  | メモリ + ロードユース | lw/sw 追加。`lw → 直後に lw 結果を使う` を 1 サイクルストールで吸収 |
 | 12d  | 分岐・ジャンプ | beq/bne (EX 段で taken 判定, IF/ID + ID/EX フラッシュ), j/jal (ID 段, IF/ID フラッシュ), jr (EX 段, rs はフォワーディング) |
 | 12e  | 残り即値/ALU/分岐 | lui (EX で `{imm16,16'b0}` 生成), ori/andi/xori (ID でゼロ拡張即値), シフト sll/srl/sra・sllv/srlv/srav (EX でオペランド入替), bltz/bgez/blez/bgtz (EX で rs と 0 比較), addiu/addu/subu/sltu/sltiu/nor |
+| 12f  | 乗除算・サブワード | mult/multu/div/divu (EX で HI/LO 書込み、フォワーディング後オペランド), mfhi/mflo (EX で HI/LO 読出→WB), lb/lbu/lh/lhu/sb/sh (MEM で byte_en 生成・スライス+符号/ゼロ拡張) |
 
 **ハザード処理**
 
@@ -297,11 +298,18 @@ wb_write_data = mem_wb_jal_instr   ? mem_wb_pc_plus4    // jal
 - **シフト (sll/srl/sra/sllv/srlv/srav)**: EX 段でオペランドを入替（`a=rt`, `b=shamt` or `rs`）。shamt は伝搬済み即値の `[10:6]` から取得。値オペランドは rt なので既存の `forward_b` がそのまま機能
 - **addiu/addu/subu/sltu/sltiu/nor**: 既存 ALU 経路でそのまま動作（追加ロジック不要）
 
-**Step 12f 以降の予定**
+**Step 12f の実装詳細**
 
-- mult/div/HI/LO (mult/multu/div/divu/mfhi/mflo)
-- バイト/ハーフワードアクセス (lb/lbu/lh/lhu/sb/sh)
-- Step 11 の例外処理 (パイプライン例外は精密化が必要)
+- **mult/multu/div/divu**: EX 段でフォワーディング後の rs/rt から積/商余を計算し、`id_ex_hilo_write` のとき HI/LO レジスタへ書き込む。バブル/フラッシュ時は `id_ex_hilo_write=0` にして誤書込みを防ぐ
+- **mfhi/mflo**: EX 段で HI/LO を読み `ex_result` 経由で WB へ。mfhi/mflo は mult/div の 1 命令以上後に EX へ来るため、HI/LO は前サイクルに書込み済みで**専用フォワーディング不要**
+- **lb/lbu/lh/lhu/sb/sh**: `mem_size`/`mem_unsigned` を EX/MEM まで伝搬。MEM 段で `mem_size + addr[1:0]` から byte_en 生成、書込みデータをバイト/ハーフ複製。読出しは MEM 段でスライス+符号/ゼロ拡張して MEM/WB へ
+- `sw→lb/lh` の store→load は dmem が同期書込み/非同期読出しのため、`sw→lw`（12c）と同じく 1 命令後の読出しで成立
+- 注意: 32bit 組み合わせ除算器が EX 段に入るためタイミング余裕が縮小（WNS +5.1ns @20MHz）
+
+**Step 12g 以降の予定**
+
+- Step 11 の例外処理 (CP0/syscall/overflow) のパイプライン化 (Step 13 検討)
+- C 言語実行 (test10) と C テスト群のパイプライン再確認
 
 ---
 
@@ -521,3 +529,4 @@ controls[8:0]:
 | 12c  | lw/sw + ロードユースストール                           | ✓ |
 | 12d  | 分岐 (beq/bne) + ジャンプ (j/jal/jr) + フラッシュ      | ✓ |
 | 12e  | lui/ori/andi/xori/シフト/blez系/addiu/addu/subu/sltu/sltiu/nor | ✓ |
+| 12f  | mult/multu/div/divu/mfhi/mflo + lb/lbu/lh/lhu/sb/sh           | ✓ |
