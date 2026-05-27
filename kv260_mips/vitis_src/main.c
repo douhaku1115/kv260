@@ -614,6 +614,35 @@ static void run_test9(void)
 }
 
 // ============================================================
+// Test CP0: mfc0 / mtc0 ラウンドトリップ (Step 12g-1)
+// ============================================================
+// 例外発生・eret はまだ無い (12g-2/3)。CP0 レジスタへの GPR 書込み (mtc0) と
+// 読出し (mfc0) だけを確認する。
+//   addi $1,0x55 ; mtc0 $1,$13(Cause) ; mfc0 $2,$13  → $2=0x55
+//   addi $3,0x2A ; mtc0 $3,$14(EPC)   ; mfc0 $4,$14  → $4=0x2A
+static const u32 test_cp0_program[] = {
+    0x20010055, // addi $1, $0, 0x55      $1 = 0x55
+    0x40816800, // mtc0 $1, $13           CP0 Cause = 0x55
+    0x40026800, // mfc0 $2, $13           $2 = Cause = 0x55
+    0x2003002A, // addi $3, $0, 0x2A      $3 = 0x2A
+    0x40837000, // mtc0 $3, $14           CP0 EPC = 0x2A
+    0x40047000, // mfc0 $4, $14           $4 = EPC = 0x2A
+    0x08000006, // j 0x18                 無限ループ
+};
+#define TEST_CP0_COUNT  (sizeof(test_cp0_program) / sizeof(test_cp0_program[0]))
+
+static void run_test_cp0(void)
+{
+    xil_printf("--- Test CP0: mfc0/mtc0 (Step 12g-1) ---\r\n");
+    mips_reset();
+    mips_load_program(test_cp0_program, TEST_CP0_COUNT);
+    mips_run_cycles(100);
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=0x55, $2=0x55, $3=0x2A, $4=0x2A\r\n");
+    mips_dump_regs(1, 4);
+}
+
+// ============================================================
 // Test 10: C言語実行 (Step 10)
 // ============================================================
 // mips-linux-gnu-gcc でコンパイルした C プログラムを実行する。
@@ -1244,7 +1273,7 @@ static void run_all_c_tests(void)
 
 int main(void)
 {
-    xil_printf("\r\n==== MIPS Pipeline Test (Step 12f) ====\r\n\r\n");
+    xil_printf("\r\n==== MIPS Pipeline Test (Step 12g-1) ====\r\n\r\n");
     run_test_pipe_a();
     xil_printf("\r\n");
     run_test1();
@@ -1266,11 +1295,13 @@ int main(void)
     run_test7();           // Step 12f: mult, multu, div, divu, mfhi, mflo
     xil_printf("\r\n");
     run_test8();           // Step 12f: lb, lbu, lh, lhu, sb, sh
-    /* Step 12g 以降で順次再有効化する。
+    xil_printf("\r\n");
+    run_test_cp0();        // Step 12g-1: mfc0/mtc0
+    /* Step 12g-2/3 以降で順次再有効化する。
     run_test10();          // C言語実行
     run_all_c_tests();
     run_test11b();
-    run_test11();          // 例外処理 (パイプライン例外は精密化が必要)
+    run_test11();          // 例外処理 (syscall/overflow/eret)
     */
     xil_printf("\r\n==== Done ====\r\n");
     return 0;

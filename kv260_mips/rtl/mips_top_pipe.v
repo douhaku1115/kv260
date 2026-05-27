@@ -43,7 +43,11 @@
 //     (mfhi/mflo は mult/div の 1 命令以上後に EX へ来るため専用フォワーディング不要)
 //   - バイト/ハーフワード: lb/lbu/lh/lhu/sb/sh
 //     MEM 段で mem_size + addr[1:0] から byte_en 生成、読出しはスライス+符号/ゼロ拡張
-//   - 例外処理 (Step 11) のパイプライン化は Step 12g/13 で別途
+//
+// 【Step 12g-1 スコープ】 (本ファイル)
+//   - CP0 レジスタ ($12 SR / $13 Cause / $14 EPC) と mfc0/mtc0 のみ
+//     EX 段で CP0 書込み(mtc0)・読出し(mfc0)。HI/LO と同方式で専用FW不要
+//   - 例外発生(syscall/overflow→0x80)・eret は 12g-2/12g-3 で追加予定
 //
 // 【フォワーディングロジック】
 //   ID/EX.rs が EX/MEM のデスティネーションと一致 → ALU 入力 a に EX/MEM 結果を直送
@@ -278,6 +282,8 @@ module mips_top_pipe (
     reg        id_ex_sel_hi;       // Step 12f: 1=HI(mfhi), 0=LO(mflo)
     reg [1:0]  id_ex_mem_size;     // Step 12f: 00=byte,01=half,10=word
     reg        id_ex_mem_unsigned; // Step 12f: lbu/lhu=1
+    reg        id_ex_is_mfc0;      // Step 12g-1: mfc0 (CP0→GPR)
+    reg        id_ex_is_mtc0;      // Step 12g-1: mtc0 (GPR→CP0)
 
     assign id_ex_jr_w = id_ex_jr;  // forward declaration の wire と接続
 
@@ -317,6 +323,8 @@ module mips_top_pipe (
             id_ex_sel_hi      <= 1'b0;
             id_ex_mem_size    <= 2'b10;
             id_ex_mem_unsigned<= 1'b0;
+            id_ex_is_mfc0     <= 1'b0;
+            id_ex_is_mtc0     <= 1'b0;
         end else if (!halt) begin
             if (load_use_stall || flush_id_ex) begin
                 // バブル挿入 / フラッシュ: 制御信号を全 0 にする (NOP)
@@ -350,6 +358,8 @@ module mips_top_pipe (
                 id_ex_sel_hi      <= 1'b0;
                 id_ex_mem_size    <= 2'b10;
                 id_ex_mem_unsigned<= 1'b0;
+                id_ex_is_mfc0     <= 1'b0;
+                id_ex_is_mtc0     <= 1'b0;   // バブル中は CP0 書込み禁止
             end else begin
                 id_ex_reg_write   <= id_reg_write;
                 id_ex_reg_dst     <= id_reg_dst;
@@ -381,6 +391,8 @@ module mips_top_pipe (
                 id_ex_sel_hi      <= id_sel_hi;
                 id_ex_mem_size    <= id_mem_size;
                 id_ex_mem_unsigned<= id_mem_unsigned;
+                id_ex_is_mfc0     <= id_is_mfc0;
+                id_ex_is_mtc0     <= id_is_mtc0;
             end
         end
     end
@@ -477,8 +489,37 @@ module mips_top_pipe (
         end
     end
 
-    // 書き戻しデータ: lui → mfhi/mflo → 通常 ALU の順で選択
+    // ============================================================
+    // Step 12g-1: CP0 レジスタ + mfc0/mtc0 (EX 段、HI/LO と同方式)
+    // ============================================================
+    //   $12 SR / $13 Cause / $14 EPC。12g-1 では mtc0/mfc0 のみ実装し、
+    //   例外発生・eret は 12g-2/12g-3 で追加する。
+    //   mtc0: EX 段で CP0[id_ex_rd] ← GPR[rt] (フォワーディング後 alu_in_rt)
+    //   mfc0: EX 段で CP0[id_ex_rd] を読み ex_result 経由で WB へ
+    //   mtc0 の 1 命令以上後に mfc0 が EX へ来るため専用フォワーディング不要
+    reg [31:0] cp0_sr, cp0_cause, cp0_epc;
+    always @(posedge clk) begin
+        if (reset) begin
+            cp0_sr    <= 32'b0;
+            cp0_cause <= 32'b0;
+            cp0_epc   <= 32'b0;
+        end else if (id_ex_is_mtc0 & ~halt) begin
+            case (id_ex_rd)
+                5'd12: cp0_sr    <= alu_in_rt;
+                5'd13: cp0_cause <= alu_in_rt;
+                5'd14: cp0_epc   <= alu_in_rt;
+                default: ;
+            endcase
+        end
+    end
+
+    wire [31:0] cp0_read = (id_ex_rd == 5'd12) ? cp0_sr    :
+                           (id_ex_rd == 5'd13) ? cp0_cause :
+                           (id_ex_rd == 5'd14) ? cp0_epc   : 32'b0;
+
+    // 書き戻しデータ: lui → mfc0 → mfhi/mflo → 通常 ALU の順で選択
     wire [31:0] ex_result = id_ex_lui_instr ? {id_ex_sign_imm[15:0], 16'b0}     :
+                            id_ex_is_mfc0   ? cp0_read                          :
                             id_ex_mfhilo    ? (id_ex_sel_hi ? hi_reg : lo_reg)  :
                                               ex_alu_result;
 

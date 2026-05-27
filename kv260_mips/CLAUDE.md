@@ -1,9 +1,9 @@
 # KV260 MIPS プロジェクト — 現在の状態
 
 ## 現在地
-**Step 12f 完了・実機確認済み**
+**Step 12g-1 完了・実機確認済み**
 
-- Step 1〜12f: 実機動作確認済み
+- Step 1〜12g-1: 実機動作確認済み
 - 単一サイクル版 (`mips_top.v`) は Step 11 で完成、`mips_top_pipe.v` (Step 12) に切替済み
 - 切り戻し: `mips_axi.v` で `mips_top_pipe` → `mips_top` に変更すれば単一サイクルに戻る
 - クロック: 20MHz（rebuild.tcl で設定）
@@ -16,11 +16,13 @@
 - 12d: beq/bne + j/jal/jr + フラッシュ ✓
 - 12e: lui/ori/andi/xori/シフト/blez 系/addiu/addu/subu/sltu/sltiu/nor ✓
 - 12f: mult/multu/div/divu/mfhi/mflo + lb/lbu/lh/lhu/sb/sh ✓
-- 12g (Step 13 と統合検討): 例外処理 (Step 11) のパイプライン化 (未着手)
+- 12g-1: CP0 (SR/Cause/EPC) + mfc0/mtc0 ✓
+- 12g-2: syscall/overflow 例外発生 + 0x80 リダイレクト + フラッシュ (未着手)
+- 12g-3: eret 復帰 (PC←EPC, SR.EXL←0) (未着手)
 
 ## 今後のロードマップ
 
-- Step 12g 対応 → 全 Step 1〜11 をパイプラインで再現。C 言語実行(test10)も再確認
+- Step 12g-2/3 → 例外処理完成。その後 C 言語実行(test10)・C テスト群を再確認
 
 ## 標準フロー（毎 Step）
 1. RTL 変更
@@ -33,6 +35,6 @@
 - Vivado: `E:\vivado\2025.2\Vivado\bin\vivado.bat`
 - プロジェクト: `E:\fpga\kria260\kv260_mips\`
 - XSA: `E:\fpga\kria260\kv260_mips\project_1\design_1_wrapper.xsa`
-- Vitis WS: `E:\Xilinx\project_vitis\kv_mips19`（Step 12f。kv_mips14〜18 は古い）
+- Vitis WS: `E:\Xilinx\project_vitis\kv_mips20`（Step 12g-1。kv_mips14〜19 は古い）
 - main.c（編集はここのみ）: `E:\fpga\kria260\kv260_mips\vitis_src\main.c`
 - git: https://github.com/douhaku1115/kv260.git
