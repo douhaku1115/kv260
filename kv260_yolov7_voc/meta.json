@@ -1,0 +1,8 @@
+{
+    "lib": "libvart-dpu-runner.so",
+    "filename": "yolov7_voc_kv260.xmodel",
+    "kernel": [
+        "subgraph_Model__Model_Concat_model__Concat_100__ret_551"
+    ],
+    "target": "DPUCZDX8G_ISA1_B4096_0101000016010407"
+}
