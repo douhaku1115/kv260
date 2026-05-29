@@ -3,7 +3,7 @@ title: "KV260のFPGA(DPU)で動かす独自YOLOv7 - 転移学習からデプロ�
 emoji: "🦅"
 type: "tech"
 topics: ["fpga", "kv260", "vitisai", "yolov7", "ディープラーニング"]
-published: false
+published: true
 ---
 
 ## はじめに
