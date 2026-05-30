@@ -5,9 +5,10 @@ USBカメラの映像をYOLOv7 + DPU B4096でリアルタイム物体検出し�
 
 ## 動作結果
 
-- DPU推論: 185ms/frame
-- 合計: 275ms/frame（3.6 FPS）
+- DPU推論: ~185ms/frame
+- 合計: ~320ms/frame（3.1 FPS）
 - 80クラス（COCO）のリアルタイム検出
+- モデル: YOLOv7 COCO (39MB xmodel)
 
 ## ファイル構成
 
@@ -85,7 +86,7 @@ After:  np.where(mask) + 一括sigmoid + 一括座標計算                     
 
 ### 前提条件
 
-- 案8（kv260_yolov7_dpu）のxmodelとDockerイメージ（vai-yolov7:v2）がKV260上にあること
+- YOLOv7 COCO xmodelとDockerイメージ（vai-yolov7:v5）がKV260上にあること
 - USBカメラがKV260に接続されていること（/dev/video0）
 - KV260のHDMIモニタ前で直接操作すること（SSH経由ではX11表示不可）
 
@@ -140,7 +141,7 @@ DISPLAY=:1 bash ~/run_yolo_cam.sh 1
 
 - KV260 Ubuntu 22.04
 - DPU: DPUCZDX8G_ISA1_B4096 (300MHz)
-- Docker: vai-yolov7:v2 (Vitis AI runtime + OpenCV GUI)
-- xmodel: 案8で量子化・コンパイル済みYOLOv7
+- Docker: vai-yolov7:v5 (Vitis AI runtime + OpenCV GUI + GTK)
+- xmodel: YOLOv7 COCO 80クラス (39MB, Vitis AI 3.5量子化・B4096コンパイル済み)
 - USBカメラ: UVC対応 640x480
 - 表示: HDMI (cv2.imshow, X11, DISPLAY=:1)

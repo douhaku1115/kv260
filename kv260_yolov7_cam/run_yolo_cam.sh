@@ -11,5 +11,5 @@ sudo docker run --rm \
   --privileged \
   --net=host \
   -w /work \
-  vai-yolov7:v2 \
+  vai-yolov7:v5 \
   python3 /work/yolov7_cam.py /work/yolov7_kv260.xmodel ${1:-0}
