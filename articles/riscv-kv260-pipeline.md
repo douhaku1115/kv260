@@ -1,0 +1,248 @@
+---
+title: "「RISC-Vで学ぶコンピュータアーキテクチャ」のパイプラインプロセッサをKV260で動かす"
+emoji: "🔧"
+type: "tech"
+topics: ["fpga", "kv260", "riscv", "vivado", "verilog"]
+published: true
+---
+
+## はじめに
+
+「RISC-Vで学ぶコンピュータアーキテクチャ」（東京大学出版会）の教科書に載っている**3段パイプラインRISC-Vプロセッサ**を、Xilinx Kria KV260上で動作させました。
+
+教科書のコードはArty A7等の教育用ボード向けですが、KV260ではクロック供給やデバッグ方法が異なるため、移植にいくつかハマりポイントがあります。本記事ではその過程をまとめます。
+
+**結果**: VIOで計算結果 `0x13BA`（= 5050 = 0+1+2+...+100）を確認
+
+## 環境
+
+| 項目 | 内容 |
+|------|------|
+| ボード | Kria KV260 (xck26-sfvc784-2LV-c) |
+| ツール | Vivado 2025.1 |
+| ホストPC | Ubuntu, RTX 5070 Ti |
+| KV260 OS | Linux (PetaLinux系) |
+| 接続 | JTAG + SSH (192.168.0.x) |
+
+## 教科書のプロセッサ構成
+
+教科書Chap9の `m_proc8_F` は以下の構成を持つ3段パイプラインプロセッサです。
+
+```
+[IF: フェッチ] → [EX: デコード+実行] → [WB: ライトバック]
+     P1_*              P2_*                P3_*
+```
+
+### 主な特徴
+
+- **3段パイプライン**: IF → EX → WB
+- **データフォワーディング**: EX段で前の命令の結果を直接バイパス
+- **分岐予測**: 静的「Not Taken」（常にPC+4をフェッチ、ミス時2サイクルペナルティ）
+- **対応命令**: R形式(add等)、I形式(addi, lw等)、S形式(sw)、B形式(bne等)、U形式(lui, auipc)、J形式(jal)
+
+### テストプログラム
+
+0から100までの和（= 5050）を計算し、結果をレジスタx30に格納します。
+
+```verilog
+`MM[0]={12'd0,5'd0,3'h0,5'd10,7'h13};         // addi x10,x0,0
+`MM[1]={12'd0,5'd0,3'h0,5'd3,7'h13};          // addi x3,x0,0
+`MM[2]={12'd101,5'd0,3'h0,5'd1,7'h13};        // addi x1,x0,101
+`MM[3]={7'd0,5'd3,5'd10,3'h0,5'd10,7'h33};    // L: add x10,x10,x3
+`MM[4]={12'd1,5'd3,3'h0,5'd3,7'h13};          // addi x3,x3,1
+`MM[5]={~12'd0,5'd1,5'd3,3'h1,5'b11001,7'h63};// bne x3,x1,L
+`MM[6]=32'h00050f13;                          // addi x30,x10,0 (HALT)
+```
+
+## 教科書コード → KV260 の変更点
+
+教科書のコードはArty A7等を想定しており、KV260ではそのまま動きません。
+
+| 項目 | 教科書 (Arty等) | KV260 |
+|------|-----------------|-------|
+| クロック | PL外部ピン (XDC指定) | Zynq PS の `pl_clk0` (100MHz) |
+| 結果確認 | VIO IP (直接インスタンス) | VIO IP + Zynq PS クロック |
+| XDC制約 | 必要 | 不要（ボード定義で処理） |
+| `$finish` | シミュレーション終了用 | 削除（実機では不要） |
+
+### KV260固有の問題: PLクロック
+
+KV260はPL側に外部クロックピンがありません。クロックはZynq UltraScale+ PSの`pl_clk0`から供給されます。そのため、**ブロックデザインでZynq PSをインスタンス化**してクロックを取り出す必要があります。
+
+## プロジェクト構成
+
+```
+kv260/
+├── src/
+│   ├── main_vio.v      # プロセッサ + VIOトップモジュール
+│   └── asm.txt          # テストプログラム
+└── create_vio_full.tcl  # Vivadoプロジェクト自動生成スクリプト
+```
+
+### トップモジュール
+
+```verilog
+module m_top_kv260();
+  wire w_clk;
+  wire [31:0] w_rslt;
+  clk_bd_wrapper m0 (.pl_clk0(w_clk));  // Zynq PSからクロック取得
+  m_proc8_F m1 (w_clk, w_rslt);         // RISC-Vプロセッサ
+  vio_0 m2 (w_clk, w_rslt);             // VIOで結果観測
+endmodule
+```
+
+ポイントは `clk_bd_wrapper` です。これはブロックデザインで作成したZynq PSのラッパーで、`pl_clk0`のみを出力します。AXIポートは全て無効化しています。
+
+### TCLスクリプト（抜粋）
+
+```tcl
+# Zynq PSを追加（クロック供給のみ）
+create_bd_cell -type ip -vlnv xilinx.com:ip:zynq_ultra_ps_e:3.5 zynq_ultra_ps_e_0
+apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e \
+  -config {apply_board_preset "1"} [get_bd_cells zynq_ultra_ps_e_0]
+
+# AXIポート全無効（クロックだけ使う）
+set_property -dict [list \
+  CONFIG.PSU__USE__M_AXI_GP0 {0} \
+  CONFIG.PSU__USE__M_AXI_GP1 {0} \
+  CONFIG.PSU__USE__M_AXI_GP2 {0} \
+  CONFIG.PSU__FPGA_PL0_ENABLE {1} \
+  CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {100} \
+] [get_bd_cells zynq_ultra_ps_e_0]
+
+# クロックを外部ポートとして公開
+create_bd_port -dir O -type clk pl_clk0
+connect_bd_net [get_bd_pins zynq_ultra_ps_e_0/pl_clk0] [get_bd_ports pl_clk0]
+```
+
+## ビルドと書き込み
+
+### 1. プロジェクト生成
+
+```bash
+cd /path/to/kv260
+vivado -mode batch -source create_vio_full.tcl
+```
+
+### 2. ビットストリーム生成
+
+```bash
+vivado -mode batch -source - <<'EOF'
+open_project vivado/riscv_kv260_vio2/riscv_kv260_vio2.xpr
+launch_runs synth_1 -jobs 8
+wait_on_run synth_1
+launch_runs impl_1 -to_step write_bitstream -jobs 8
+wait_on_run impl_1
+EOF
+```
+
+### 3. KV260への書き込み
+
+```bash
+# ホストPCからbitファイルを転送
+scp -O vivado/riscv_kv260_vio2/riscv_kv260_vio2.runs/impl_1/m_top_kv260.bit \
+  dou@192.168.0.15:/home/dou/
+
+# KV260上でFPGAにロード
+ssh dou@192.168.0.15
+sudo fpgautil -b /home/dou/m_top_kv260.bit
+```
+
+## ハマりポイント
+
+### 1. scp が動かない（sshは動く）
+
+**症状**: `ssh`でログインできるが、`scp`や`sftp`がフリーズまたはパスワードエラー
+
+**原因**: OpenSSH 9.0以降、scpのデフォルトプロトコルがSFTPベースに変更された。KV260側のSFTPサブシステムが未設定。
+
+**解決策**: レガシーSCPプロトコルを使う
+
+```bash
+scp -O file.bit dou@192.168.0.15:/home/dou/
+```
+
+### 2. devmem でカーネルパニック
+
+**症状**: `sudo devmem 0xA0000000 32` でカーネルがフリーズ
+
+**原因**: AXI GPIO版のデザインで、PS-PLのAXIインターフェースが正しく初期化されていない。`fpgautil`はPLのみ書き換えるため、PS側のAXIマスターポートが有効化されない。
+
+**教訓**: KV260でAXI経由のPS-PL通信を行うには、適切なデバイスツリーオーバーレイとドライバが必要。単純な`devmem`アクセスは危険。
+
+### 3. VIOが検出されない (debug hub not found)
+
+**症状**: JTAG経由でProgram Device後、Hardware ManagerでVIOが見えない
+
+```
+INFO: [Labtools 27-1434] Device xck26 is programmed with a design 
+that has no supported debug core(s) in it.
+WARNING: [Labtools 27-3361] The debug hub core was not detected.
+```
+
+**原因**: `pl_clk0`がPS側で無効化されていた。VIOのデバッグハブはフリーランニングクロックが必要。
+
+**解決策**: `fpgautil`経由でロードした後、PLクロックを有効化する。
+
+```bash
+# PLクロックレジスタを確認
+sudo devmem 0xFF5E00C0 32
+# → 0x00010A00 (bit24 = 0: クロック無効)
+
+# bit24を立ててクロック有効化
+sudo devmem 0xFF5E00C0 32 0x01010A00
+```
+
+その後、Vivado Hardware Managerで `refresh_hw_device` するとVIOが検出される。
+
+### 4. JTAG Program Device ではVIOが動かない
+
+**症状**: JTAGでProgram Deviceした後、VIOが検出されない
+
+**原因**: JTAGはPLファブリックのみを書き換え、PSの設定（クロック出力等）は変更しない。`pl_clk0`が無効のままだとVIOのデバッグハブが動作しない。
+
+**解決策**: `fpgautil`経由でロードする（PS-PLインターフェースが正しく初期化される）。または上記の`devmem`でPLクロックを手動有効化する。
+
+## 動作確認
+
+fpgautil でロード＆PLクロック有効化後、Vivado TCLコンソールで：
+
+```tcl
+# probeファイルを設定
+set_property PROBES.FILE {.../m_top_kv260.ltx} [get_hw_devices xck26_0]
+refresh_hw_device [get_hw_devices xck26_0]
+
+# VIO確認
+get_hw_vios
+# → hw_vio_1
+
+# 結果読み取り
+get_property INPUT_VALUE [get_hw_probes w_rslt]
+# → 000013ba
+```
+
+**0x13BA = 5050** --- 0+1+2+...+100 の計算結果が正しく得られました。
+
+## まとめ
+
+教科書のRISC-Vプロセッサ（3段パイプライン、フォワーディング付き）をKV260で動作させました。
+
+教育用ボード向けのコードをKV260に移植する際のポイント：
+
+1. **クロック**: KV260はPL外部クロックがないため、Zynq PSの`pl_clk0`をブロックデザイン経由で取得する
+2. **デバッグ**: VIOを使う場合、`fpgautil`でロード後にPLクロック（`0xFF5E00C0`）の有効化が必要
+3. **転送**: OpenSSH 9.0以降は `scp -O` を使う
+4. **AXI経由の読み取り**: 単純な`devmem`は危険。VIOの方が確実
+
+教科書のコードがそのままでは動かない部分が多く、KV260特有の知識が必要ですが、一度環境を整えれば他の章のプロセッサ（4段パイプライン版等）も同様の手順で動かせます。
+
+## ソースコード
+
+https://github.com/douhaku1115/kv260/tree/main/riscv_kv260
+
+## 参考
+
+- 「RISC-Vで学ぶコンピュータアーキテクチャ」東京大学出版会
+- [Kria KV260 Vision AI Starter Kit](https://www.amd.com/en/products/system-on-modules/kria/k26/kv260-vision-starter-kit.html)
+- [Vivado Debug and Programming User Guide (UG908)](https://docs.amd.com/r/en-US/ug908-vivado-programming-debugging)
+- [Zynq UltraScale+ Technical Reference Manual (UG1085)](https://docs.amd.com/r/en-US/ug1085-zynq-ultrascale-trm)
