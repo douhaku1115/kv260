@@ -1,0 +1,6 @@
+vivado/
+simbuild/
+*.jou
+*.log
+*.str
+.Xil/
