@@ -1,4 +1,5 @@
 vivado/
+vivado_loop/
 simbuild/
 *.jou
 *.log
