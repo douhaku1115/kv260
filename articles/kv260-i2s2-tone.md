@@ -123,7 +123,7 @@ apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e -config {apply_boar
 
 ビットストリームを JTAG で書き込み、`End of startup status: HIGH`（FPGA 正常起動）まで確認できたのに、イヤホンから音が出ません。
 
-切り分けると、PL ファブリッククロックが死んでいました。
+切り分けると、PL ファブリッククロックが無効（ゲートOFF）の状態でした。
 
 ```
 $ sudo cat /sys/kernel/debug/clk/clk_summary | grep -w pl0_ref
