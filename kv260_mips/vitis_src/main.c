@@ -1382,7 +1382,7 @@ static void run_all_c_tests(void)
 
 int main(void)
 {
-    xil_printf("\r\n==== MIPS Pipeline Test (Step 12g-2) ====\r\n\r\n");
+    xil_printf("\r\n==== MIPS Pipeline Test (Step 12g-3) ====\r\n\r\n");
     run_test_pipe_a();
     xil_printf("\r\n");
     run_test1();
@@ -1410,11 +1410,12 @@ int main(void)
     run_test_exc();        // Step 12g-2: syscall 例外
     xil_printf("\r\n");
     run_test_ovf();        // Step 12g-2: overflow 例外
-    /* Step 12g-3 以降で順次再有効化する。
+    xil_printf("\r\n");
+    run_test11();          // Step 12g-3: 例外処理フル (syscall/overflow + eret 復帰)
+    /* Step 12g-4 以降で順次再有効化する。
     run_test10();          // C言語実行
     run_all_c_tests();
     run_test11b();
-    run_test11();          // 例外処理フル (syscall/overflow/eret)
     */
     xil_printf("\r\n==== Done ====\r\n");
     return 0;

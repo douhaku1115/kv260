@@ -263,6 +263,7 @@ WB:   regfile 書き戻し
 | 12f  | 乗除算・サブワード | mult/multu/div/divu (EX で HI/LO 書込み、フォワーディング後オペランド), mfhi/mflo (EX で HI/LO 読出→WB), lb/lbu/lh/lhu/sb/sh (MEM で byte_en 生成・スライス+符号/ゼロ拡張) |
 | 12g-1 | CP0 + mfc0/mtc0 | CP0 レジスタ ($12 SR/$13 Cause/$14 EPC) を EX 段に追加。mtc0 で CP0←GPR、mfc0 で CP0→GPR (HI/LO と同方式)。例外発生・eret は未実装 |
 | 12g-2 | 例外発生 | syscall/overflow を EX 段で検出。EPC←pc_plus4-4, Cause←ExcCode, SR.EXL←1, PC←0x80。若い命令(IF/ID, ID/EX)をフラッシュ、例外命令の reg/mem/HILO 書込みを抑止。PC 優先: 例外>分岐/jr>ジャンプ>+4 |
+| 12g-3 | eret 復帰 | eret を EX 段で解決。PC←EPC, SR.EXL←0。jr と同じく IF/ID,ID/EX フラッシュ。ハンドラの mtc0(EPC更新) の 1 命令後に eret が EX へ来るため cp0_epc は書込み済みで専用FW不要 |
 
 **ハザード処理**
 
@@ -324,9 +325,17 @@ wb_write_data = mem_wb_jal_instr   ? mem_wb_pc_plus4    // jal
 - **フラッシュ/抑止**: `flush_if_id`/`flush_id_ex` に `ex_exception` を OR。例外命令自身の `reg_write`/`mem_write`/`hilo_write` を `& ~ex_exception` で抑止 (overflow した add は書かない)
 - ID/EX のバブル/フラッシュ時は `id_ex_is_syscall=0`/`id_ex_exc_on_ov=0` で誤例外を防止
 
-**Step 12g-3 以降の予定**
+**Step 12g-3 の実装詳細**
 
-- 12g-3: eret 復帰 (PC←EPC, SR.EXL←0)。jr 同様 EX 段で解決+フラッシュ
+- **eret** (EX 段): `ex_eret = id_ex_is_eret & ~halt`、戻り先 `ex_epc = cp0_epc`
+- **PC リダイレクト**: `pc_next_select` で例外の次に優先。優先順位 例外>eret>分岐/jr>ジャンプ>+4
+- **SR.EXL クリア**: eret 時に `cp0_sr ← {cp0_sr[31:1], 1'b0}`
+- **フラッシュ**: `flush_if_id`/`flush_id_ex` に `ex_eret` を OR (jr と同じ機構)
+- ハンドラの `mtc0`(EPC更新) の 1 命令後に `eret` が EX へ来るため、`cp0_epc` は前サイクルに書込み済みで**専用フォワーディング不要** (mtc0→mfc0 と同じパターン)
+- これで Step 1〜11 の全機能がパイプラインで動作 (test11 フル例外テスト合格)
+
+**今後の予定**
+
 - C 言語実行 (test10) と C テスト群のパイプライン再確認
 
 ---
@@ -550,3 +559,4 @@ controls[8:0]:
 | 12f  | mult/multu/div/divu/mfhi/mflo + lb/lbu/lh/lhu/sb/sh           | ✓ |
 | 12g-1 | CP0 (SR/Cause/EPC) + mfc0/mtc0 ラウンドトリップ               | ✓ |
 | 12g-2 | syscall/overflow 例外発生 → EPC/Cause/SR + 0x80 + フラッシュ  | ✓ |
+| 12g-3 | eret 復帰 (syscall→eret→overflow→eret フル例外, test11)        | ✓ |

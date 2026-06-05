@@ -48,12 +48,17 @@
 //   - CP0 レジスタ ($12 SR / $13 Cause / $14 EPC) と mfc0/mtc0
 //     EX 段で CP0 書込み(mtc0)・読出し(mfc0)。HI/LO と同方式で専用FW不要
 //
-// 【Step 12g-2 スコープ】 (本ファイル)
+// 【Step 12g-2 スコープ】 (完了)
 //   - 例外発生: syscall(ExcCode=8) / add,addi,sub のオーバーフロー(ExcCode=12)
 //     EX 段で検出。EPC←例外命令PC(=pc_plus4-4), Cause←ExcCode, SR.EXL←1,
-//     PC←0x80(EXC_VEC)。PC 優先順位は 例外 > 分岐/jr > ジャンプ > +4
+//     PC←0x80(EXC_VEC)。
 //   - 例外時フラッシュ: IF/ID と ID/EX を潰し、例外命令の reg/mem/HILO 書込みを抑止
-//   - eret 復帰は 12g-3 で追加予定
+//
+// 【Step 12g-3 スコープ】 (本ファイル)
+//   - eret: EX 段で PC←EPC, SR.EXL←0。jr と同じく EX で解決し IF/ID,ID/EX フラッシュ
+//     ハンドラの mtc0(EPC更新) の 1 命令後に eret が EX へ来るため、cp0_epc は
+//     書込み済みで専用フォワーディング不要 (mtc0→mfc0 と同じパターン)
+//   - PC 優先順位: 例外 > eret > 分岐/jr > ジャンプ > +4
 //
 // 【フォワーディングロジック】
 //   ID/EX.rs が EX/MEM のデスティネーションと一致 → ALU 入力 a に EX/MEM 結果を直送
@@ -114,19 +119,22 @@ module mips_top_pipe (
     wire [31:0] id_jump_target;
     wire        id_ex_jr_w;     // EX 段の jr フラグを参照するためのワイヤ
     wire        ex_exception;   // Step 12g-2: EX 段で例外発生 (syscall/overflow)
+    wire        ex_eret;        // Step 12g-3: EX 段で eret (PC←EPC)
+    wire [31:0] ex_epc;         // Step 12g-3: eret の戻り先 (cp0_epc)
 
     localparam EXC_VEC = 32'h00000080;  // 例外ベクタ (imem word 32)
 
-    // PC 次値選択 (優先度: 例外 > EX 段の分岐/jr > ID 段のジャンプ > PC+4)
+    // PC 次値選択 (優先度: 例外 > eret > EX 段の分岐/jr > ID 段のジャンプ > PC+4)
     wire [31:0] pc_next_select =
         ex_exception   ? EXC_VEC :
+        ex_eret        ? ex_epc  :
         ex_take_branch ? (id_ex_jr_w ? ex_jr_target : ex_branch_target) :
         id_take_jump   ? id_jump_target :
                          pc_plus4;
 
-    // フラッシュ信号 (例外時も若い命令を潰す)
-    wire flush_if_id = id_take_jump | ex_take_branch | ex_exception;
-    wire flush_id_ex = ex_take_branch | ex_exception;
+    // フラッシュ信号 (例外/eret 時も若い命令を潰す)
+    wire flush_if_id = id_take_jump | ex_take_branch | ex_exception | ex_eret;
+    wire flush_id_ex = ex_take_branch | ex_exception | ex_eret;
 
     // PC レジスタ更新 (stall 中は据え置き、分岐/ジャンプ時はターゲットへ)
     always @(posedge clk) begin
@@ -296,6 +304,7 @@ module mips_top_pipe (
     reg        id_ex_is_mtc0;      // Step 12g-1: mtc0 (GPR→CP0)
     reg        id_ex_is_syscall;   // Step 12g-2: syscall (ExcCode=8)
     reg        id_ex_exc_on_ov;    // Step 12g-2: add/addi/sub のオーバーフロー例外対象
+    reg        id_ex_is_eret;      // Step 12g-3: eret (PC←EPC, SR.EXL←0)
 
     assign id_ex_jr_w = id_ex_jr;  // forward declaration の wire と接続
 
@@ -339,6 +348,7 @@ module mips_top_pipe (
             id_ex_is_mtc0     <= 1'b0;
             id_ex_is_syscall  <= 1'b0;
             id_ex_exc_on_ov   <= 1'b0;
+            id_ex_is_eret     <= 1'b0;
         end else if (!halt) begin
             if (load_use_stall || flush_id_ex) begin
                 // バブル挿入 / フラッシュ: 制御信号を全 0 にする (NOP)
@@ -376,6 +386,7 @@ module mips_top_pipe (
                 id_ex_is_mtc0     <= 1'b0;   // バブル中は CP0 書込み禁止
                 id_ex_is_syscall  <= 1'b0;   // バブル中は例外を起こさない
                 id_ex_exc_on_ov   <= 1'b0;
+                id_ex_is_eret     <= 1'b0;   // バブル中は eret を発火させない
             end else begin
                 id_ex_reg_write   <= id_reg_write;
                 id_ex_reg_dst     <= id_reg_dst;
@@ -411,6 +422,7 @@ module mips_top_pipe (
                 id_ex_is_mtc0     <= id_is_mtc0;
                 id_ex_is_syscall  <= id_is_syscall;
                 id_ex_exc_on_ov   <= id_exc_on_ov;
+                id_ex_is_eret     <= id_is_eret;
             end
         end
     end
@@ -528,16 +540,23 @@ module mips_top_pipe (
     wire [4:0] ex_exc_code = id_ex_is_syscall ? 5'd8 : 5'd12; // 8=Syscall,12=Overflow
     wire [31:0] ex_exc_pc  = id_ex_pc_plus4 - 32'd4;          // 例外命令の PC
 
+    // Step 12g-3: eret (EX 段)。PC←EPC, SR.EXL←0。jr と同じく EX で解決+フラッシュ
+    assign ex_eret = id_ex_is_eret & ~halt;
+    assign ex_epc  = cp0_epc;
+
     always @(posedge clk) begin
         if (reset) begin
             cp0_sr    <= 32'b0;
             cp0_cause <= 32'b0;
             cp0_epc   <= 32'b0;
         end else if (ex_exception) begin
-            // 例外発生が最優先 (mtc0 より優先)
+            // 例外発生が最優先 (mtc0/eret より優先)
             cp0_epc   <= ex_exc_pc;
             cp0_cause <= {25'b0, ex_exc_code, 2'b0}; // Cause[6:2] = ExcCode
             cp0_sr    <= {cp0_sr[31:1], 1'b1};       // EXL = 1
+        end else if (ex_eret) begin
+            // eret: EXL = 0 (PC は pc_next_select 側で EPC に戻す)
+            cp0_sr    <= {cp0_sr[31:1], 1'b0};
         end else if (id_ex_is_mtc0 & ~halt) begin
             case (id_ex_rd)
                 5'd12: cp0_sr    <= alu_in_rt;
