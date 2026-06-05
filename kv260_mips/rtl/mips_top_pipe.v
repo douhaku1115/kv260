@@ -44,10 +44,16 @@
 //   - バイト/ハーフワード: lb/lbu/lh/lhu/sb/sh
 //     MEM 段で mem_size + addr[1:0] から byte_en 生成、読出しはスライス+符号/ゼロ拡張
 //
-// 【Step 12g-1 スコープ】 (本ファイル)
-//   - CP0 レジスタ ($12 SR / $13 Cause / $14 EPC) と mfc0/mtc0 のみ
+// 【Step 12g-1 スコープ】 (完了)
+//   - CP0 レジスタ ($12 SR / $13 Cause / $14 EPC) と mfc0/mtc0
 //     EX 段で CP0 書込み(mtc0)・読出し(mfc0)。HI/LO と同方式で専用FW不要
-//   - 例外発生(syscall/overflow→0x80)・eret は 12g-2/12g-3 で追加予定
+//
+// 【Step 12g-2 スコープ】 (本ファイル)
+//   - 例外発生: syscall(ExcCode=8) / add,addi,sub のオーバーフロー(ExcCode=12)
+//     EX 段で検出。EPC←例外命令PC(=pc_plus4-4), Cause←ExcCode, SR.EXL←1,
+//     PC←0x80(EXC_VEC)。PC 優先順位は 例外 > 分岐/jr > ジャンプ > +4
+//   - 例外時フラッシュ: IF/ID と ID/EX を潰し、例外命令の reg/mem/HILO 書込みを抑止
+//   - eret 復帰は 12g-3 で追加予定
 //
 // 【フォワーディングロジック】
 //   ID/EX.rs が EX/MEM のデスティネーションと一致 → ALU 入力 a に EX/MEM 結果を直送
@@ -107,16 +113,20 @@ module mips_top_pipe (
     wire [31:0] ex_jr_target;
     wire [31:0] id_jump_target;
     wire        id_ex_jr_w;     // EX 段の jr フラグを参照するためのワイヤ
+    wire        ex_exception;   // Step 12g-2: EX 段で例外発生 (syscall/overflow)
 
-    // PC 次値選択 (優先度: EX 段の分岐/jr > ID 段のジャンプ > PC+4)
+    localparam EXC_VEC = 32'h00000080;  // 例外ベクタ (imem word 32)
+
+    // PC 次値選択 (優先度: 例外 > EX 段の分岐/jr > ID 段のジャンプ > PC+4)
     wire [31:0] pc_next_select =
+        ex_exception   ? EXC_VEC :
         ex_take_branch ? (id_ex_jr_w ? ex_jr_target : ex_branch_target) :
         id_take_jump   ? id_jump_target :
                          pc_plus4;
 
-    // フラッシュ信号
-    wire flush_if_id = id_take_jump | ex_take_branch;
-    wire flush_id_ex = ex_take_branch;
+    // フラッシュ信号 (例外時も若い命令を潰す)
+    wire flush_if_id = id_take_jump | ex_take_branch | ex_exception;
+    wire flush_id_ex = ex_take_branch | ex_exception;
 
     // PC レジスタ更新 (stall 中は据え置き、分岐/ジャンプ時はターゲットへ)
     always @(posedge clk) begin
@@ -284,6 +294,8 @@ module mips_top_pipe (
     reg        id_ex_mem_unsigned; // Step 12f: lbu/lhu=1
     reg        id_ex_is_mfc0;      // Step 12g-1: mfc0 (CP0→GPR)
     reg        id_ex_is_mtc0;      // Step 12g-1: mtc0 (GPR→CP0)
+    reg        id_ex_is_syscall;   // Step 12g-2: syscall (ExcCode=8)
+    reg        id_ex_exc_on_ov;    // Step 12g-2: add/addi/sub のオーバーフロー例外対象
 
     assign id_ex_jr_w = id_ex_jr;  // forward declaration の wire と接続
 
@@ -325,6 +337,8 @@ module mips_top_pipe (
             id_ex_mem_unsigned<= 1'b0;
             id_ex_is_mfc0     <= 1'b0;
             id_ex_is_mtc0     <= 1'b0;
+            id_ex_is_syscall  <= 1'b0;
+            id_ex_exc_on_ov   <= 1'b0;
         end else if (!halt) begin
             if (load_use_stall || flush_id_ex) begin
                 // バブル挿入 / フラッシュ: 制御信号を全 0 にする (NOP)
@@ -360,6 +374,8 @@ module mips_top_pipe (
                 id_ex_mem_unsigned<= 1'b0;
                 id_ex_is_mfc0     <= 1'b0;
                 id_ex_is_mtc0     <= 1'b0;   // バブル中は CP0 書込み禁止
+                id_ex_is_syscall  <= 1'b0;   // バブル中は例外を起こさない
+                id_ex_exc_on_ov   <= 1'b0;
             end else begin
                 id_ex_reg_write   <= id_reg_write;
                 id_ex_reg_dst     <= id_reg_dst;
@@ -393,6 +409,8 @@ module mips_top_pipe (
                 id_ex_mem_unsigned<= id_mem_unsigned;
                 id_ex_is_mfc0     <= id_is_mfc0;
                 id_ex_is_mtc0     <= id_is_mtc0;
+                id_ex_is_syscall  <= id_is_syscall;
+                id_ex_exc_on_ov   <= id_exc_on_ov;
             end
         end
     end
@@ -479,7 +497,7 @@ module mips_top_pipe (
         if (reset) begin
             hi_reg <= 32'b0;
             lo_reg <= 32'b0;
-        end else if (id_ex_hilo_write & ~halt) begin
+        end else if (id_ex_hilo_write & ~halt & ~ex_exception) begin
             case (id_ex_hilo_op)
                 2'b00: {hi_reg, lo_reg} <= mult_s;          // mult
                 2'b01: {hi_reg, lo_reg} <= mult_u;          // multu
@@ -490,19 +508,36 @@ module mips_top_pipe (
     end
 
     // ============================================================
-    // Step 12g-1: CP0 レジスタ + mfc0/mtc0 (EX 段、HI/LO と同方式)
+    // Step 12g-1/12g-2: CP0 レジスタ + mfc0/mtc0 + 例外処理 (EX 段)
     // ============================================================
-    //   $12 SR / $13 Cause / $14 EPC。12g-1 では mtc0/mfc0 のみ実装し、
-    //   例外発生・eret は 12g-2/12g-3 で追加する。
+    //   $12 SR / $13 Cause / $14 EPC。
     //   mtc0: EX 段で CP0[id_ex_rd] ← GPR[rt] (フォワーディング後 alu_in_rt)
     //   mfc0: EX 段で CP0[id_ex_rd] を読み ex_result 経由で WB へ
     //   mtc0 の 1 命令以上後に mfc0 が EX へ来るため専用フォワーディング不要
+    //
+    // 【Step 12g-2: 例外発生】(EX 段で検出)
+    //   syscall (ExcCode=8) または add/addi/sub のオーバーフロー (ExcCode=12)
+    //   発生時: EPC ← 例外命令の PC, Cause ← ExcCode, SR.EXL ← 1, PC ← 0x80
+    //   例外命令自身の reg_write/CP0書込み/HI-LO書込みは抑止する。
+    //   EPC は伝搬済み pc_plus4 から -4 で導出 (専用 PC レジスタ不要)。
     reg [31:0] cp0_sr, cp0_cause, cp0_epc;
+
+    // 例外検出 (EX 段)。jr/分岐より「同じ命令で」優先評価される。
+    wire ex_exc_overflow = id_ex_exc_on_ov & ex_alu_overflow;
+    assign ex_exception  = (id_ex_is_syscall | ex_exc_overflow) & ~halt;
+    wire [4:0] ex_exc_code = id_ex_is_syscall ? 5'd8 : 5'd12; // 8=Syscall,12=Overflow
+    wire [31:0] ex_exc_pc  = id_ex_pc_plus4 - 32'd4;          // 例外命令の PC
+
     always @(posedge clk) begin
         if (reset) begin
             cp0_sr    <= 32'b0;
             cp0_cause <= 32'b0;
             cp0_epc   <= 32'b0;
+        end else if (ex_exception) begin
+            // 例外発生が最優先 (mtc0 より優先)
+            cp0_epc   <= ex_exc_pc;
+            cp0_cause <= {25'b0, ex_exc_code, 2'b0}; // Cause[6:2] = ExcCode
+            cp0_sr    <= {cp0_sr[31:1], 1'b1};       // EXL = 1
         end else if (id_ex_is_mtc0 & ~halt) begin
             case (id_ex_rd)
                 5'd12: cp0_sr    <= alu_in_rt;
@@ -572,10 +607,11 @@ module mips_top_pipe (
             ex_mem_mem_size   <= 2'b10;
             ex_mem_mem_unsigned <= 1'b0;
         end else if (!halt) begin
-            ex_mem_reg_write  <= id_ex_reg_write;
+            // Step 12g-2: 例外発生時は当該命令の reg_write/mem_write を抑止
+            ex_mem_reg_write  <= id_ex_reg_write & ~ex_exception;
             ex_mem_alu_result <= ex_result;       // Step 12e: lui 結果も含む
             ex_mem_write_reg  <= ex_write_reg;
-            ex_mem_mem_write  <= id_ex_mem_write;
+            ex_mem_mem_write  <= id_ex_mem_write & ~ex_exception;
             ex_mem_mem_to_reg <= id_ex_mem_to_reg;
             ex_mem_rd2        <= alu_in_rt;
             ex_mem_jal_instr  <= id_ex_jal_instr;

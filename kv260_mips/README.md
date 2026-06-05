@@ -262,6 +262,7 @@ WB:   regfile 書き戻し
 | 12e  | 残り即値/ALU/分岐 | lui (EX で `{imm16,16'b0}` 生成), ori/andi/xori (ID でゼロ拡張即値), シフト sll/srl/sra・sllv/srlv/srav (EX でオペランド入替), bltz/bgez/blez/bgtz (EX で rs と 0 比較), addiu/addu/subu/sltu/sltiu/nor |
 | 12f  | 乗除算・サブワード | mult/multu/div/divu (EX で HI/LO 書込み、フォワーディング後オペランド), mfhi/mflo (EX で HI/LO 読出→WB), lb/lbu/lh/lhu/sb/sh (MEM で byte_en 生成・スライス+符号/ゼロ拡張) |
 | 12g-1 | CP0 + mfc0/mtc0 | CP0 レジスタ ($12 SR/$13 Cause/$14 EPC) を EX 段に追加。mtc0 で CP0←GPR、mfc0 で CP0→GPR (HI/LO と同方式)。例外発生・eret は未実装 |
+| 12g-2 | 例外発生 | syscall/overflow を EX 段で検出。EPC←pc_plus4-4, Cause←ExcCode, SR.EXL←1, PC←0x80。若い命令(IF/ID, ID/EX)をフラッシュ、例外命令の reg/mem/HILO 書込みを抑止。PC 優先: 例外>分岐/jr>ジャンプ>+4 |
 
 **ハザード処理**
 
@@ -314,10 +315,18 @@ wb_write_data = mem_wb_jal_instr   ? mem_wb_pc_plus4    // jal
 - **mfc0**: EX 段で `id_ex_rd` に応じた CP0 値を読み `ex_result` 経由で WB へ
 - mfc0 は mtc0 の 1 命令以上後に EX へ来るため、CP0 は前サイクルに書込み済みで**専用フォワーディング不要**
 
-**Step 12g-2/12g-3 以降の予定**
+**Step 12g-2 の実装詳細**
 
-- 12g-2: syscall/overflow 例外発生 → EPC/Cause/SR.EXL 設定 → 0x80 へリダイレクト + フラッシュ
-- 12g-3: eret 復帰 (PC←EPC, SR.EXL←0)
+- **例外検出** (EX 段): `ex_exception = (id_ex_is_syscall | (id_ex_exc_on_ov & ex_alu_overflow)) & ~halt`。syscall/add/addi/sub はいずれも分岐命令ではないので `ex_take_branch` と排他
+- **EPC**: 伝搬済み `id_ex_pc_plus4 - 4` で例外命令の PC を導出（専用 PC レジスタ不要）
+- **Cause/SR**: `cp0_cause ← {ExcCode,2'b0}` (syscall=8/overflow=12)、`cp0_sr.EXL ← 1`
+- **PC リダイレクト**: `pc_next_select` で例外を最優先に `EXC_VEC=0x80` へ。優先順位 例外>分岐/jr>ジャンプ>+4
+- **フラッシュ/抑止**: `flush_if_id`/`flush_id_ex` に `ex_exception` を OR。例外命令自身の `reg_write`/`mem_write`/`hilo_write` を `& ~ex_exception` で抑止 (overflow した add は書かない)
+- ID/EX のバブル/フラッシュ時は `id_ex_is_syscall=0`/`id_ex_exc_on_ov=0` で誤例外を防止
+
+**Step 12g-3 以降の予定**
+
+- 12g-3: eret 復帰 (PC←EPC, SR.EXL←0)。jr 同様 EX 段で解決+フラッシュ
 - C 言語実行 (test10) と C テスト群のパイプライン再確認
 
 ---
@@ -540,3 +549,4 @@ controls[8:0]:
 | 12e  | lui/ori/andi/xori/シフト/blez系/addiu/addu/subu/sltu/sltiu/nor | ✓ |
 | 12f  | mult/multu/div/divu/mfhi/mflo + lb/lbu/lh/lhu/sb/sh           | ✓ |
 | 12g-1 | CP0 (SR/Cause/EPC) + mfc0/mtc0 ラウンドトリップ               | ✓ |
+| 12g-2 | syscall/overflow 例外発生 → EPC/Cause/SR + 0x80 + フラッシュ  | ✓ |

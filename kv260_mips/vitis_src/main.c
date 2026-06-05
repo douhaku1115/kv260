@@ -830,6 +830,115 @@ static void run_test11b(void)
     mips_dump_regs(4, 6);
 }
 
+// ============================================================
+// Test EXC: 例外発生 (syscall / overflow) — eret なし (Step 12g-2)
+// ============================================================
+// 12g-2 は「例外を検出して 0x80 のハンドラに飛び、CP0 を設定する」ところまで。
+// eret 復帰は 12g-3 で実装するため、ハンドラは値を GPR に退避して無限ループする。
+//
+// 【メインプログラム】
+//   0x00: addi $1,$0,0      $1 = 0 (例外カウンタ)
+//   0x04: addi $7,$0,0      $7 = 0 (スキップ確認用を既知値に初期化)
+//   0x08: syscall           → 例外! EPC=0x08, ExcCode=8, PC→0x80
+//   0x0C: addi $7,$0,0x63   (★到達してはいけない: 例外でスキップされる)
+//   0x10: j 0x10            無限ループ
+//
+// 【ハンドラ (0x80)】
+//   0x80: addi $1,$1,1      $1++ (例外に到達した証拠 → $1=1)
+//   0x84: mfc0 $2,$14       $2 = EPC   (= 0x08, 例外を起こした syscall の PC)
+//   0x88: mfc0 $3,$13       $3 = Cause (= 8<<2 = 0x20)
+//   0x8C: mfc0 $4,$12       $4 = SR    (= 0x01, EXL=1)
+//   0x90: j 0x90            無限ループ (eret なし)
+//
+// 【期待値】 $1=1, $2=0x08, $3=0x20, $4=0x01, $7=0 (スキップ確認)
+static const u32 test_exc_program[] = {
+    // ---- メイン (word 0-4) ----
+    0x20010000,  // [0] 0x00: addi $1,$0,0       $1=0 (カウンタ)
+    0x20070000,  // [1] 0x04: addi $7,$0,0       $7=0 (スキップ確認用)
+    0x0000000C,  // [2] 0x08: syscall            → 例外 (EPC=0x08, code=8)
+    0x20070063,  // [3] 0x0C: addi $7,$0,0x63    ★スキップされるべき
+    0x08000004,  // [4] 0x10: j 0x10             無限ループ
+    // ---- NOP padding (word 5-31, 0x14-0x7C) ----
+    0x00000000, 0x00000000, 0x00000000,             // [5-7]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [8-11]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [12-15]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [16-19]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [20-23]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [24-27]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [28-31]
+    // ---- ハンドラ (word 32 = 0x80) ----
+    0x20210001,  // [32] 0x80: addi $1,$1,1      $1++ (=1)
+    0x40027000,  // [33] 0x84: mfc0 $2,$14       $2 = EPC = 0x08
+    0x40036800,  // [34] 0x88: mfc0 $3,$13       $3 = Cause = 0x20
+    0x40046000,  // [35] 0x8C: mfc0 $4,$12       $4 = SR = 0x01
+    0x08000024,  // [36] 0x90: j 0x90            無限ループ
+};
+#define TEST_EXC_COUNT  (sizeof(test_exc_program) / sizeof(test_exc_program[0]))
+
+static void run_test_exc(void)
+{
+    xil_printf("--- Test EXC: syscall exception (Step 12g-2, no eret) ---\r\n");
+    mips_reset();
+    mips_load_program(test_exc_program, TEST_EXC_COUNT);
+    mips_run_cycles(200);
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=1, $2=0x08, $3=0x20, $4=0x01, $7=0 (skipped)\r\n");
+    mips_dump_regs(1, 4);
+    xil_printf("  $7 = 0x%08x (should be 0)\r\n", mips_read_reg(7));
+}
+
+// ============================================================
+// Test OVF: オーバーフロー例外 (Step 12g-2)
+// ============================================================
+//   0x00: addi $1,$0,0      $1 = 0 (例外カウンタ)
+//   0x04: addi $7,$0,0      $7 = 0 (スキップ確認用を既知値に初期化)
+//   0x08: lui  $5,0x7FFF    $5 = 0x7FFF0000
+//   0x0C: ori  $5,$5,0xFFFF $5 = 0x7FFFFFFF (INT_MAX)
+//   0x10: addi $5,$5,1      → オーバーフロー! EPC=0x10, ExcCode=12, $5書込抑止
+//   0x14: addi $7,$0,0x63   ★スキップされるべき
+//   0x18: j 0x18            無限ループ
+//   ハンドラ(0x80): $1++; $2=EPC; $3=Cause; j self
+//
+// 【期待値】 $1=1, $2=0x10, $3=0x30(12<<2), $5=0x7FFFFFFF(書込抑止), $7=0
+static const u32 test_ovf_program[] = {
+    0x20010000,  // [0] 0x00: addi $1,$0,0        $1=0 (カウンタ)
+    0x20070000,  // [1] 0x04: addi $7,$0,0        $7=0 (スキップ確認用)
+    0x3C057FFF,  // [2] 0x08: lui  $5,0x7FFF
+    0x34A5FFFF,  // [3] 0x0C: ori  $5,$5,0xFFFF   $5=0x7FFFFFFF
+    0x20A50001,  // [4] 0x10: addi $5,$5,1        → overflow (EPC=0x10, code=12)
+    0x20070063,  // [5] 0x14: addi $7,$0,0x63     ★スキップされるべき
+    0x08000006,  // [6] 0x18: j 0x18              無限ループ
+    // NOP padding (word 7-31)
+    0x00000000,                                     // [7]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [8-11]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [12-15]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [16-19]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [20-23]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [24-27]
+    0x00000000, 0x00000000, 0x00000000, 0x00000000, // [28-31]
+    // ハンドラ (word 32 = 0x80)
+    0x20210001,  // [32] 0x80: addi $1,$1,1       $1++ (=1)
+    0x40027000,  // [33] 0x84: mfc0 $2,$14        $2 = EPC = 0x10
+    0x40036800,  // [34] 0x88: mfc0 $3,$13        $3 = Cause = 0x30
+    0x08000023,  // [35] 0x8C: j 0x8C             無限ループ
+};
+#define TEST_OVF_COUNT  (sizeof(test_ovf_program) / sizeof(test_ovf_program[0]))
+
+static void run_test_ovf(void)
+{
+    xil_printf("--- Test OVF: overflow exception (Step 12g-2) ---\r\n");
+    mips_reset();
+    mips_load_program(test_ovf_program, TEST_OVF_COUNT);
+    mips_run_cycles(200);
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $1=1, $2=0x10, $3=0x30, $5=0x7FFFFFFF, $7=0\r\n");
+    xil_printf("  $1 = 0x%08x (exc count, =1)\r\n", mips_read_reg(1));
+    xil_printf("  $2 = 0x%08x (EPC, =0x10)\r\n", mips_read_reg(2));
+    xil_printf("  $3 = 0x%08x (Cause, =0x30)\r\n", mips_read_reg(3));
+    xil_printf("  $5 = 0x%08x (=0x7FFFFFFF, write suppressed)\r\n", mips_read_reg(5));
+    xil_printf("  $7 = 0x%08x (should be 0)\r\n", mips_read_reg(7));
+}
+
 // ==== AUTO-GENERATED C TESTS BEGIN (step10/build_all.sh) ====
 
 // --------------------------------------------------------
@@ -1273,7 +1382,7 @@ static void run_all_c_tests(void)
 
 int main(void)
 {
-    xil_printf("\r\n==== MIPS Pipeline Test (Step 12g-1) ====\r\n\r\n");
+    xil_printf("\r\n==== MIPS Pipeline Test (Step 12g-2) ====\r\n\r\n");
     run_test_pipe_a();
     xil_printf("\r\n");
     run_test1();
@@ -1297,11 +1406,15 @@ int main(void)
     run_test8();           // Step 12f: lb, lbu, lh, lhu, sb, sh
     xil_printf("\r\n");
     run_test_cp0();        // Step 12g-1: mfc0/mtc0
-    /* Step 12g-2/3 以降で順次再有効化する。
+    xil_printf("\r\n");
+    run_test_exc();        // Step 12g-2: syscall 例外
+    xil_printf("\r\n");
+    run_test_ovf();        // Step 12g-2: overflow 例外
+    /* Step 12g-3 以降で順次再有効化する。
     run_test10();          // C言語実行
     run_all_c_tests();
     run_test11b();
-    run_test11();          // 例外処理 (syscall/overflow/eret)
+    run_test11();          // 例外処理フル (syscall/overflow/eret)
     */
     xil_printf("\r\n==== Done ====\r\n");
     return 0;
