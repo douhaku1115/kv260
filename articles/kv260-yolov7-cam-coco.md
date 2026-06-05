@@ -16,8 +16,9 @@ KV260のDPU (B4096) を使い、USBカメラの映像をYOLOv7でリアルタイ
 USBカメラ (640x480)
     ↓
 KV260 (Zynq UltraScale+ / DPU B4096)
-    ↓ YOLOv7推論 (~185ms)
-    ↓ 後処理 (~90ms)
+    ↓ [DPUスレッド]  YOLOv7推論 (~190ms)
+    ↓     ↕ キュー (両ステージを重ねる)
+    ↓ [メインスレッド] 後処理 (~90ms) + 描画
     ↓
 HDMIモニタ (バウンディングボックス+クラス名+FPS表示)
 ```
@@ -26,11 +27,14 @@ HDMIモニタ (バウンディングボックス+クラス名+FPS表示)
 
 | 項目 | 値 |
 |------|-----|
-| DPU推論 | ~185ms |
+| DPU推論 | ~190ms |
 | 後処理 | ~90ms |
-| 合計 | ~320ms (3.1 FPS) |
+| 合計(直列) | ~275ms (3.6 FPS) |
+| **合計(パイプライン化後)** | **~200ms (5.0 FPS)** |
 | 検出クラス | COCO 80クラス |
 | モデルサイズ | 39MB (xmodel) |
+
+DPU推論(ハード)と後処理(CPU)を別スレッドに分けて重ね、3.6→5.0 FPS に向上。DPU 190ms が律速なので、理論上限(~5.3 FPS)にほぼ到達している。
 
 ## 前提条件
 
@@ -113,6 +117,38 @@ Before: 3重forループ → 1400ms
 After:  NumPyベクトル化 + sigmoid事前フィルタ → 90ms
 ```
 
+## DPUと後処理のパイプライン化 (3.6 → 5.0 FPS)
+
+後処理を90msまで詰めても、1スレッドで「DPU(190ms)→後処理(90ms)」を直列実行すると合計275ms(3.6 FPS)になる。そこで **DPU推論と後処理を別スレッドに分け、キューでつないで重ねる**。
+
+```
+[DPUスレッド]   フレーム取得→前処理→DPU推論 → キューへ
+                     ↓ queue.Queue(maxsize=1)
+[メインスレッド] キューから受信→後処理(decode+NMS)→描画→imshow
+```
+
+DPUスレッドがフレームNを推論する裏で、メインスレッドがフレームN-1の後処理を実行する。スループットは `max(DPU側≈200ms, 後処理側≈100ms)≈200ms` となり 5.0 FPS。
+
+```python
+def inference_worker(runner, cam, in_w, in_h, output_tensors, result_q, stop_event):
+    while not stop_event.is_set():
+        ret, frame = cam.read()
+        if not ret or frame is None:
+            time.sleep(0.001); continue
+        # 前処理 + DPU推論
+        ...
+        output_data = [np.empty(ot.dims, dtype=np.float32) for ot in output_tensors]  # フレーム毎に新規
+        job_id = runner.execute_async(input_data, output_data)
+        runner.wait(job_id)                      # wait中はVARTがGILを解放
+        result_q.put((frame, output_data, infer_ms), timeout=0.5)
+```
+
+ポイント:
+
+- **VARTは `wait()` の間 GIL を解放する**。だからDPU待機中にメインスレッドのNumPy後処理が並列に走り、本当に重なる(公式マルチスレッド例がスケールするのと同じ理由)。同一スレッドで `execute_async` 後にそのまま後処理すると重ならない。
+- DPU出力バッファは**フレーム毎に新規確保**する。使い回すと、後段が読んでいる間にDPUスレッドが上書きする競合が起きる。
+- これ以上はDPU推論190ms自体が壁。さらに上げるなら入力縮小(640→416)や軽量モデルへ。
+
 ## Docker環境構築メモ
 
 `vai-yolov7:v5`は以下で構築:
@@ -132,15 +168,17 @@ After:  NumPyベクトル化 + sigmoid事前フィルタ → 90ms
 
 | エラー | 原因 | 対策 |
 |--------|------|------|
-| `cvNamedWindow` not implemented | OpenCVがheadless版 | `pip install opencv-python`に入替 |
+| `cvNamedWindow` not implemented | OpenCVがheadless版 | `pip install opencv-python`(headlessでない版)に入替 |
+| `_ARRAY_API not found` / `numpy.core.multiarray failed to import` | NumPy 2.x と OpenCV(1.x向けビルド)の非互換 | コンテナ内で `pip install "numpy<2"` |
 | `Check failed: !get_factory().empty()` | DPU未ロード | `sudo xmutil loadapp kv260-benchmark-b4096` |
-| `xhost: unable to open display ""` | DISPLAY未設定 | `export DISPLAY=:1` |
+| `xhost: unable to open display ":1"` | SSH経由でXのアクセス権が無い | `export XAUTHORITY=$(ps -C Xorg -o args=｜grep -oP '(?<=-auth )\S+'｜head -1)` を設定 |
+| `unable to find image ... or may require docker login` | スクリプトのタグ名と実イメージのタグが不一致 | `docker tag` で合わせる / `docker images` でタグ確認 |
+| `scp: write remote ... Failure` / `No space left` | SD満杯 | load済みのimage tarやaptキャッシュ削除(`apt-get clean`) |
 | camera 0 open失敗 | デバイスID違い | `ls /dev/video*`で確認、ID変更 |
-| ディスク容量不足 | Docker/tar.gz等 | 不要なtar.gz削除 |
 
 ## まとめ
 
 - KV260のDPU B4096でYOLOv7 COCO 80クラスのリアルタイム物体検出を実現
-- 3.1 FPSで人・車・動物など幅広い物体を検出
-- Python後処理の最適化（sigmoid事前フィルタ + NumPyベクトル化）が重要
-- Dockerイメージを作り込んでおけばモデル差し替えだけで別タスクに対応可能
+- 後処理最適化(sigmoid事前フィルタ + NumPyベクトル化)で 0.6→3.6 FPS
+- **DPUと後処理のパイプライン化(別スレッド+キュー)で 3.6→5.0 FPS**。DPU 190msが律速で理論上限近く
+- Dockerイメージを作り込んでおけばモデル差し替えだけで別タスクに対応可能。ただしSD入替で消えるので保存(`docker save`)推奨

@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""YOLOv7 real-time camera inference on KV260 DPU"""
+"""YOLOv7 real-time camera inference on KV260 DPU (pipelined)
+
+DPU推論(ハード, ~185ms)と後処理(CPU/NumPy, ~90ms)を別スレッドに分け、
+キューでつないで両ステージをオーバーラップさせる。
+スループットは直列275ms → max(DPU側, 後処理側)≈200ms に短縮(狙い ~5 FPS)。
+"""
 import sys
 import time
 import threading
+import queue
 import numpy as np
 import cv2
 import xir
@@ -126,6 +132,32 @@ class CameraThread:
         self.thread.join()
         self.cap.release()
 
+def inference_worker(runner, cam, in_w, in_h, output_tensors, result_q, stop_event):
+    """DPUステージ: フレーム取得→前処理→DPU推論し、(frame, 出力, infer_ms)をキューへ。
+    後処理ステージ(メインスレッド)と別スレッドで動き、DPU(ハード)とCPU後処理を重ねる。
+    出力バッファはフレーム毎に新規確保し、後段が読む間に上書きされる競合を防ぐ。"""
+    while not stop_event.is_set():
+        ret, frame = cam.read()
+        if not ret or frame is None:
+            time.sleep(0.001)
+            continue
+        # Preprocess
+        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = cv2.resize(img, (in_w, in_h))
+        img = img.astype(np.float32) / 255.0
+        input_data = [np.expand_dims(img, axis=0)]
+        output_data = [np.empty(ot.dims, dtype=np.float32) for ot in output_tensors]
+        # Inference (DPUスレッドをブロックするが、wait中はGILが解放され後段と並列に動く)
+        start = time.time()
+        job_id = runner.execute_async(input_data, output_data)
+        runner.wait(job_id)
+        infer_ms = (time.time() - start) * 1000
+        # 後処理ステージへ受け渡し(満杯なら少し待つ。stop時はtimeoutで抜ける)
+        try:
+            result_q.put((frame, output_data, infer_ms), timeout=0.5)
+        except queue.Full:
+            continue
+
 def main():
     xmodel_path = sys.argv[1] if len(sys.argv) > 1 else "/work/yolov7_kv260.xmodel"
     camera_id = int(sys.argv[2]) if len(sys.argv) > 2 else 0
@@ -151,27 +183,27 @@ def main():
 
     cv2.namedWindow("YOLOv7", cv2.WINDOW_NORMAL)
 
-    frame_start = time.time()
+    # パイプライン: DPUスレッド → result_q → メイン(後処理+表示)
+    result_q = queue.Queue(maxsize=1)
+    stop_event = threading.Event()
+    worker = threading.Thread(
+        target=inference_worker,
+        args=(runner, cam, in_w, in_h, output_tensors, result_q, stop_event),
+        daemon=True,
+    )
+    worker.start()
+
+    last_disp = time.time()
 
     while True:
-        ret, frame = cam.read()
-        if not ret or frame is None:
+        try:
+            frame, output_data, infer_ms = result_q.get(timeout=1.0)
+        except queue.Empty:
+            if stop_event.is_set():
+                break
             continue
 
-        # Preprocess
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (in_w, in_h))
-        img = img.astype(np.float32) / 255.0
-
-        # Inference
-        input_data = [np.expand_dims(img, axis=0)]
-        output_data = [np.empty(ot.dims, dtype=np.float32) for ot in output_tensors]
-        start = time.time()
-        job_id = runner.execute_async(input_data, output_data)
-        runner.wait(job_id)
-        infer_ms = (time.time() - start) * 1000
-
-        # Postprocess
+        # Postprocess (DPUスレッドが次フレームを推論する裏で実行)
         boxes = decode_outputs(output_data, img_size=in_w, conf_thresh=0.25)
         detections = nms(boxes, iou_thresh=0.45)
 
@@ -190,17 +222,21 @@ def main():
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(frame, f"{label} {score:.2f}", (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        # FPS display
-        total_ms = (time.time() - frame_start) * 1000
-        fps = 1000.0 / total_ms if total_ms > 0 else 0
-        fps_text = f"DPU:{infer_ms:.0f}ms Total:{total_ms:.0f}ms FPS:{fps:.1f} Det:{len(detections)}"
+        # FPS display (表示間隔=パイプラインのスループット)
+        now = time.time()
+        disp_ms = (now - last_disp) * 1000
+        last_disp = now
+        fps = 1000.0 / disp_ms if disp_ms > 0 else 0
+        fps_text = f"DPU:{infer_ms:.0f}ms Pipe:{disp_ms:.0f}ms FPS:{fps:.1f} Det:{len(detections)}"
         cv2.putText(frame, fps_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        frame_start = time.time()
 
         cv2.imshow("YOLOv7", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
+            stop_event.set()
             break
 
+    stop_event.set()
+    worker.join(timeout=2.0)
     cam.stop()
     cv2.destroyAllWindows()
     print("Done.")

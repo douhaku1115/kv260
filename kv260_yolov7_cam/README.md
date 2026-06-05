@@ -5,8 +5,9 @@ USBカメラの映像をYOLOv7 + DPU B4096でリアルタイム物体検出し�
 
 ## 動作結果
 
-- DPU推論: ~185ms/frame
-- 合計: ~320ms/frame（3.1 FPS）
+- DPU推論: ~190ms/frame
+- 合計(直列): ~275ms/frame（3.6 FPS）
+- **合計(パイプライン化後): ~200ms/frame（5.0 FPS）** ← DPUと後処理を別スレッドで重ねた
 - 80クラス（COCO）のリアルタイム検出
 - モデル: YOLOv7 COCO (39MB xmodel)
 
@@ -82,6 +83,25 @@ Before: for ay in range(80): for ax in range(80): for a in range(3): ...  → 14
 After:  np.where(mask) + 一括sigmoid + 一括座標計算                      →   90ms
 ```
 
+## DPUと後処理のパイプライン化（3.6 → 5.0 FPS）
+
+後処理を90msまで詰めても、1スレッドで「DPU(190ms)→後処理(90ms)」を直列実行すると275ms(3.6 FPS)。
+**DPU推論を別スレッド(`inference_worker`)に出し、`queue.Queue`でメインスレッドの後処理とつなぐ**ことで、両ステージを重ねる。
+
+```
+[DPUスレッド]   フレーム取得→前処理→DPU推論 → queue へ
+                     ↓ queue.Queue(maxsize=1)
+[メインスレッド] queue から受信 → 後処理(decode+NMS) → 描画 → imshow
+```
+
+DPUスレッドがフレームNを推論する裏で、メインがフレームN-1の後処理を実行 →
+スループット `max(DPU側≈200ms, 後処理側≈100ms)≈200ms` で **5.0 FPS**。
+
+- **VARTは `wait()` の間 GIL を解放する**ので、DPU待機中にメインのNumPy後処理が並列に走り本当に重なる。
+  (同一スレッドで `execute_async` 直後に後処理すると重ならない。別スレッド+キューが必須)
+- DPU出力バッファは**フレーム毎に新規確保**(使い回すと後段が読む間にDPUスレッドが上書きする競合)
+- これ以上はDPU 190ms自体が壁。入力縮小(640→416)や軽量モデルが次の手
+
 ## 実行方法
 
 ### 前提条件
@@ -123,10 +143,11 @@ DISPLAY=:1 bash ~/run_yolo_cam.sh 1
 |------|------|------|
 | カメラ取得 | ~0ms | 別スレッドで常時取得 |
 | 前処理（resize+正規化） | ~15ms | 640x480→640x640 |
-| DPU推論 | ~185ms | DPUCZDX8G B4096, 300MHz |
+| DPU推論 | ~190ms | DPUCZDX8G B4096, 300MHz |
 | 後処理（デコード+NMS） | ~90ms | NumPyベクトル化版 |
 | 描画+表示 | ~10ms | cv2.imshow (X11) |
-| **合計** | **~275ms** | **3.6 FPS** |
+| 合計(直列) | ~275ms | 3.6 FPS |
+| **合計(パイプライン化)** | **~200ms** | **5.0 FPS** |
 
 ## 試行した最適化とその結果
 
@@ -135,7 +156,7 @@ DISPLAY=:1 bash ~/run_yolo_cam.sh 1
 | Python 3重forループ → NumPyベクトル化 | 1400ms → 270ms | ループ廃止で大幅改善 |
 | sigmoid事前フィルタ | 270ms → 90ms | 演算対象を大幅削減 |
 | カメラ取得スレッド化 | 効果なし | DPUがボトルネックのため |
-| DPU推論+後処理パイプライン化 | 効果なし | execute_asyncが実際にはブロックするため |
+| DPU推論+後処理パイプライン化(別スレッド+キュー) | 3.6 → 5.0 FPS | wait()中GIL解放でDPUと後処理が並列に重なる |
 
 ## 環境
 
