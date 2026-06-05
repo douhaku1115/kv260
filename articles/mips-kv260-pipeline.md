@@ -3,7 +3,7 @@ title: "自作MIPSプロセッサをKV260で5段パイプライン化する（�
 emoji: "⚙️"
 type: "tech"
 topics: ["fpga", "kv260", "mips", "verilog", "computerarchitecture"]
-published: false
+published: true
 ---
 
 ## はじめに
