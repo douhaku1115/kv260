@@ -939,6 +939,47 @@ static void run_test_ovf(void)
     xil_printf("  $7 = 0x%08x (should be 0)\r\n", mips_read_reg(7));
 }
 
+// ============================================================
+// Test VN: von Neumann 自己書き換えコード (OS-prep1)
+// ============================================================
+// 統一メモリ化の検証。sw でコード領域(0x100)に命令を書き込み、そこへ j で
+// 飛んで実行する。Harvard では imem/dmem が別空間なので不可能だが、
+// von Neumann (unified_mem) なら sw で書いた命令がフェッチされ実行される。
+//
+//   0x00: lui  $1,0x2005        $1 = 0x20050000
+//   0x04: ori  $1,$1,0x0077     $1 = 0x20050077 (= "addi $5,$0,0x77" の機械語)
+//   0x08: sw   $1,0x100($0)     mem[0x100] ← 命令 (自己書き換え)
+//   0x0C: lui  $2,0x0800        $2 = 0x08000000
+//   0x10: ori  $2,$2,0x0041     $2 = 0x08000041 (= "j 0x104")
+//   0x14: sw   $2,0x104($0)     mem[0x104] ← j 0x104 (無限ループ)
+//   0x18: j    0x100            PC ← 0x100 へジャンプ
+//   --- 0x100 (sw で書いた命令を実行) ---
+//   0x100: addi $5,$0,0x77      $5 = 0x77   ← von Neumann ならここが動く
+//   0x104: j 0x104              無限ループ
+//
+// 【期待値】 $5 = 0x77  (Harvard なら $5 は 0x77 にならない)
+static const u32 test_vn_program[] = {
+    0x3C012005, // [0] 0x00: lui  $1, 0x2005
+    0x34210077, // [1] 0x04: ori  $1, $1, 0x0077   $1=0x20050077 (addi $5,$0,0x77)
+    0xAC010100, // [2] 0x08: sw   $1, 0x100($0)     自己書き換え mem[0x100]
+    0x3C020800, // [3] 0x0C: lui  $2, 0x0800
+    0x34420041, // [4] 0x10: ori  $2, $2, 0x0041   $2=0x08000041 (j 0x104)
+    0xAC020104, // [5] 0x14: sw   $2, 0x104($0)     mem[0x104]=j 0x104
+    0x08000040, // [6] 0x18: j    0x100             PC=0x100 へ
+};
+#define TEST_VN_COUNT  (sizeof(test_vn_program) / sizeof(test_vn_program[0]))
+
+static void run_test_vn(void)
+{
+    xil_printf("--- Test VN: von Neumann self-modifying code (OS-prep1) ---\r\n");
+    mips_reset();
+    mips_load_program(test_vn_program, TEST_VN_COUNT);
+    mips_run_cycles(200);
+    xil_printf("PC = 0x%08x\r\n", mips_read_pc());
+    xil_printf("Expected: $5=0x77 (sw-written instr at 0x100 fetched & executed)\r\n");
+    xil_printf("  $5 = 0x%08x (should be 0x77 = von Neumann OK)\r\n", mips_read_reg(5));
+}
+
 // ==== AUTO-GENERATED C TESTS BEGIN (step10/build_all.sh) ====
 
 // --------------------------------------------------------
@@ -1382,7 +1423,9 @@ static void run_all_c_tests(void)
 
 int main(void)
 {
-    xil_printf("\r\n==== MIPS Pipeline Test (Step 12g-3) ====\r\n\r\n");
+    xil_printf("\r\n==== MIPS Pipeline Test (OS-prep1: von Neumann) ====\r\n\r\n");
+    run_test_vn();         // OS-prep1: 統一メモリ(自己書き換え)検証 ★最重要
+    xil_printf("\r\n");
     run_test_pipe_a();
     xil_printf("\r\n");
     run_test1();

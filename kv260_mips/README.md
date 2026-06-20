@@ -265,6 +265,19 @@ WB:   regfile 書き戻し
 | 12g-2 | 例外発生 | syscall/overflow を EX 段で検出。EPC←pc_plus4-4, Cause←ExcCode, SR.EXL←1, PC←0x80。若い命令(IF/ID, ID/EX)をフラッシュ、例外命令の reg/mem/HILO 書込みを抑止。PC 優先: 例外>分岐/jr>ジャンプ>+4 |
 | 12g-3 | eret 復帰 | eret を EX 段で解決。PC←EPC, SR.EXL←0。jr と同じく IF/ID,ID/EX フラッシュ。ハンドラの mtc0(EPC更新) の 1 命令後に eret が EX へ来るため cp0_epc は書込み済みで専用FW不要 |
 
+---
+
+### OS-prep1 — 統一メモリ (von Neumann) 化
+
+OS を載せる準備として、Harvard (imem/dmem 別空間) を **von Neumann (統一メモリ)** に変更。
+命令とデータを単一16KB空間 (`unified_mem.v`) に統合し、`lw/sw` でコード領域も読み書きでき、
+PC フェッチも同じ空間から行えるようにした。= メモリ上に置いたコード(タスク)を実行できる。
+
+- `unified_mem.v`: 単一16KB。IF読み(非同期)＋MEM読み書き(byte enable)＋PSロード。書込みは PS優先→sw 調停
+- `mips_top_pipe.v`: imem/dmem インスタンスを unified_mem 1個に統合 (IF と MEM が同一メモリを共有)
+- 検証 (test_vn): `sw` で 0x100 に `addi $5,$0,0x77` を書き `j 0x100` で実行 → **$5=0x77** で von Neumann 成立 (実機確認)
+- 注: 既存テスト(Test1〜11)は Harvard 前提のため統一メモリでは一部干渉する(コード領域への sw、無限ループ無しの PC 暴走)。von Neumann の正しい挙動であり OS 実装には影響しない
+
 **ハザード処理**
 
 | ハザード種別 | 解決方法 | ペナルティ |
@@ -560,3 +573,4 @@ controls[8:0]:
 | 12g-1 | CP0 (SR/Cause/EPC) + mfc0/mtc0 ラウンドトリップ               | ✓ |
 | 12g-2 | syscall/overflow 例外発生 → EPC/Cause/SR + 0x80 + フラッシュ  | ✓ |
 | 12g-3 | eret 復帰 (syscall→eret→overflow→eret フル例外, test11)        | ✓ |
+| OS-prep1 | von Neumann 化 (統一メモリ, 自己書き換え test_vn で $5=0x77)  | ✓ |

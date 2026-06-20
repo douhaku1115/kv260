@@ -60,6 +60,11 @@
 //     書込み済みで専用フォワーディング不要 (mtc0→mfc0 と同じパターン)
 //   - PC 優先順位: 例外 > eret > 分岐/jr > ジャンプ > +4
 //
+// 【OS-prep1: 統一メモリ (von Neumann)】 (本ファイル)
+//   imem/dmem を unified_mem.v に統合し、命令とデータを単一16KB空間に。
+//   IF(命令フェッチ)と MEM(lw/sw)が同じメモリを共有するため、lw/sw でコード
+//   領域も読み書きでき、自己書き換えコードが動く (OS でタスクをロード/実行する前提)。
+//
 // 【フォワーディングロジック】
 //   ID/EX.rs が EX/MEM のデスティネーションと一致 → ALU 入力 a に EX/MEM 結果を直送
 //   ID/EX.rs が MEM/WB のデスティネーションと一致 → ALU 入力 a に MEM/WB 結果を直送
@@ -101,13 +106,21 @@ module mips_top_pipe (
     wire [31:0] pc_plus4 = pc_reg + 32'd4;
     wire [31:0] if_instr;
 
-    imem imem_inst (
-        .addr_a(pc_reg),
-        .instr(if_instr),
-        .clk_b(clk),
-        .we_b(imem_we),
-        .addr_b(imem_waddr),
-        .din_b(imem_wdata)
+    // OS-prep1: 統一メモリ (von Neumann)。命令とデータが同一空間。
+    //   IF ポート  = pc_reg / if_instr
+    //   MEM ポート = MEM 段の信号 (mem_byte_en/ex_mem_alu_result/... を前方参照)
+    //   PS ポート  = AXI 経由のプログラムロード (imem_we/waddr/wdata)
+    unified_mem unified_mem_inst (
+        .if_addr(pc_reg),
+        .if_instr(if_instr),
+        .clk(clk),
+        .byte_en(mem_byte_en),
+        .mem_addr(ex_mem_alu_result),
+        .mem_wdata(mem_write_data),
+        .mem_rdata(mem_read_data),
+        .ps_we(imem_we),
+        .ps_waddr(imem_waddr),
+        .ps_wdata(imem_wdata)
     );
 
     // 後段で定義する信号の forward declaration
@@ -670,15 +683,9 @@ module mips_top_pipe (
                                  (ex_mem_mem_size == 2'b01) ? {2{ex_mem_rd2[15:0]}} : // sh
                                                               ex_mem_rd2;             // sw
 
+    // OS-prep1: MEM 読出しデータは unified_mem_inst (IF 段付近) の mem_rdata で駆動。
+    //   dmem は廃止し命令メモリと統合 (von Neumann)。
     wire [31:0] mem_read_data;
-
-    dmem dmem_inst (
-        .clk(clk),
-        .byte_en(mem_byte_en),
-        .addr(ex_mem_alu_result),
-        .write_data(mem_write_data),
-        .read_data(mem_read_data)
-    );
 
     // Step 12f: 読み出しデータのスライス + 符号/ゼロ拡張 (ビッグエンディアン)
     wire [7:0] mem_byte_sel =

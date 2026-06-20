@@ -1,9 +1,10 @@
 # KV260 MIPS プロジェクト — 現在の状態
 
 ## 現在地
-**Step 12g-3 完了・実機確認済み（パイプライン化 Step 1〜11 全機能 達成）**
+**OS-prep1 完了・実機確認済み（von Neumann 化達成、OS 実装に着手）**
 
-- Step 1〜12g-3: 実機動作確認済み
+- Step 1〜12g-3: パイプライン化 全機能 実機動作確認済み
+- OS-prep1: 統一メモリ(von Neumann)化。test_vn (自己書き換え) で $5=0x77 実機確認
 - 単一サイクル版 (`mips_top.v`) は Step 11 で完成、`mips_top_pipe.v` (Step 12) に切替済み
 - 切り戻し: `mips_axi.v` で `mips_top_pipe` → `mips_top` に変更すれば単一サイクルに戻る
 - クロック: 20MHz（rebuild.tcl で設定）
@@ -20,6 +21,14 @@
 - 12g-2: syscall/overflow 例外発生 + 0x80 リダイレクト + フラッシュ ✓
 - 12g-3: eret 復帰 (PC←EPC, SR.EXL←0)、test11 フル例外合格 ✓
 
+## OS 実装 (Step 12 完了後、新フェーズ)
+
+- **OS-prep1: von Neumann 化** ✓ (unified_mem.v で imem/dmem 統合、test_vn で $5=0x77 実機確認)
+- OS-prep2: タイマ割込 (CP0 Count/Compare + 外部割込) — 未着手
+- OS-1: 協調マルチタスク (yield) — 未着手
+- OS-2: プリエンプティブ (ラウンドロビン) — 未着手
+- 注: 既存テスト(Test1〜11)は Harvard 前提で統一メモリでは一部干渉(既知、OS実装に影響なし)
+
 ## 今後のロードマップ
 
 - パイプライン化(Step 12)は例外処理まで完了。残: C言語実行(test10)・C テスト群をパイプラインで再確認
@@ -32,19 +41,25 @@
 5. コメント整備 → README.md 更新 → git commit & push
 
 ## 実機テストの注意
-- **SD カードを抜いてベアメタル実行する**。挿したままだと SD の PetaLinux
-  (`kvmipslinux`) が起動し JTAG デバッグと競合 (login プロンプトに入れない/
-  `ZynqMP>` U-Boot が出る)。電源OFF→SD抜き→電源ON→Vitis Debug
+- **★QSPIブート競合 (2026-06 判明、確立した対処)**: このKV260はQSPIにブート
+  イメージが書かれており、SD抜いても `QSPI 32bit Boot Mode`→PMU→BL31→U-Boot
+  (`ZynqMP>`) とフルブートする。これがJTAGデバッグと競合し
+  `Failed to detect FSBL exit` / `Could not find ARM device` / `AP transaction timeout`
+  が出る。**確実な対処** = U-Boot を起動完了させて (ZynqMP> まで待つ=DAP有効化)、
+  Vitis の Debug Configuration で **Board Initialization = None** にし
+  (FSBL/psu_init を実行せず U-Boot 済みのPS初期化を流用)、アプリだけJTAGロード。
+  → main で停止 → Resume でシリアルに出力。mips22/mips23 ともこの方法で成功。
+- Board Init で FSBL→TCL(psu_init)に変えるのも一案だが、QSPIブートと二重初期化で
+  AP timeout が出るため、None が最も確実
+- SD カードは抜いたままでよい (QSPIブートなので SD有無は競合に無関係)
 - Vitis import 時 `UserConfig.cmake` に `"../main.c"` が混入する罠 → 削除必須
   (混入すると src/main.c と二重コンパイルでビルド破綻)
-- `Failed to detect FSBL exit` は Vitis 2025.2 の既知警告。シリアルに出力が
-  出ていればアプリは動いている。出ない時は電源サイクル→再 Debug
 - RTL 不変でテスト(main.c)のみ修正した場合は Vivado 不要、App Build だけで可
 
 ## 重要パス
 - Vivado: `E:\vivado\2025.2\Vivado\bin\vivado.bat`
 - プロジェクト: `E:\fpga\kria260\kv260_mips\`
 - XSA: `E:\fpga\kria260\kv260_mips\project_1\design_1_wrapper.xsa`
-- Vitis WS: `E:\Xilinx\project_vitis\kv_mips22`（Step 12g-3。kv_mips14〜21 は古い）
+- Vitis WS: `E:\Xilinx\project_vitis\kv_mips23`（OS-prep1。kv_mips14〜22 は古い）
 - main.c（編集はここのみ）: `E:\fpga\kria260\kv260_mips\vitis_src\main.c`
 - git: https://github.com/douhaku1115/kv260.git

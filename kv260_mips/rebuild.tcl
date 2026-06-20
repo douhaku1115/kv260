@@ -6,6 +6,12 @@ if {[llength [get_files -quiet rtl/mips_top_pipe.v]] == 0} {
     puts "Added rtl/mips_top_pipe.v to project"
 }
 
+# OS-prep1: 統一メモリ (von Neumann) を追加（既にあればスキップ）
+if {[llength [get_files -quiet rtl/unified_mem.v]] == 0} {
+    add_files -norecurse E:/fpga/kria260/kv260_mips/rtl/unified_mem.v
+    puts "Added rtl/unified_mem.v to project"
+}
+
 # clk_wiz を 20MHz に設定（32bit 除算器のタイミング対策: 50MHz では WNS=-22ns）
 open_bd_design [get_files design_1.bd]
 set_property CONFIG.CLKOUT1_REQUESTED_OUT_FREQ 20 [get_bd_cells clk_wiz_0]
