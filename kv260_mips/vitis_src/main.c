@@ -980,6 +980,48 @@ static void run_test_vn(void)
     xil_printf("  $5 = 0x%08x (should be 0x77 = von Neumann OK)\r\n", mips_read_reg(5));
 }
 
+// ============================================================
+// Test Timer A: CP0 Count($9) / Compare($11) (OS-prep2a)
+// ============================================================
+// タイマ割込の前段階。Count は毎クロック +1、Compare は mtc0 で設定。
+// 割込はまだ無く、レジスタの読み書きと Count の自動インクリメントだけ確認する。
+//
+//   0x00: addi $3,$0,0x40   $3 = 0x40 (Compare に入れる値)
+//   0x04: mtc0 $3,$11       Compare = 0x40
+//   0x08: mfc0 $1,$9        $1 = Count (early)
+//   0x0C: addi $6,$0,0      (時間を稼ぐ nop 代わり)
+//   0x10: addi $6,$0,0
+//   0x14: addi $6,$0,0
+//   0x18: mfc0 $2,$9        $2 = Count (later, > $1)
+//   0x1C: mfc0 $4,$11       $4 = Compare (=0x40)
+//   0x20: j 0x20            無限ループ
+//
+// 【期待値】 $1 < $2 (Count が進んでいる), $4 = 0x40 (Compare 読み書き OK)
+static const u32 test_timer_a_program[] = {
+    0x20030040, // [0] 0x00: addi $3,$0,0x40
+    0x40835800, // [1] 0x04: mtc0 $3,$11     Compare=0x40
+    0x40014800, // [2] 0x08: mfc0 $1,$9      $1=Count(early)
+    0x20060000, // [3] 0x0C: addi $6,$0,0
+    0x20060000, // [4] 0x10: addi $6,$0,0
+    0x20060000, // [5] 0x14: addi $6,$0,0
+    0x40024800, // [6] 0x18: mfc0 $2,$9      $2=Count(later)
+    0x40045800, // [7] 0x1C: mfc0 $4,$11     $4=Compare
+    0x08000008, // [8] 0x20: j 0x20
+};
+#define TEST_TIMER_A_COUNT  (sizeof(test_timer_a_program) / sizeof(test_timer_a_program[0]))
+
+static void run_test_timer_a(void)
+{
+    xil_printf("--- Test Timer A: CP0 Count/Compare (OS-prep2a) ---\r\n");
+    mips_reset();
+    mips_load_program(test_timer_a_program, TEST_TIMER_A_COUNT);
+    mips_run_cycles(200);
+    xil_printf("Expected: $1 < $2 (Count incrementing), $4=0x40 (Compare)\r\n");
+    xil_printf("  $1 (Count early) = %u\r\n", mips_read_reg(1));
+    xil_printf("  $2 (Count later) = %u  (should be > $1)\r\n", mips_read_reg(2));
+    xil_printf("  $4 (Compare) = 0x%x  (should be 0x40)\r\n", mips_read_reg(4));
+}
+
 // ==== AUTO-GENERATED C TESTS BEGIN (step10/build_all.sh) ====
 
 // --------------------------------------------------------
@@ -1423,8 +1465,10 @@ static void run_all_c_tests(void)
 
 int main(void)
 {
-    xil_printf("\r\n==== MIPS Pipeline Test (OS-prep1: von Neumann) ====\r\n\r\n");
+    xil_printf("\r\n==== MIPS Pipeline Test (OS-prep2a: Timer regs) ====\r\n\r\n");
     run_test_vn();         // OS-prep1: 統一メモリ(自己書き換え)検証 ★最重要
+    xil_printf("\r\n");
+    run_test_timer_a();    // OS-prep2a: CP0 Count/Compare レジスタ
     xil_printf("\r\n");
     run_test_pipe_a();
     xil_printf("\r\n");

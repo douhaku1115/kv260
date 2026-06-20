@@ -546,6 +546,7 @@ module mips_top_pipe (
     //   例外命令自身の reg_write/CP0書込み/HI-LO書込みは抑止する。
     //   EPC は伝搬済み pc_plus4 から -4 で導出 (専用 PC レジスタ不要)。
     reg [31:0] cp0_sr, cp0_cause, cp0_epc;
+    reg [31:0] cp0_count, cp0_compare;  // OS-prep2: $9 Count(毎クロック+1), $11 Compare
 
     // 例外検出 (EX 段)。jr/分岐より「同じ命令で」優先評価される。
     wire ex_exc_overflow = id_ex_exc_on_ov & ex_alu_overflow;
@@ -580,9 +581,27 @@ module mips_top_pipe (
         end
     end
 
-    wire [31:0] cp0_read = (id_ex_rd == 5'd12) ? cp0_sr    :
-                           (id_ex_rd == 5'd13) ? cp0_cause :
-                           (id_ex_rd == 5'd14) ? cp0_epc   : 32'b0;
+    // OS-prep2a: Count($9) は毎クロック +1 (halt中は停止)、Compare($11) は mtc0 で設定。
+    //   Count は mtc0 で初期化も可能 (mtc0 書込み優先、それ以外は +1)。
+    always @(posedge clk) begin
+        if (reset) begin
+            cp0_count   <= 32'b0;
+            cp0_compare <= 32'b0;
+        end else begin
+            if (id_ex_is_mtc0 & ~halt & (id_ex_rd == 5'd9))
+                cp0_count <= alu_in_rt;            // Count 初期化 (mtc0)
+            else if (~halt)
+                cp0_count <= cp0_count + 32'd1;    // 毎クロック +1
+            if (id_ex_is_mtc0 & ~halt & (id_ex_rd == 5'd11))
+                cp0_compare <= alu_in_rt;          // Compare 設定
+        end
+    end
+
+    wire [31:0] cp0_read = (id_ex_rd == 5'd9)  ? cp0_count   :
+                           (id_ex_rd == 5'd11) ? cp0_compare :
+                           (id_ex_rd == 5'd12) ? cp0_sr      :
+                           (id_ex_rd == 5'd13) ? cp0_cause   :
+                           (id_ex_rd == 5'd14) ? cp0_epc     : 32'b0;
 
     // 書き戻しデータ: lui → mfc0 → mfhi/mflo → 通常 ALU の順で選択
     wire [31:0] ex_result = id_ex_lui_instr ? {id_ex_sign_imm[15:0], 16'b0}     :

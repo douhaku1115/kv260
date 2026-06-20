@@ -278,6 +278,16 @@ PC フェッチも同じ空間から行えるようにした。= メモリ上に
 - 検証 (test_vn): `sw` で 0x100 に `addi $5,$0,0x77` を書き `j 0x100` で実行 → **$5=0x77** で von Neumann 成立 (実機確認)
 - 注: 既存テスト(Test1〜11)は Harvard 前提のため統一メモリでは一部干渉する(コード領域への sw、無限ループ無しの PC 暴走)。von Neumann の正しい挙動であり OS 実装には影響しない
 
+### OS-prep2a — CP0 タイマレジスタ (Count/Compare)
+
+タイマ割込の前段階として CP0 に Count($9)/Compare($11) を追加。
+
+- **Count ($9)**: 毎クロック +1 (halt 中は停止)。mtc0 で初期化も可
+- **Compare ($11)**: mtc0 で設定、mfc0 で読み出し
+- mfc0/mtc0 経路 (12g-1) に $9/$11 を追加。Count/Compare は専用 always で駆動
+- 検証 (test_timer_a): Count を 2 回読み $1=4 < $2=8 (命令数ぶん進行)、Compare=0x40 読み書き OK (実機確認)
+- 次の OS-prep2b で Count==Compare を割込条件に使う
+
 **ハザード処理**
 
 | ハザード種別 | 解決方法 | ペナルティ |
@@ -574,3 +584,4 @@ controls[8:0]:
 | 12g-2 | syscall/overflow 例外発生 → EPC/Cause/SR + 0x80 + フラッシュ  | ✓ |
 | 12g-3 | eret 復帰 (syscall→eret→overflow→eret フル例外, test11)        | ✓ |
 | OS-prep1 | von Neumann 化 (統一メモリ, 自己書き換え test_vn で $5=0x77)  | ✓ |
+| OS-prep2a | CP0 Count($9)/Compare($11) (Count自動+1, mtc0/mfc0 読み書き)  | ✓ |
