@@ -286,7 +286,22 @@ PC フェッチも同じ空間から行えるようにした。= メモリ上に
 - **Compare ($11)**: mtc0 で設定、mfc0 で読み出し
 - mfc0/mtc0 経路 (12g-1) に $9/$11 を追加。Count/Compare は専用 always で駆動
 - 検証 (test_timer_a): Count を 2 回読み $1=4 < $2=8 (命令数ぶん進行)、Compare=0x40 読み書き OK (実機確認)
-- 次の OS-prep2b で Count==Compare を割込条件に使う
+
+### OS-prep2b — タイマ割込
+
+Count==Compare で割込を発生させ、ハンドラ(0x80)→eret 復帰を繰り返す。プリエンプティブな
+タスク切替の土台 (定期的に必ずカーネルへ制御が移る)。
+
+- **SR[1]=IE** (割込イネーブル) 新設。SR[0]=EXL は現状維持 (既存例外を壊さない)
+- **タイマ割込ペンディングフラグ** (標準 MIPS の IP7 相当, `timer_pending`):
+  Count==Compare で 1 にセット保持、Compare 書込み(mtc0 $11)でクリア。
+  一致は 1 サイクルだけだが、フラグ保持により割込点(有効命令)まで取りこぼさない (★重要)
+- **割込検出** (EX 段): `timer_pending & IE & ~EXL & 有効命令(id_ex_pc_plus4!=0)`。
+  既存の同期例外機構を拡張し `ex_exception_total = ex_exception(syscall/ovf) | ex_interrupt` で統合。
+  pc_next_select/flush/副作用抑止を total に。EPC は同期例外と同じ EX 段命令 PC
+- **Cause**: 割込=IP7(0x00008000, bit15), 同期=ExcCode で区別。EXL=1 中は割込禁止(ネスト防止)
+- 検証 (test_timer_b): メインループ中に定期割込。**ペンディングフラグ無しでは $1=2 (取りこぼし)
+  → フラグ追加で $1=140** (メインループ 2864 回に対し約64クロックごと, 実機確認)
 
 **ハザード処理**
 
@@ -585,3 +600,4 @@ controls[8:0]:
 | 12g-3 | eret 復帰 (syscall→eret→overflow→eret フル例外, test11)        | ✓ |
 | OS-prep1 | von Neumann 化 (統一メモリ, 自己書き換え test_vn で $5=0x77)  | ✓ |
 | OS-prep2a | CP0 Count($9)/Compare($11) (Count自動+1, mtc0/mfc0 読み書き)  | ✓ |
+| OS-prep2b | タイマ割込 (Count==Compare→割込→eret, ペンディングフラグで $1=140) | ✓ |

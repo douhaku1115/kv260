@@ -1022,6 +1022,61 @@ static void run_test_timer_a(void)
     xil_printf("  $4 (Compare) = 0x%x  (should be 0x40)\r\n", mips_read_reg(4));
 }
 
+// ============================================================
+// Test Timer B: タイマ割込 (OS-prep2b)
+// ============================================================
+// Count==Compare で割込発生 → ハンドラ(0x80) → eret 復帰、を繰り返す。
+// SR[1]=IE を有効化し、メインループを回す間に複数回割込が起きることを確認。
+//
+// 【メイン】
+//   0x00: addi $1,$0,0      $1=0 (割込回数。ハンドラが ++)
+//   0x04: addi $2,$0,0x40   $2=0x40 (Compare 値)
+//   0x08: mtc0 $2,$11       Compare = 0x40
+//   0x0C: addi $3,$0,0x2    $3=0x2 (SR: IE=bit1=1, EXL=bit0=0)
+//   0x10: mtc0 $3,$12       SR = 0x2 (割込許可)
+//   0x14: addi $4,$4,1      メインループ: $4++  (割込待ちの仕事)
+//   0x18: j 0x14            ループ
+//
+// 【ハンドラ (0x80)】
+//   0x80: addi $1,$1,1      割込回数 ++
+//   0x84: mfc0 $5,$9        $5 = Count (現在値)
+//   0x88: addi $5,$5,0x40   $5 = Count + 0x40
+//   0x8C: mtc0 $5,$11       Compare = Count+0x40 (次の割込を仕込む)
+//   0x90: eret             メインへ復帰 (SR.EXL←0 で割込再許可)
+//
+// 【期待値】 $1 > 0 (割込が起きハンドラが eret で戻った), $4 も増加 (メインも実行)
+static const u32 test_timer_b_program[] = {
+    0x20010000, // [0] 0x00: addi $1,$0,0      割込回数=0
+    0x20020040, // [1] 0x04: addi $2,$0,0x40   Compare値
+    0x40825800, // [2] 0x08: mtc0 $2,$11       Compare=0x40
+    0x20030002, // [3] 0x0C: addi $3,$0,0x2    SR値(IE=1)
+    0x40836000, // [4] 0x10: mtc0 $3,$12       SR=0x2(IE=1,EXL=0)
+    0x20840001, // [5] 0x14: addi $4,$4,1      メインループ $4++
+    0x08000005, // [6] 0x18: j 0x14            ループ
+    // ---- padding word7-31 (0x1C-0x7C) ----
+    0,0,0,0,0,0,0,0,0,                          // [7-15]
+    0,0,0,0,0,0,0,0,                            // [16-23]
+    0,0,0,0,0,0,0,0,                            // [24-31]
+    // ---- ハンドラ word32 = 0x80 ----
+    0x20210001, // [32] 0x80: addi $1,$1,1     割込回数++
+    0x40054800, // [33] 0x84: mfc0 $5,$9       $5=Count
+    0x20A50040, // [34] 0x88: addi $5,$5,0x40  $5=Count+0x40
+    0x40855800, // [35] 0x8C: mtc0 $5,$11      Compare=Count+0x40
+    0x42000018, // [36] 0x90: eret
+};
+#define TEST_TIMER_B_COUNT  (sizeof(test_timer_b_program) / sizeof(test_timer_b_program[0]))
+
+static void run_test_timer_b(void)
+{
+    xil_printf("--- Test Timer B: timer interrupt (OS-prep2b) ---\r\n");
+    mips_reset();
+    mips_load_program(test_timer_b_program, TEST_TIMER_B_COUNT);
+    mips_run_cycles(500);
+    xil_printf("Expected: $1 > 0 (interrupt fired, handler ran, eret returned)\r\n");
+    xil_printf("  $1 (interrupt count) = %u  (should be > 0)\r\n", mips_read_reg(1));
+    xil_printf("  $4 (main loop count) = %u\r\n", mips_read_reg(4));
+}
+
 // ==== AUTO-GENERATED C TESTS BEGIN (step10/build_all.sh) ====
 
 // --------------------------------------------------------
@@ -1465,10 +1520,12 @@ static void run_all_c_tests(void)
 
 int main(void)
 {
-    xil_printf("\r\n==== MIPS Pipeline Test (OS-prep2a: Timer regs) ====\r\n\r\n");
+    xil_printf("\r\n==== MIPS Pipeline Test (OS-prep2b: Timer IRQ) ====\r\n\r\n");
     run_test_vn();         // OS-prep1: 統一メモリ(自己書き換え)検証 ★最重要
     xil_printf("\r\n");
     run_test_timer_a();    // OS-prep2a: CP0 Count/Compare レジスタ
+    xil_printf("\r\n");
+    run_test_timer_b();    // OS-prep2b: タイマ割込 ★今回の主役
     xil_printf("\r\n");
     run_test_pipe_a();
     xil_printf("\r\n");

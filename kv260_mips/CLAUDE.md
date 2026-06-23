@@ -1,11 +1,12 @@
 # KV260 MIPS プロジェクト — 現在の状態
 
 ## 現在地
-**OS-prep2a 完了・実機確認済み（タイマレジスタ追加、OS 実装進行中）**
+**OS-prep2b 完了・実機確認済み（タイマ割込達成、プリエンプティブの土台完成）**
 
 - Step 1〜12g-3: パイプライン化 全機能 実機動作確認済み
 - OS-prep1: 統一メモリ(von Neumann)化。test_vn (自己書き換え) で $5=0x77 実機確認
 - OS-prep2a: CP0 Count($9)/Compare($11)。Count自動+1 ($1=4<$2=8)、Compare=0x40 実機確認
+- OS-prep2b: タイマ割込。SR[1]=IE新設、timer_pendingフラグ(IP7相当)で取りこぼし防止。test_timer_b で $1=140 実機確認
 - 単一サイクル版 (`mips_top.v`) は Step 11 で完成、`mips_top_pipe.v` (Step 12) に切替済み
 - 切り戻し: `mips_axi.v` で `mips_top_pipe` → `mips_top` に変更すれば単一サイクルに戻る
 - クロック: 20MHz（rebuild.tcl で設定）
@@ -26,9 +27,10 @@
 
 - **OS-prep1: von Neumann 化** ✓ (unified_mem.v で imem/dmem 統合、test_vn で $5=0x77 実機確認)
 - **OS-prep2a: CP0 Count/Compare レジスタ** ✓ (Count自動+1, Compare読み書き 実機確認)
-- OS-prep2b: タイマ割込発生 + ハンドラ + eret (Count==Compare で割込、SR[1]=IE 新設予定) — 次
-- OS-1: 協調マルチタスク (yield) — 未着手
-- OS-2: プリエンプティブ (ラウンドロビン) — 未着手
+- **OS-prep2b: タイマ割込** ✓ (SR[1]=IE, timer_pendingフラグ, test_timer_b で $1=140 実機確認)
+  - 重要な学び: Count==Compare は1サイクルのみ→ペンディングフラグ保持しないと割込取りこぼし($1=2)。フラグ追加で$1=140
+- OS-1: 協調マルチタスク (yield, コンテキスト保存/復元) — 次
+- OS-2: プリエンプティブ (タイマ割込でラウンドロビン) — 未着手
 - 注: 既存テスト(Test1〜11)は Harvard 前提で統一メモリでは一部干渉(既知、OS実装に影響なし)
 
 ## 今後のロードマップ
@@ -62,6 +64,6 @@
 - Vivado: `E:\vivado\2025.2\Vivado\bin\vivado.bat`
 - プロジェクト: `E:\fpga\kria260\kv260_mips\`
 - XSA: `E:\fpga\kria260\kv260_mips\project_1\design_1_wrapper.xsa`
-- Vitis WS: `E:\Xilinx\project_vitis\kv_mips24`（OS-prep2a。kv_mips14〜23 は古い）
+- Vitis WS: `E:\Xilinx\project_vitis\kv_mips26`（OS-prep2b。kv_mips14〜25 は古い）
 - main.c（編集はここのみ）: `E:\fpga\kria260\kv260_mips\vitis_src\main.c`
 - git: https://github.com/douhaku1115/kv260.git

@@ -60,10 +60,18 @@
 //     書込み済みで専用フォワーディング不要 (mtc0→mfc0 と同じパターン)
 //   - PC 優先順位: 例外 > eret > 分岐/jr > ジャンプ > +4
 //
-// 【OS-prep1: 統一メモリ (von Neumann)】 (本ファイル)
+// 【OS-prep1: 統一メモリ (von Neumann)】
 //   imem/dmem を unified_mem.v に統合し、命令とデータを単一16KB空間に。
 //   IF(命令フェッチ)と MEM(lw/sw)が同じメモリを共有するため、lw/sw でコード
 //   領域も読み書きでき、自己書き換えコードが動く (OS でタスクをロード/実行する前提)。
+//
+// 【OS-prep2: タイマ割込】
+//   - CP0 Count($9, 毎クロック+1) / Compare($11) を追加 (2a)
+//   - SR[1]=IE(割込イネーブル, 新設)。SR[0]=EXL は現状維持
+//   - タイマ割込: Count==Compare & IE & ~EXL & 有効命令 → EX 段で発火 (2b)
+//     既存の同期例外(syscall/overflow)と同じ機構で EPC保存/0x80/フラッシュ/副作用抑止
+//     Cause は割込=IP7(bit15), 同期=ExcCode で区別。EXL=1 中は割込禁止(ネスト防止)
+//     ハンドラが Compare 再設定→eret で次の割込を仕込む
 //
 // 【フォワーディングロジック】
 //   ID/EX.rs が EX/MEM のデスティネーションと一致 → ALU 入力 a に EX/MEM 結果を直送
@@ -131,23 +139,25 @@ module mips_top_pipe (
     wire [31:0] ex_jr_target;
     wire [31:0] id_jump_target;
     wire        id_ex_jr_w;     // EX 段の jr フラグを参照するためのワイヤ
-    wire        ex_exception;   // Step 12g-2: EX 段で例外発生 (syscall/overflow)
+    wire        ex_exception;   // Step 12g-2: EX 段で同期例外 (syscall/overflow)
+    wire        ex_interrupt;   // OS-prep2b: EX 段で タイマ割込 (非同期)
+    wire        ex_exception_total; // 同期例外 or 割込 (共通処理用)
     wire        ex_eret;        // Step 12g-3: EX 段で eret (PC←EPC)
     wire [31:0] ex_epc;         // Step 12g-3: eret の戻り先 (cp0_epc)
 
     localparam EXC_VEC = 32'h00000080;  // 例外ベクタ (imem word 32)
 
-    // PC 次値選択 (優先度: 例外 > eret > EX 段の分岐/jr > ID 段のジャンプ > PC+4)
+    // PC 次値選択 (優先度: 例外/割込 > eret > EX 段の分岐/jr > ID 段のジャンプ > PC+4)
     wire [31:0] pc_next_select =
-        ex_exception   ? EXC_VEC :
-        ex_eret        ? ex_epc  :
-        ex_take_branch ? (id_ex_jr_w ? ex_jr_target : ex_branch_target) :
-        id_take_jump   ? id_jump_target :
-                         pc_plus4;
+        ex_exception_total ? EXC_VEC :
+        ex_eret            ? ex_epc  :
+        ex_take_branch     ? (id_ex_jr_w ? ex_jr_target : ex_branch_target) :
+        id_take_jump       ? id_jump_target :
+                             pc_plus4;
 
-    // フラッシュ信号 (例外/eret 時も若い命令を潰す)
-    wire flush_if_id = id_take_jump | ex_take_branch | ex_exception | ex_eret;
-    wire flush_id_ex = ex_take_branch | ex_exception | ex_eret;
+    // フラッシュ信号 (例外/割込/eret 時も若い命令を潰す)
+    wire flush_if_id = id_take_jump | ex_take_branch | ex_exception_total | ex_eret;
+    wire flush_id_ex = ex_take_branch | ex_exception_total | ex_eret;
 
     // PC レジスタ更新 (stall 中は据え置き、分岐/ジャンプ時はターゲットへ)
     always @(posedge clk) begin
@@ -522,7 +532,7 @@ module mips_top_pipe (
         if (reset) begin
             hi_reg <= 32'b0;
             lo_reg <= 32'b0;
-        end else if (id_ex_hilo_write & ~halt & ~ex_exception) begin
+        end else if (id_ex_hilo_write & ~halt & ~ex_exception_total) begin
             case (id_ex_hilo_op)
                 2'b00: {hi_reg, lo_reg} <= mult_s;          // mult
                 2'b01: {hi_reg, lo_reg} <= mult_u;          // multu
@@ -547,12 +557,22 @@ module mips_top_pipe (
     //   EPC は伝搬済み pc_plus4 から -4 で導出 (専用 PC レジスタ不要)。
     reg [31:0] cp0_sr, cp0_cause, cp0_epc;
     reg [31:0] cp0_count, cp0_compare;  // OS-prep2: $9 Count(毎クロック+1), $11 Compare
+    reg        timer_pending;           // OS-prep2b: タイマ割込ペンディング(IP7相当)
 
     // 例外検出 (EX 段)。jr/分岐より「同じ命令で」優先評価される。
     wire ex_exc_overflow = id_ex_exc_on_ov & ex_alu_overflow;
     assign ex_exception  = (id_ex_is_syscall | ex_exc_overflow) & ~halt;
     wire [4:0] ex_exc_code = id_ex_is_syscall ? 5'd8 : 5'd12; // 8=Syscall,12=Overflow
     wire [31:0] ex_exc_pc  = id_ex_pc_plus4 - 32'd4;          // 例外命令の PC
+
+    // OS-prep2b: タイマ割込検出 (EX 段)。Count==Compare かつ IE(SR[1]) かつ ~EXL(SR[0])。
+    //   バブル (id_ex_pc_plus4==0) では取らず、有効命令の境界で取る。同期例外を優先。
+    //   EPC は同期例外と同じ EX 段命令の PC。eret でその命令から再実行する。
+    wire ex_timer_irq = timer_pending;  // フラグ保持 (一致サイクルを逃しても保持される)
+    wire ex_int_raw   = ex_timer_irq & cp0_sr[1] & ~cp0_sr[0] & ~halt &
+                        (id_ex_pc_plus4 != 32'b0);
+    assign ex_interrupt       = ex_int_raw & ~ex_exception;  // 同期例外を優先
+    assign ex_exception_total = ex_exception | ex_interrupt;
 
     // Step 12g-3: eret (EX 段)。PC←EPC, SR.EXL←0。jr と同じく EX で解決+フラッシュ
     assign ex_eret = id_ex_is_eret & ~halt;
@@ -563,10 +583,11 @@ module mips_top_pipe (
             cp0_sr    <= 32'b0;
             cp0_cause <= 32'b0;
             cp0_epc   <= 32'b0;
-        end else if (ex_exception) begin
-            // 例外発生が最優先 (mtc0/eret より優先)
+        end else if (ex_exception_total) begin
+            // 例外/割込が最優先 (mtc0/eret より優先)
             cp0_epc   <= ex_exc_pc;
-            cp0_cause <= {25'b0, ex_exc_code, 2'b0}; // Cause[6:2] = ExcCode
+            cp0_cause <= ex_interrupt ? 32'h00008000              // 割込: IP7(bit15)=1, ExcCode=0
+                                      : {25'b0, ex_exc_code, 2'b0}; // 同期: Cause[6:2]=ExcCode
             cp0_sr    <= {cp0_sr[31:1], 1'b1};       // EXL = 1
         end else if (ex_eret) begin
             // eret: EXL = 0 (PC は pc_next_select 側で EPC に戻す)
@@ -595,6 +616,18 @@ module mips_top_pipe (
             if (id_ex_is_mtc0 & ~halt & (id_ex_rd == 5'd11))
                 cp0_compare <= alu_in_rt;          // Compare 設定
         end
+    end
+
+    // OS-prep2b: タイマ割込ペンディングフラグ (標準 MIPS の IP7 相当)。
+    //   Count==Compare で 1 に保持。Compare 書込み(mtc0 $11)でクリア。
+    //   一致は 1 サイクルだけだが、フラグ保持により割込点(有効命令)まで取りこぼさない。
+    always @(posedge clk) begin
+        if (reset)
+            timer_pending <= 1'b0;
+        else if (id_ex_is_mtc0 & ~halt & (id_ex_rd == 5'd11))
+            timer_pending <= 1'b0;                 // Compare 書込みでクリア(次の割込を仕込む)
+        else if ((cp0_count == cp0_compare) & (cp0_compare != 32'b0))
+            timer_pending <= 1'b1;                 // 一致でセット(保持)
     end
 
     wire [31:0] cp0_read = (id_ex_rd == 5'd9)  ? cp0_count   :
@@ -659,10 +692,10 @@ module mips_top_pipe (
             ex_mem_mem_unsigned <= 1'b0;
         end else if (!halt) begin
             // Step 12g-2: 例外発生時は当該命令の reg_write/mem_write を抑止
-            ex_mem_reg_write  <= id_ex_reg_write & ~ex_exception;
+            ex_mem_reg_write  <= id_ex_reg_write & ~ex_exception_total;
             ex_mem_alu_result <= ex_result;       // Step 12e: lui 結果も含む
             ex_mem_write_reg  <= ex_write_reg;
-            ex_mem_mem_write  <= id_ex_mem_write & ~ex_exception;
+            ex_mem_mem_write  <= id_ex_mem_write & ~ex_exception_total;
             ex_mem_mem_to_reg <= id_ex_mem_to_reg;
             ex_mem_rd2        <= alu_in_rt;
             ex_mem_jal_instr  <= id_ex_jal_instr;
