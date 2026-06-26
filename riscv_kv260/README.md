@@ -9,16 +9,16 @@ Xilinx Kria KV260 上で動作させたもの。結果は VIO で `0x13BA`（= 5
 
 | ファイル | 内容 |
 |----------|------|
-| `src/main_vio.v` | **3段パイプライン** `m_proc8_F`（教科書 code9-1）+ 共通モジュール + KV260トップ |
-| `src/main_vio_4stage.v` | **4段パイプライン** `m_proc9`（教科書 code6-27）版 |
+| `src/main_vio.v` | **4段パイプライン** `m_proc8_F`（教科書 code9-1、MEMはEXに併合）+ 共通モジュール + KV260トップ |
+| `src/main_vio_4stage.v` | **5段パイプライン** `m_proc9`（教科書 code6-27、IF/ID/EX/MEM/WB）版 |
 | `src/asm.txt` | 命令メモリに焼き込むプログラム（Σ0..100=5050、手アセンブル） |
-| `create_vio_full.tcl` | 3段版プロジェクト生成（Vivado batch） |
-| `create_4stage.tcl` | 4段版プロジェクト生成＋ビットストリームまで |
+| `create_vio_full.tcl` | 4段版プロジェクト生成（Vivado batch） |
+| `create_4stage.tcl` | 5段版プロジェクト生成＋ビットストリームまで |
 
 ## ビルド
 
 ```
-vivado -mode batch -source create_4stage.tcl   # 4段版（create_vio_full.tcl が3段版）
+vivado -mode batch -source create_4stage.tcl   # 5段版 m_proc9（create_vio_full.tcl が4段版 m_proc8_F）
 ```
 
 `m_top_kv260.bit` と `m_top_kv260.ltx` が生成される。
@@ -40,9 +40,9 @@ get_property INPUT_VALUE [get_hw_probes w_rslt]
 # → 000013ba （= 5050）
 ```
 
-## 3段 → 4段 の違い
+## 4段 → 5段 の違い
 
-| 項目 | 3段 (m_proc8_F) | 4段 (m_proc9) |
+| 項目 | 4段 (m_proc8_F) | 5段 (m_proc9) |
 |------|-----------------|----------------|
 | 段 | P1/P2/P3 | P1/P2/P3/P4 |
 | ライトバック | P3 | P4 |
