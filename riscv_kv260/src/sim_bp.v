@@ -8,12 +8,10 @@ module m_tb;
   wire [31:0] w_rslt, w_miss, w_brn;
   m_proc9 dut (w_clk, w_rslt, w_miss, w_brn);
   initial begin
-    repeat (2000) @(posedge w_clk);
+    repeat (6000) @(posedge w_clk);   // Σ/ネストループ どちらも完走する長さ
     $display("RESULT = %0d (0x%h)", w_rslt, w_rslt);
     $display("MISS   = %0d", w_miss);
     $display("BRANCH = %0d", w_brn);
-    if (w_rslt==5050) $display("=> result OK (5050)");
-    else              $display("=> result NG");
     $finish;
   end
 endmodule

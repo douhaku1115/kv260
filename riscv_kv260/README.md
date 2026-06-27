@@ -12,11 +12,14 @@ Xilinx Kria KV260 上で動作させたもの。結果は VIO で `0x13BA`（= 5
 | `src/main_vio.v` | **4段パイプライン** `m_proc8_F`（教科書 code9-1、MEMはEXに併合）+ 共通モジュール + KV260トップ |
 | `src/main_vio_4stage.v` | **5段パイプライン** `m_proc9`（教科書 code6-27、IF/ID/EX/MEM/WB）版 |
 | `src/main_vio_bp.v` | **5段＋分岐予測** `m_proc9` に BTB（code7-4）+ bimodal 2bit（code7-11）を追加した版 |
+| `src/main_vio_gshare.v` | **5段＋gshare** 予測器を gshare（code7-13、BHR^PC）に差し替えた版。命令メモリは `asm_nested.txt` |
 | `src/sim_bp.v` | `main_vio_bp.v` の iverilog 検証用テストベンチ（Xilinx IP はスタブ） |
 | `src/asm.txt` | 命令メモリに焼き込むプログラム（Σ0..100=5050、手アセンブル） |
+| `src/asm_nested.txt` | ネストループ（code7-10、結果505）。gshareの効果検証用 |
 | `create_vio_full.tcl` | 4段版プロジェクト生成（Vivado batch） |
 | `create_4stage.tcl` | 5段版プロジェクト生成＋ビットストリームまで |
-| `create_bp.tcl` | 分岐予測版プロジェクト生成＋ビットストリームまで（VIO入力3本） |
+| `create_bp.tcl` | 分岐予測版（BTB+bimodal）生成＋ビットストリームまで（VIO入力3本） |
+| `create_gshare.tcl` | gshare版生成＋ビットストリームまで（VIO入力3本、ネストループ） |
 
 ## ビルド
 
@@ -82,4 +85,30 @@ cd src && iverilog -g2012 -o /tmp/bp.out main_vio_bp.v sim_bp.v && vvp /tmp/bp.o
 
 # ビルド
 vivado -mode batch -source create_bp.tcl
+```
+
+## gshare（5段＋BTB+gshare）
+
+予測器を gshare（`main_vio_gshare.v`、code7-13）に差し替えた版。gshare は
+分岐履歴レジスタ `r_bhr`（5bit）を PHT のアドレスと XOR して引くため、**相関する分岐**
+（ネストループ等）を区別して予測できる。bimodal とインターフェースは同一で、予測器だけ差し替え。
+
+効果が見えるよう命令メモリは**ネストループ**（`asm_nested.txt`、code7-10、結果505）を使用。
+内ループは `T T T N` を繰り返すパターンで、bimodal は外ループのたびに脱出を外す。
+
+| 予測器 | ミス予測 | 分岐 | 結果 |
+|---|---|---|---|
+| BTB+bimodal | 104 | 505 | 505 |
+| **BTB+gshare** | **9** | 505 | 505 |
+
+bimodal の 104 回ミスを gshare は 9 回まで削減。
+KV260 実機 VIO で `r_dout=0x1F9`（505）/ `r_miss=9` / `r_brn=505` を確認。
+
+```
+# シミュレーション比較（要 iverilog、ネストループは asm_nested.txt を include）
+cd src && iverilog -g2012 -o /tmp/g.out main_vio_gshare.v sim_bp.v && vvp /tmp/g.out
+# => RESULT=505  MISS=9  BRANCH=505
+
+# ビルド
+vivado -mode batch -source create_gshare.tcl
 ```
