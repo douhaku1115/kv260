@@ -15,17 +15,21 @@ Xilinx Kria KV260 上で動作させたもの。結果は VIO で `0x13BA`（= 5
 | `src/main_vio_gshare.v` | **5段＋gshare** 予測器を gshare（code7-13、BHR^PC）に差し替えた版。命令メモリは `asm_nested.txt` |
 | `src/main_vio_cache.v` | **4段＋命令キャッシュ** `m_proc8_c2`（code8-8）に直接マップ `m_cache1`（code8-7）+ 遅延主記憶 `m_imem`（code8-2）を組んだ版 |
 | `src/main_vio_2way.v` | **4段＋2-wayキャッシュ** キャッシュを 2-way セットアソシアティブ `m_cache3`（code8-12、LRU付き）に差し替えた版。命令メモリは `asm_conflict.txt` |
+| `src/main_vio_block.v` | **4段＋2ワードブロックキャッシュ** `m_cache2`（code8-10）+ バースト主記憶。空間的局所性で主記憶転送を半減。命令メモリは `asm_seq.txt` |
 | `src/sim_bp.v` | `main_vio_bp.v` の iverilog 検証用テストベンチ（Xilinx IP はスタブ） |
 | `src/sim_cache.v` | `main_vio_cache.v` / `main_vio_2way.v` の iverilog 検証用テストベンチ |
+| `src/sim_block.v` | `main_vio_block.v` の iverilog 検証用テストベンチ |
 | `src/asm.txt` | 命令メモリに焼き込むプログラム（Σ0..100=5050、手アセンブル） |
 | `src/asm_nested.txt` | ネストループ（code7-10、結果505）。gshareの効果検証用 |
 | `src/asm_conflict.txt` | コンフリクト用（code8-11、低位/高位がインデックス衝突、結果5050）。2-wayの効果検証用 |
+| `src/asm_seq.txt` | 逐次プログラム（addi×50、結果50）。2ワードブロックの効果検証用 |
 | `create_vio_full.tcl` | 4段版プロジェクト生成（Vivado batch） |
 | `create_4stage.tcl` | 5段版プロジェクト生成＋ビットストリームまで |
 | `create_bp.tcl` | 分岐予測版（BTB+bimodal）生成＋ビットストリームまで（VIO入力3本） |
 | `create_gshare.tcl` | gshare版生成＋ビットストリームまで（VIO入力3本、ネストループ） |
 | `create_cache.tcl` | 命令キャッシュ版生成＋ビットストリームまで（VIO入力3本） |
 | `create_2way.tcl` | 2-wayキャッシュ版生成＋ビットストリームまで（VIO入力3本、コンフリクト用） |
+| `create_block.tcl` | 2ワードブロックキャッシュ版生成＋ビットストリームまで（VIO入力3本、逐次用） |
 
 ## ビルド
 
@@ -181,3 +185,32 @@ vivado -mode batch -source create_2way.tcl
 ```
 
 > VIO のプローブ名はトップで接続したワイヤ名（`w_rslt` / `w_cyc` / `w_miss`）。内部レジスタ名（`r_dout` 等）では出ない。
+
+## 2ワードブロック・キャッシュ（m_cache2）
+
+1ライン＝**2ワード（ブロック）**のキャッシュ `m_cache2`（`main_vio_block.v`、code8-10）。
+ミス時にブロック2ワードをまとめて主記憶から取ってくるので、**空間的局所性**（次の隣接命令も
+キャッシュに載る）が効き、主記憶への転送回数が約半分になる。
+
+教科書は `m_cache2` を**単体モジュールとしてのみ**提示しており、プロセッサへの統合は無い。
+本実装ではブロック充填に対応した `m_proc8_c2b` と、ミス時に2ワードを一括で返すバースト主記憶
+`m_imem_blk` を自作して統合した。効果が見えるよう、ループではなく**逐次プログラム**
+`asm_seq.txt`（`addi` を50個、結果50）を使う。
+
+| キャッシュ | 総サイクル | 主記憶転送 | 結果 |
+|---|---|---|---|
+| 1ワード m_cache1 | 324 | 54 | 50 |
+| **2ワードブロック m_cache2** | **189** | **27** | 50 |
+
+逐次コードでは各ブロック転送が2命令を運ぶので、転送回数が 54→27（半分）に、サイクルも
+**約1.7倍高速**（324→189）になる。KV260 実機 VIO で `w_rslt=50` / `w_cyc=189` / `w_miss=27` を確認。
+（Σのようなループ主体のコードだと、転送は半減してもサイクル差は小さい。ブロックの効果は逐次性に依存する。）
+
+```
+# シミュレーション比較（要 iverilog、asm_seq.txt を include）
+cd src && iverilog -g2012 -o /tmp/blk.out main_vio_block.v sim_block.v && vvp /tmp/blk.out
+# => RESULT=50  CYCLES=189  MISS=27
+
+# ビルド
+vivado -mode batch -source create_block.tcl
+```
