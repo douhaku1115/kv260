@@ -14,15 +14,18 @@ Xilinx Kria KV260 上で動作させたもの。結果は VIO で `0x13BA`（= 5
 | `src/main_vio_bp.v` | **5段＋分岐予測** `m_proc9` に BTB（code7-4）+ bimodal 2bit（code7-11）を追加した版 |
 | `src/main_vio_gshare.v` | **5段＋gshare** 予測器を gshare（code7-13、BHR^PC）に差し替えた版。命令メモリは `asm_nested.txt` |
 | `src/main_vio_cache.v` | **4段＋命令キャッシュ** `m_proc8_c2`（code8-8）に直接マップ `m_cache1`（code8-7）+ 遅延主記憶 `m_imem`（code8-2）を組んだ版 |
+| `src/main_vio_2way.v` | **4段＋2-wayキャッシュ** キャッシュを 2-way セットアソシアティブ `m_cache3`（code8-12、LRU付き）に差し替えた版。命令メモリは `asm_conflict.txt` |
 | `src/sim_bp.v` | `main_vio_bp.v` の iverilog 検証用テストベンチ（Xilinx IP はスタブ） |
-| `src/sim_cache.v` | `main_vio_cache.v` の iverilog 検証用テストベンチ |
+| `src/sim_cache.v` | `main_vio_cache.v` / `main_vio_2way.v` の iverilog 検証用テストベンチ |
 | `src/asm.txt` | 命令メモリに焼き込むプログラム（Σ0..100=5050、手アセンブル） |
 | `src/asm_nested.txt` | ネストループ（code7-10、結果505）。gshareの効果検証用 |
+| `src/asm_conflict.txt` | コンフリクト用（code8-11、低位/高位がインデックス衝突、結果5050）。2-wayの効果検証用 |
 | `create_vio_full.tcl` | 4段版プロジェクト生成（Vivado batch） |
 | `create_4stage.tcl` | 5段版プロジェクト生成＋ビットストリームまで |
 | `create_bp.tcl` | 分岐予測版（BTB+bimodal）生成＋ビットストリームまで（VIO入力3本） |
 | `create_gshare.tcl` | gshare版生成＋ビットストリームまで（VIO入力3本、ネストループ） |
 | `create_cache.tcl` | 命令キャッシュ版生成＋ビットストリームまで（VIO入力3本） |
+| `create_2way.tcl` | 2-wayキャッシュ版生成＋ビットストリームまで（VIO入力3本、コンフリクト用） |
 
 ## ビルド
 
@@ -148,3 +151,33 @@ cd src && iverilog -g2012 -o /tmp/c.out main_vio_cache.v sim_cache.v && vvp /tmp
 # ビルド
 vivado -mode batch -source create_cache.tcl
 ```
+
+## 2-wayセットアソシアティブ・キャッシュ（m_cache3）
+
+キャッシュを **2-way セットアソシアティブ `m_cache3`**（`main_vio_2way.v`、code8-12）に差し替えた版。
+直接マップ `m_cache1` を2つ並べ、**LRU（1bit）** で追い出す way を選ぶ。同じインデックスに当たる
+2つのアドレスが両方のwayに共存できるので、**コンフリクトミス（スラッシング）** を防げる。
+
+2-wayが直接マップに勝つのはコンフリクトがある時だけなので、効果が見える専用プログラム
+`asm_conflict.txt`（code8-11）を使う。これは低位 `0x0c` と高位 `0x8c`（インデックス同じ・タグ違い）を
+交互に実行するため、直接マップでは毎周追い出し合う。
+
+| キャッシュ | 総サイクル | 主記憶アクセス | 結果 |
+|---|---|---|---|
+| 直接マップ m_cache1 | 7938 | 1223 | 5050 |
+| **2-way m_cache3** | **1928** | **21** | 5050 |
+
+直接マップは毎周コンフリクトミスして 1223 回ミス・7938 サイクル。2-wayは両アドレスが共存でき
+**21 回**（コールドスタートのみ）まで減り、**約4倍高速**。KV260 実機 VIO で
+`w_rslt=5050` / `w_cyc=1928` / `w_miss=21` を確認。
+
+```
+# シミュレーション比較（要 iverilog、asm_conflict.txt を include）
+cd src && iverilog -g2012 -o /tmp/2w.out main_vio_2way.v sim_cache.v && vvp /tmp/2w.out
+# => RESULT=5050  CYCLES=1928  MISS=21
+
+# ビルド
+vivado -mode batch -source create_2way.tcl
+```
+
+> VIO のプローブ名はトップで接続したワイヤ名（`w_rslt` / `w_cyc` / `w_miss`）。内部レジスタ名（`r_dout` 等）では出ない。
