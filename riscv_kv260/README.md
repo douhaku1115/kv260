@@ -13,13 +13,16 @@ Xilinx Kria KV260 上で動作させたもの。結果は VIO で `0x13BA`（= 5
 | `src/main_vio_4stage.v` | **5段パイプライン** `m_proc9`（教科書 code6-27、IF/ID/EX/MEM/WB）版 |
 | `src/main_vio_bp.v` | **5段＋分岐予測** `m_proc9` に BTB（code7-4）+ bimodal 2bit（code7-11）を追加した版 |
 | `src/main_vio_gshare.v` | **5段＋gshare** 予測器を gshare（code7-13、BHR^PC）に差し替えた版。命令メモリは `asm_nested.txt` |
+| `src/main_vio_cache.v` | **4段＋命令キャッシュ** `m_proc8_c2`（code8-8）に直接マップ `m_cache1`（code8-7）+ 遅延主記憶 `m_imem`（code8-2）を組んだ版 |
 | `src/sim_bp.v` | `main_vio_bp.v` の iverilog 検証用テストベンチ（Xilinx IP はスタブ） |
+| `src/sim_cache.v` | `main_vio_cache.v` の iverilog 検証用テストベンチ |
 | `src/asm.txt` | 命令メモリに焼き込むプログラム（Σ0..100=5050、手アセンブル） |
 | `src/asm_nested.txt` | ネストループ（code7-10、結果505）。gshareの効果検証用 |
 | `create_vio_full.tcl` | 4段版プロジェクト生成（Vivado batch） |
 | `create_4stage.tcl` | 5段版プロジェクト生成＋ビットストリームまで |
 | `create_bp.tcl` | 分岐予測版（BTB+bimodal）生成＋ビットストリームまで（VIO入力3本） |
 | `create_gshare.tcl` | gshare版生成＋ビットストリームまで（VIO入力3本、ネストループ） |
+| `create_cache.tcl` | 命令キャッシュ版生成＋ビットストリームまで（VIO入力3本） |
 
 ## ビルド
 
@@ -111,4 +114,37 @@ cd src && iverilog -g2012 -o /tmp/g.out main_vio_gshare.v sim_bp.v && vvp /tmp/g
 
 # ビルド
 vivado -mode batch -source create_gshare.tcl
+```
+
+## 命令キャッシュ（4段＋m_cache1＋遅延主記憶）
+
+教科書8章のメモリ階層。**4段プロセッサ `m_proc8_c2`**（`main_vio_cache.v`、code8-8）に
+**直接マップ命令キャッシュ `m_cache1`**（code8-7、32エントリ）と
+**遅延つき主記憶 `m_imem`**（code8-2、`D_DELAY=5` サイクル待ち）を組み合わせた版。
+
+- キャッシュ**ヒット**：その場で命令を返す（ストールなし）
+- キャッシュ**ミス**：`w_re` で主記憶をリクエストし、返るまで `w_stall` で待つ（約 D_DELAY+1 サイクル）。返ってきた命令はキャッシュに書き込む
+
+キャッシュが意味を持つには**遅い主記憶**が要るので、1サイクルメモリではなく `m_imem` を使う。
+キャッシュを入れても結果（5050）は変わらないので、効果は**総サイクル数**で観測する（VIOに 結果 / サイクル数 / ミス回数 の3本）。
+
+| | 総サイクル | 主記憶アクセス | 結果 |
+|---|---|---|---|
+| キャッシュなし（毎フェッチ主記憶待ち） | 2550 | 510 | 5050 |
+| **m_proc8_c2 + m_cache1** | **560** | **10** | 5050 |
+
+各フェッチが D_DELAY=5 サイクルかかるキャッシュなし（510×5=2550）に対し、ループがヒットする
+キャッシュ版は **約4.5倍高速**。主記憶アクセスは 510→10（触れた命令の種類数）まで減る。
+KV260 実機 VIO で `r_dout=0x13BA`（5050）/ `r_cyc=560` / `r_miss=10` を確認。
+
+> 補足: 教科書 code8-8 は `P3_s`/`P3_b` の更新が抜けている（code8-4 の c1 にはある）ため、本実装で補っている。
+> 結果の取り出しは4段なので P3 段（`!w_stall & P3_rd==30`）で capture する。
+
+```
+# シミュレーション（要 iverilog、asm.txt = Σ0..100）
+cd src && iverilog -g2012 -o /tmp/c.out main_vio_cache.v sim_cache.v && vvp /tmp/c.out
+# => RESULT=5050  CYCLES=560  MISS=10
+
+# ビルド
+vivado -mode batch -source create_cache.tcl
 ```
