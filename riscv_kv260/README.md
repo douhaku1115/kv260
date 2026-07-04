@@ -365,3 +365,38 @@ vivado -mode batch -source create_timer.tcl
 
 **KV260 実機 VIO で `w_rslt=0x00000005` / `w_done=1` を確認**
 （gcc の C が実機でタイマ割込みによるプリエンプションを実行）。
+
+## KOZOS 協調マルチタスク — 自作OS移植の第5段-1
+
+これまでの全要素（RV32I・例外/ecall・スタック）を統合し、**自作OS（KOZOS流）の
+コンテキストスイッチ＋スケジューラ**を載せた。コアは第4段の `main_vio_timer.v`
+（`m_proc_timer`）をそのまま使用（5-1は ecall のみ、タイマは 5-2 で使う）。
+
+**部品**（`src/gcc/`）:
+
+| ファイル | 内容 |
+|---|---|
+| `kentry.S` | `trap_entry`＝コンテキストスイッチ（全GPR+mepcを現スレッドのスタックへ退避→`ksched`→次スレッドのを復元→`mret`）／`dispatch`＝最初のスレッド起動 |
+| `kozos.c` | TCB・ラウンドロビン `ksched`・`thread_create`（スタックに偽の初期コンテキスト）・`yield`/`sys_exit`（a7に番号→`ecall`）・スレッドA/B |
+
+- コンテキスト＝128B（32語）: `[0]=mepc, [i]=xi (i=1,3..31), [2]=未使用`。ecallは
+  `trap_entry` で `mepc+4`（協調＝次命令へ復帰）。syscall番号は a7（フレーム slot 17）。
+- スレッド生成は「スタックに偽フレームを作り、初回復元で関数へ飛ぶ」古典手法。
+
+**検証**: 2スレッドが共有 `seq` に桁を交互追加（A=1, B=2）。ラウンドロビンで
+A,B,A,B,A,B と切り替われば `seq` は `1→12→121→1212→12121→121212` と進む。
+
+```
+# KOZOS を命令メモリに生成（crt0 + kozos.c + kentry.S）
+cd src/gcc && CSRC="kozos.c kentry.S" bash build_gcc.sh && cd ..
+iverilog -g2012 main_vio_timer.v sim_timer.v -o /tmp/a && vvp /tmp/a
+# => r_rslt = 0001d97c  (= 121212 = A,B,A,B,A,B と交互実行)
+
+# ビルド
+vivado -mode batch -source create_kozos.tcl
+```
+
+**KV260 実機 VIO で `w_rslt=0x0001D97C`（=121212）/ `w_done=1` を確認**
+＝自作RISC-Vコア上で自作OSのコンテキストスイッチが実機動作。
+（次: 5-2 プリエンプティブ＝yield廃止、タイマ割込みで強制切替。`mcause` 判定で
+割込み時は `mepc+4` しない。）
