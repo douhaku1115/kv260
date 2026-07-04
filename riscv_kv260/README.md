@@ -330,3 +330,38 @@ vivado -mode batch -source create_rvsys.tcl
 
 **iverilog 全5テストPASS**（Σ / ISA網羅 / mem / CSR-asm / C-CSR-gcc）。
 **KV260 実機 VIO で `w_rslt=0x000013ba` / `w_done=1` を確認（統合コアでも Σ 正常）。**
+
+## マシンタイマ割込み — 自作OS（KOZOS）移植の第4段
+
+統合コア（`m_proc_rvsys`）に **RISC-V マシンタイマ割込み**を追加（`main_vio_timer.v`, コア `m_proc_timer`）。
+KOZOS の**プリエンプション**（時間でタスクを強制切替）の心臓部。
+
+**追加CSR**: `mstatus`（MIE=bit3 / MPIE=bit7）, `mie`（MTIE=bit7）, `mip`（MTIP=bit7, HW制御）。
+
+**メモリマップド・タイマ（64bit, 上下2ワード）**:
+
+| レジスタ | アドレス | 用途 |
+|---|---|---|
+| `mtimecmp` | `0x0003_0000`(lo) / `0x0003_0004`(hi) | 比較値（R/W） |
+| `mtime` | `0x0003_0008`(lo) / `0x0003_000C`(hi) | 自走カウンタ（RO） |
+
+`mtime >= mtimecmp` で `mip.MTIP=1`。**割込み条件 `MIE & MTIE & MTIP`** が成立すると、
+P2境界で有効な命令に相乗りして `mepc ← その命令PC`（＝復帰後に再実行）, `mcause ← 0x80000007`
+（Interrupt＋code7）, `MPIE←MIE, MIE←0`, `PC ← mtvec`。`mret` で `MIE←MPIE`。
+
+**検証**（`src/gcc/test_timer.c`, gcc の `__attribute__((interrupt("machine")))` ハンドラ）:
+mtvec設定→mtimecmp設定→MTIE/MIE許可→ループ。タイマ割込みでハンドラが tick++ し次の mtimecmp を設定、
+5回で脱出。**`r_rslt=5` / `mcause=0x80000007` を確認**（RV32I/CSR の回帰も全通過）。
+
+```
+# タイマ割込みテストを命令メモリに生成
+cd src/gcc && CSRC=test_timer.c bash build_gcc.sh && cd ..
+iverilog -g2012 main_vio_timer.v sim_timer.v -o /tmp/a && vvp /tmp/a
+# => r_rslt = 00000005 (タイマ割込みが5回発生)
+
+# ビルド
+vivado -mode batch -source create_timer.tcl
+```
+
+**KV260 実機 VIO で `w_rslt=0x00000005` / `w_done=1` を確認**
+（gcc の C が実機でタイマ割込みによるプリエンプションを実行）。
