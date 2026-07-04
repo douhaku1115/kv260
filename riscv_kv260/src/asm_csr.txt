@@ -1,0 +1,14 @@
+// 第2段 CSR/例外 検証プログラム (手アセンブル)
+//   mtvec を handler に設定 → ecall で例外 → handler で mcause 取得・mepc+4 → mret 復帰
+//   復帰後 x30 <- a0(=mcause=11) をキャプチャ。VIO で x30=0xB を確認。
+// レジスタ: x5=t0, x6=t1, x10=a0, x30=結果
+`MM[0]=32'h01400293;   // 00  addi x5,x0,0x14   ; t0 = handler(0x14)
+`MM[1]=32'h30529073;   // 04  csrrw x0,mtvec,x5 ; mtvec <- t0
+`MM[2]=32'h00000073;   // 08  ecall             ; -> trap to mtvec (mepc=0x08,mcause=11)
+`MM[3]=32'h00050f13;   // 0c  addi x30,x10,0    ; RET: x30 <- a0(=mcause)  [capture]
+`MM[4]=32'h000f1063;   // 10  bne  x30,x0,0     ; HALT (self-loop, x30!=0)
+`MM[5]=32'h34202573;   // 14  handler: csrrs x10,mcause,x0 ; a0 <- mcause(=11)
+`MM[6]=32'h34102373;   // 18  csrrs x6,mepc,x0  ; t1 <- mepc(=0x08)
+`MM[7]=32'h00430313;   // 1c  addi x6,x6,4      ; t1 = mepc+4 = 0x0c
+`MM[8]=32'h34131073;   // 20  csrrw x0,mepc,x6  ; mepc <- 0x0c (ecallの次)
+`MM[9]=32'h30200073;   // 24  mret              ; -> pc = mepc = 0x0c (RET)

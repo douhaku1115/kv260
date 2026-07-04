@@ -214,3 +214,45 @@ cd src && iverilog -g2012 -o /tmp/blk.out main_vio_block.v sim_block.v && vvp /t
 # ビルド
 vivado -mode batch -source create_block.tcl
 ```
+
+## CSR / 例外（ecall・mret）— 自作OS（KOZOS）移植の第2段
+
+教科書のプロセッサ（`m_proc9`, 5段）を拡張し、**最小の CSR と例外機構**を追加した
+（`main_vio_csr.v`, コア名 `m_proc_csr`）。教科書には CSR/例外のコードは無く、ここからは
+自作OS（KOZOS 流）を載せるための独自拡張。第2段はまず**同期例外の往復**を成立させる。
+
+| 追加命令 | 追加 CSR |
+|---|---|
+| `csrrw`(funct3=001) / `csrrs`(010) / `ecall` / `mret` | `mtvec`(0x305) / `mepc`(0x341) / `mcause`(0x342) / `mscratch`(0x340) |
+
+- **トラップは分岐解決と同じ P2（EX）境界に相乗り**。既存の分岐フラッシュ `w_miss` を
+  `w_redir = w_miss | ecall | mret` に拡張し、若い命令（P1/P2）を潰して PC を差し替える。
+- `ecall` → `mepc ← PC`, `mcause ← 11`（M-mode 環境呼び出し）, `PC ← mtvec`
+- `mret` → `PC ← mepc`（スコープ最小のため `mstatus` 復元は無し。割込みは第4段で追加予定）
+- CSR 命令は**旧値を rd へ返す**（`P3_alu` を CSR 旧値で置換し既存のライトバック経路に乗せる）。
+  書き込み側の rs1 値はフォワーディング済みの `w_in1` を使う。
+
+検証プログラム `asm_csr.txt`：`mtvec` を handler に設定 → `ecall` → handler で `mcause` 取得＋
+`mepc+4`（ecall をスキップする標準作法）→ `mret` で復帰 → `x30 ← mcause`。
+往復が成立すれば `x30 = 11`。
+
+> HALT は `bne x30,x0,0`（x30≠0 の自己ループ）。命令メモリが 64 語（256B）のため、PC が
+> 暴走して `ecall` を再実行しないための処置。ベースの `m_proc9` は `jal` 未実装なので使えない。
+
+| 項目 | 値 |
+|---|---|
+| VIO `w_rslt`（= x30 = mcause） | **0x0000000B（11）** |
+| VIO `w_trapcnt`（トラップ回数） | **1** |
+| ビルド WNS(setup) | +4.620 ns |
+
+KV260 実機 VIO で `w_rslt=0000000b` / `w_trapcnt=1` を確認＝ecall→handler→mret の往復成功。
+
+```
+# シミュレーション（要 iverilog）
+cd src && iverilog -g2012 -o /tmp/csr.out main_vio_csr.v sim_csr.v && vvp /tmp/csr.out
+# => r_rslt = 0000000b   r_trapcnt = 1   *** PASS ***
+
+# ビルド
+vivado -mode batch -source create_csr.tcl
+```
+
