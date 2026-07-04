@@ -1,0 +1,14 @@
+// 統合コア CSR/例外 検証(手アセンブル)
+//   mtvec=handler → ecall → handler(mepc+4) → mret復帰 → mcause(=11)を結果ポート0x20000へsw
+//   期待: w_rslt=0x0000000b, w_done=1
+`MM[0]=32'h01c00293;   // 00  addi x5,x0,0x1c    ; x5 = handler(0x1c)
+`MM[1]=32'h30529073;   // 04  csrrw x0,mtvec,x5  ; mtvec <- handler
+`MM[2]=32'h00000073;   // 08  ecall              ; -> trap (mepc=0x08, mcause=11)
+`MM[3]=32'h34202573;   // 0c  RET: csrrs x10,mcause,x0 ; a0 <- mcause(=11)
+`MM[4]=32'h00020337;   // 10  lui  x6,0x20       ; x6 = 0x20000 (結果ポート)
+`MM[5]=32'h00a32023;   // 14  sw   x10,0(x6)     ; 結果 <- a0(=11)
+`MM[6]=32'h0000006f;   // 18  jal  x0,0          ; HALT(自己ループ)
+`MM[7]=32'h34102373;   // 1c  handler: csrrs x6,mepc,x0 ; x6 <- mepc(=0x08)
+`MM[8]=32'h00430313;   // 20  addi x6,x6,4       ; mepc+4 = 0x0c
+`MM[9]=32'h34131073;   // 24  csrrw x0,mepc,x6   ; mepc <- 0x0c
+`MM[10]=32'h30200073;  // 28  mret               ; -> pc = mepc = 0x0c

@@ -256,3 +256,77 @@ cd src && iverilog -g2012 -o /tmp/csr.out main_vio_csr.v sim_csr.v && vvp /tmp/c
 vivado -mode batch -source create_csr.tcl
 ```
 
+
+## 完全RV32I ＋ gccフロー — 自作OS（KOZOS）移植の第3段
+
+教科書の最小コア（加算とbneのみ）を **RV32I（base整数命令セット）全実装**へ拡張し
+（`main_vio_rv32i.v`, コア `m_proc_rv32i`）、**手アセンブルを卒業して gcc で書いた C を実機で動かす**。
+
+実装した命令:
+
+| 種別 | 命令 |
+|---|---|
+| ALU(R/I) | add sub sll slt sltu xor srl **sra** or and（＋即値 addi…srai） |
+| 分岐 | beq bne blt bge bltu bgeu |
+| ジャンプ | jal / jalr（`rd ← pc+4`） |
+| 上位即値 | lui / auipc |
+| ロード/ストア | lb lh lw lbu lhu / sb sh sw（バイトイネーブル） |
+
+設計の要点:
+- **ALU が funct3 を使うのは OP / OP-IMM のみ**。ロード/ストア/lui/auipc/jal/jalr の
+  アドレス・リンク計算は常に加算（`sw` の funct3=010 を SLT と誤解しないため）。
+- **シフトは算術/論理を別 wire に分離**（三項演算子で符号付き `>>>` と符号無し `>>` を混ぜると
+  arithmetic shift が logical 化する Verilog の落とし穴を回避）。
+- トラップ／ジャンプは分岐と同じ **P2（EX）境界**で解決。
+
+### メモリマップ（Harvard）
+| 領域 | アドレス | 用途 |
+|---|---|---|
+| IMEM(text) | `0x0000_0000..` | フェッチ（4096語=16KB） |
+| DMEM(data,stack) | `0x0001_0000..` | load/store（4096語=16KB） |
+| RESULT port | `0x0002_0000` | store で結果を捕捉 → VIO `w_rslt`/`w_done` |
+
+### gccフロー（`src/gcc/`）
+`crt0.S`（sp設定→`main()`→結果を`0x20000`へsw）, `link.ld`（`.text`を0x0へ, build-id無効化必須）,
+`main.c`（Σ0..100）, `build_gcc.sh`（gcc→objcopy `.text`→`` `MM[i]= `` 形式の `asm_gcc.txt` 生成）。
+ツールチェーン: Vitis同梱 `riscv64-unknown-elf-gcc`（rv32i/ilp32）。
+
+```
+# 命令メモリ生成（Σ0..100）
+cd src/gcc && CSRC=main.c bash build_gcc.sh && cd ..
+# シミュレーション（要 iverilog）
+iverilog -g2012 main_vio_rv32i.v sim_rv32i.v -o /tmp/a && vvp /tmp/a
+# => r_rslt = 000013ba (5050)
+
+# ビルド
+vivado -mode batch -source create_rv32i.tcl
+```
+
+**検証（gcc出力をホストgcc実行と突き合わせ）**: Σ=0x13BA / ISA網羅（`test_isa.c`,
+最適化バリアで全命令発行）=ホスト一致 / バイト・ハーフmem（`test_mem.c`）=ホスト一致。
+**KV260 実機 VIO で `w_rslt=0x000013ba` / `w_done=1` を確認。**
+
+## 完全RV32I ＋ CSR/例外 統合コア（第2段＋第3段の合流）
+
+第3段の完全RV32I に 第2段の CSR/例外（`csrrw`/`csrrs`/`ecall`/`mret`,
+CSR=`mtvec`/`mepc`/`mcause`/`mscratch`）を統合（`main_vio_rv32i_csr.v`, コア `m_proc_rvsys`）。
+トラップは分岐/ジャンプと同じ P2 境界の `w_redir` に相乗り、CSR 命令は旧値を rd に返す。
+**RV32I 部分は無改変**（Σ/ISA/mem の回帰すべて通過）。KOZOS とタイマ割込みの土台。
+
+gcc の C から CSR を使う場合は `-march=rv32i_zicsr`（`csr` 命令のアセンブルに必要）。
+
+```
+# CSR/例外テスト(手アセンブル): mtvec→ecall→handler→mret→mcause(=11)を出力
+iverilog -g2012 -DPROG='"asm_csr_sys.txt"' main_vio_rv32i_csr.v sim_rvsys.v -o /tmp/a && vvp /tmp/a
+# => r_rslt = 0000000b (mcause = Environment call from M-mode)
+
+# gccのCからCSR/例外を使うテスト
+cd src/gcc && CSRC=test_csr.c bash build_gcc.sh && cd ..
+iverilog -g2012 main_vio_rv32i_csr.v sim_rvsys.v -o /tmp/a && vvp /tmp/a   # => 0000000b
+
+# ビルド
+vivado -mode batch -source create_rvsys.tcl
+```
+
+**iverilog 全5テストPASS**（Σ / ISA網羅 / mem / CSR-asm / C-CSR-gcc）。
+**KV260 実機 VIO で `w_rslt=0x000013ba` / `w_done=1` を確認（統合コアでも Σ 正常）。**
