@@ -524,3 +524,38 @@ vivado -mode batch -source create_kozos5.tcl
 
 **KV260 実機 VIO で `w_rslt=0x0000007B`（=123）/ `w_done=1` を確認。**
 これで KOZOS の主要サービス（協調 / プリエンプティブ / sleep / セマフォ / メッセージング）が揃った。
+
+## KOZOS UARTコンソール（対話シェル）— 自作OS移植の第5段-6
+
+これまで結果を VIO でしか見られなかったのに対し、**UART（送受信）で対話**できる
+コンソールを追加（`src/main_vio_console.v`, シェルは `src/gcc/console.c`）。
+自作RISC-Vコア上の自作OSに、**キーボードでコマンドを打って応答が返る**ようになった。
+
+**コアへの追加**:
+- メモリマップド UART（`m_uart_tx` / 新規 `m_uart_rx`）:
+  `TX=0x40000`（w, 送信）, `STAT=0x40004`（r, bit0=RX有/bit1=TX満杯）, `RX=0x40008`（r, pop）。
+- **IMEM にデータ読み出しポートを追加**（重要）: 文字列リテラル（`.rodata`）は `.text`＝IMEM に
+  置かれるが、従来ロードは DMEM しか読めず**文字列比較が壊れていた**。text/rodata 領域
+  （`adr[31:16]==0x0000`）へのロードを IMEM から読むようにして解決（`str_eq` 等が正しく動く）。
+
+**シェル**（`console.c`, 単一ループ）: 1行読み→エコー→コマンド解釈。`help` / `echo <text>` / `sum`。
+`put_dec` の除算のため `build_gcc.sh` に `-lgcc`（RV32I ソフト除算）を追加。
+
+```
+# コンソールを命令メモリに生成
+cd src/gcc && CSRC="console.c" bash build_gcc.sh && cd ..
+# シミュレーション(RXにコマンドを流しTXをデコード, -DUARTDIV=8)
+iverilog -g2012 -DUARTDIV=8 main_vio_console.v sim_console.v -o /tmp/a && vvp /tmp/a
+
+# ビルド
+vivado -mode batch -source create_console.tcl
+```
+
+**KV260 実機（PMOD + USB-TTLアダプタ, 115200 8N1）で対話成功**:
+```
+KOZOS console (help/echo/sum)
+KOZOS> sum
+5050
+KOZOS>
+```
+配線: `uart_tx=B11(J2-10)→アダプタRXD(緑)` / `uart_rx=D11(J2-9)←アダプタTXD(白)` / `GND(黒)`（クロス接続, `src/uart_console_pins.xdc`）。ホストは `tio -b 115200 /dev/ttyUSB*`（FT232R）。

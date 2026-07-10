@@ -14,7 +14,7 @@ cd "$HERE"
 # RV32I / ilp32 / 圧縮命令なし。標準ライブラリ・スタートアップ不使用。
 $GCC -march=rv32i_zicsr -mabi=ilp32 -O2 -nostdlib -nostartfiles \
      -ffreestanding -Wl,--build-id=none -Wl,-T,link.ld \
-     crt0.S $CSRC -o prog.elf
+     crt0.S $CSRC -lgcc -o prog.elf   # -lgcc: RV32Iの soft div/mul(__udivsi3等)
 
 # 逆アセンブル(確認用)
 $OBJDUMP -d prog.elf > prog.dis
