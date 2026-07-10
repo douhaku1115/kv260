@@ -434,3 +434,36 @@ vivado -mode batch -source create_kozos2.tcl
 `cntA/cntB>0`（両スレッド稼働）を確認。
 **KV260 実機 VIO で `w_rslt=0x0001D97C`（=121212）/ `w_done=1` を確認**
 ＝自作RISC-Vコア＋自作OSで本物のプリエンプティブ・マルチタスクが実機動作。
+
+## KOZOS sleep(n) サービス — 自作OS移植の第5段-3
+
+プリエンプティブ基盤（5-2）に**スレッド状態と時間待ち**を導入し、`sleep(n)`
+（n ティック休止して他スレッドにCPUを譲る）を実装（`src/gcc/kozos3.c`）。
+コア・`kentry.S` は 5-2 から無変更（`ksched` が保存フレームの `a0` から sleep 引数を読む）。
+
+- **スレッド状態**: `READY` / `SLEEP`（`wake` ティックを持つ）/ `DEAD`。
+- `sleep(n)` = `ecall`（`a7=SYS_SLEEP, a0=n`）→ `wake=ticks+n` にして SLEEP、次の READY へ。
+- **タイマ割込み = システムティック**: `ticks++` し、`ticks>=wake` の SLEEP スレッドを READY に起こす。
+- 全 real スレッドが SLEEP なら **idle スレッド**（`for(;;)`, MIE=1）が回ってティックを進める。
+- 全 real スレッドが DEAD で結果を出力。
+
+**検証**: A は `sleep(2)` で 4 回、B は `sleep(4)` で 2 回、各回 `seq` に桁追加（A=1, B=2）。
+A は tick 0,2,4,6 の 4 回、B は tick 0,4 の 2 回起きるので、A が B の 2 倍の頻度で走る
+→ `seq=121211`。sleep 中は CPU を手放し idle/他スレッドが走る（ビジーウェイトしない）。
+
+```
+# sleep デモを命令メモリに生成
+cd src/gcc && CSRC="kozos3.c kentry.S" bash build_gcc.sh && cd ..
+iverilog -g2012 main_vio_timer.v sim_kozos.v -o /tmp/a && vvp /tmp/a
+# => r_rslt = 0001d97b (= 121211)
+
+# ビルド
+vivado -mode batch -source create_kozos3.tcl
+```
+
+**KV260 実機 VIO で `w_rslt=0x0001D97B`（=121211）/ `w_done=1` を確認。**
+
+> 実装の教訓: 割込みハンドラ（全32レジスタ退避/復元＋`ksched`）は分岐ミスペナルティ込みで
+> 約130サイクル。タイマ間隔（`INTERVAL`）をこれより十分大きく取らないと、ハンドラ実行中に
+> `mtime` が次の `mtimecmp` を越えて戻った瞬間に再割込みする**割込みストーム**でスレッドが
+> 一切進めなくなる（本実装は `INTERVAL=1000`）。
