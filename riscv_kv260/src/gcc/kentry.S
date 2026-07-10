@@ -40,10 +40,14 @@ trap_entry:
     sw x30, 30*4(sp)
     sw x31, 31*4(sp)
     csrr t0, mepc              # t0=x5 は退避済み
-    addi t0, t0, 4            # 協調(5-1): ecall の次へ復帰
+    csrr t1, mcause            # t1=x6 は退避済み
+    bltz t1, 1f               # 割込み(mcause[31]=1<0)なら mepc+4 しない(再実行)
+    addi t0, t0, 4            # 例外(ecall)は次命令へ復帰
+1:
     sw t0, 0*4(sp)
     mv  a0, sp                # a0 = 現フレーム
-    lw  a1, 17*4(sp)         # a1 = syscall番号(退避したa7)
+    lw  a1, 17*4(sp)         # a1 = syscall番号(退避したa7, 例外用)
+    mv  a2, t1                # a2 = mcause (割込み/例外の判定用)
     call ksched               # a0 = 次フレーム
     mv  sp, a0
 restore_ctx:

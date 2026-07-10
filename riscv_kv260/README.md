@@ -400,3 +400,37 @@ vivado -mode batch -source create_kozos.tcl
 ＝自作RISC-Vコア上で自作OSのコンテキストスイッチが実機動作。
 （次: 5-2 プリエンプティブ＝yield廃止、タイマ割込みで強制切替。`mcause` 判定で
 割込み時は `mepc+4` しない。）
+
+## KOZOS プリエンプティブ・マルチタスク — 自作OS移植の第5段-2
+
+第5段-1（協調）に**第4段のタイマ割込み**を組み合わせ、**yield を廃した本物の
+プリエンプション**を実現（`src/gcc/kozos2.c`）。スレッドは自発的にCPUを手放さず、
+**タイマ割込みだけ**がコンテキストスイッチを起こす。コアは `main_vio_timer.v`（`m_proc_timer`）。
+
+**5-1 からの変更点**:
+- `kentry.S` の `trap_entry` を **`mcause` 判定**に対応（後方互換）:
+  - 割込み（`mcause[31]=1`）→ `mepc` を **+4 しない**（割込まれた命令を再実行）
+  - 例外（`ecall`, `mcause=11`）→ 従来通り `mepc+4`（次命令へ）
+- `ksched(frame, sc, mcause)` に `mcause` を渡し、割込み時はスケジューラが
+  タイマを再武装（次の `mtimecmp`）＋「走っていたスレッド」を記録。
+- 起動時に `mstatus.MPIE=1` を仕込み、最初の `mret` で `MIE=1`（割込み許可）にする。
+
+**検証**: スレッドA/Bは `for(;;) cntX++;`（yield 無し）。タイマ割込みが起きるたびに
+`ksched` が「割込まれていたスレッド」を `sched_seq` に記録（A=1, B=2）。
+プリエンプションが A,B,A,B,A,B と交互に起きれば `sched_seq=121212`。
+両スレッドが実際に走った証拠に `cntA/cntB>0` も確認して出力。
+
+```
+# プリエンプティブ版を命令メモリに生成
+cd src/gcc && CSRC="kozos2.c kentry.S" bash build_gcc.sh && cd ..
+iverilog -g2012 main_vio_timer.v sim_timer.v -o /tmp/a && vvp /tmp/a
+# => r_rslt = 0001d97c (= 121212)
+
+# ビルド
+vivado -mode batch -source create_kozos2.tcl
+```
+
+シミュレーションで **プリエンプション6回 / ecall 0回**（＝100%タイマ駆動）、
+`cntA/cntB>0`（両スレッド稼働）を確認。
+**KV260 実機 VIO で `w_rslt=0x0001D97C`（=121212）/ `w_done=1` を確認**
+＝自作RISC-Vコア＋自作OSで本物のプリエンプティブ・マルチタスクが実機動作。
