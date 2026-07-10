@@ -559,3 +559,39 @@ KOZOS> sum
 KOZOS>
 ```
 配線: `uart_tx=B11(J2-10)→アダプタRXD(緑)` / `uart_rx=D11(J2-9)←アダプタTXD(白)` / `GND(黒)`（クロス接続, `src/uart_console_pins.xdc`）。ホストは `tio -b 115200 /dev/ttyUSB*`（FT232R）。
+
+## KOZOS 対話シェル ＋ カーネル統合 — 自作OS移植の第5段-7
+
+コンソール（5-6）とプリエンプティブ・カーネル（5-2〜5-3）を統合し、**シェル自身を
+1つのKOZOSスレッド**として走らせた（`src/gcc/kozos_sh.c`）。コマンドで**生きたOSを操作**できる。
+コア・`kentry.S` は無変更（`main_vio_console.v` = UART+timer+CSR+RV32I 全部入りを流用）。
+
+**コマンド**: `help` / `echo <text>` / `sum` / `tick`（システムtick）/ `ps`（スレッド一覧: id/state/cnt）/ `run`（ワーカースレッド動的起動）。
+
+- スレッド構成: `NTHREAD=6`（0=shell / 1..4=worker / 5=idle）。
+- シェルの `get_c` は入力が無ければ `sleep(1)` で他スレッドにCPUを譲る。
+- ワーカーは `cnt[id]++; sleep(3);` を繰り返す（`ps` で `cnt` が進むのが見える）。
+- `run` は空きスロットに動的生成（割込み禁止の critical section 内で TCB を用意）。
+- **割込み禁止は `csrr`+`csrw` で手動**（本コアが正しく実装する CSR 命令は `csrrw`/`csrrs` のみ。
+  `csrrc`/即値版は非対応なので使わない）。
+
+```
+# 対話シェルを命令メモリに生成
+cd src/gcc && CSRC="kozos_sh.c kentry.S" bash build_gcc.sh && cd ..
+# ビルド
+vivado -mode batch -source create_shell.tcl
+```
+
+**KV260 実機（tio, 115200）で対話・マルチタスクを確認**:
+```
+KOZOS> run
+spawned t1
+KOZOS> run
+spawned t2
+KOZOS> ps
+ t0 RUN   cnt=0
+ t1 SLEEP cnt=695531      <- 100MHz実機で裏で回り続けるワーカー
+ t2 SLEEP cnt=384046
+ t5 READY cnt=0
+```
+`ps` を打つたびに worker の `cnt` が増える＝自作RISC-Vコア上で自作OSが対話的にプリエンプティブ・マルチタスクしている。
