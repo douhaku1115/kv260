@@ -467,3 +467,32 @@ vivado -mode batch -source create_kozos3.tcl
 > 約130サイクル。タイマ間隔（`INTERVAL`）をこれより十分大きく取らないと、ハンドラ実行中に
 > `mtime` が次の `mtimecmp` を越えて戻った瞬間に再割込みする**割込みストーム**でスレッドが
 > 一切進めなくなる（本実装は `INTERVAL=1000`）。
+
+## KOZOS セマフォ（wait / signal）— 自作OS移植の第5段-4
+
+sleep（5-3）で導入した状態管理を発展させ、**同期プリミティブ セマフォ**を実装
+（`src/gcc/kozos4.c`）。時間待ち（sleep）に対し、こちらは**他スレッドのイベント待ち**
+（`BLOCKED` 状態）。**タイマは使わず `ecall`（wait/signal）だけ**で駆動。コア・`kentry.S` は無変更。
+
+- `wait(s)` = `ecall`：`sem[s]>0` なら `--` して継続、`0` なら `BLOCKED`（`block_sem=s`）。
+- `signal(s)` = `ecall`：`s` を待つスレッドが居れば 1 つ `READY` に起こす（ハンドオフ）、
+  居なければ `sem[s]++`。
+- スケジューラは、現スレッドがブロックしていなければそのまま継続（協調的）。
+- 全スレッドがブロックしたら `0xDEAD` を出力（デッドロック検出）。
+
+**検証（ping-pong）**: バイナリセマフォ `semA=1, semB=0`。
+`threadA: wait(semA); seq+=1; signal(semB);`、`threadB: wait(semB); seq+=2; signal(semA);` を各3回。
+2つのセマフォが **A,B,A,B を強制**するので、**タイミングに依らず** `seq=121212`。
+
+```
+# セマフォ ping-pong を命令メモリに生成
+cd src/gcc && CSRC="kozos4.c kentry.S" bash build_gcc.sh && cd ..
+iverilog -g2012 main_vio_timer.v sim_kozos.v -o /tmp/a && vvp /tmp/a
+# => r_rslt = 0001d97c (= 121212)
+
+# ビルド
+vivado -mode batch -source create_kozos4.tcl
+```
+
+**KV260 実機 VIO で `w_rslt=0x0001D97C`（=121212）/ `w_done=1` を確認。**
+sleep（時間駆動）と違い ecall のみで同期するため高速に完了（約2300サイクル）。
