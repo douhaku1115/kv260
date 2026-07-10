@@ -63,27 +63,41 @@ module m_uart_tx(w_clk, w_we, w_din, w_tx, w_full);
   end
 endmodule
 
-// ---- UART RX: start検出→1.5bit待ち→8bitサンプル(LSB first)→格納(8N1) ----
+// ---- UART RX: start検出→1.5bit待ち→8bitサンプル(LSB first)→16段FIFOへ格納(8N1) ----
 module m_uart_rx(w_clk, w_rx, w_rd, r_dout, r_valid);
   input  wire w_clk, w_rx, w_rd;
-  output reg [7:0] r_dout = 0;
-  output reg r_valid = 0;
+  output wire [7:0] r_dout;
+  output wire r_valid;
   parameter DIV = 868;
   reg r0=1, r1=1;
-  reg [1:0] st=0;
+  reg st=0;                              // 0=idle, 1=受信中
   reg [15:0] baud=0;
   reg [3:0] cnt=0;
   reg [7:0] sh=0;
+  reg [7:0] fifo [0:15];                 // 受信FIFO(取りこぼし防止)
+  reg [3:0] wp=0, rp=0;
+  reg [4:0] fcnt=0;                      // FIFO内バイト数 0..16
+  wire w_done = (st==1) & (baud==0) & (cnt==8);  // 1バイト揃った
+  wire w_push = w_done & (fcnt!=5'd16);
+  wire w_pop  = w_rd & (fcnt!=5'd0);
+  assign r_valid = (fcnt!=5'd0);
+  assign r_dout  = fifo[rp];
   always @(posedge w_clk) begin
     r0 <= w_rx; r1 <= r0;               // 2段同期
-    if (w_rd) r_valid <= 0;             // 読まれたらクリア
     case (st)
       0: if (r1==0) begin st<=1; baud<=DIV+DIV/2-1; cnt<=0; end  // start検出→bit0中央へ
       1: if (baud==0) begin
            baud <= DIV-1;
-           if (cnt==8) begin r_dout <= sh; r_valid <= 1; st <= 0; end  // 8bit揃った→格納
-           else begin sh <= {r1, sh[7:1]}; cnt <= cnt + 1; end          // LSB first
+           if (cnt==8) st <= 0;                                   // 8bit完了
+           else begin sh <= {r1, sh[7:1]}; cnt <= cnt + 1; end    // LSB first
          end else baud <= baud - 1;
+    endcase
+    if (w_push) begin fifo[wp] <= sh; wp <= wp + 1; end
+    if (w_pop)  rp <= rp + 1;
+    case ({w_push, w_pop})
+      2'b10: fcnt <= fcnt + 1;
+      2'b01: fcnt <= fcnt - 1;
+      default: fcnt <= fcnt;
     endcase
   end
 endmodule

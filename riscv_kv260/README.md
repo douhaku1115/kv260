@@ -595,3 +595,23 @@ KOZOS> ps
  t5 READY cnt=0
 ```
 `ps` を打つたびに worker の `cnt` が増える＝自作RISC-Vコア上で自作OSが対話的にプリエンプティブ・マルチタスクしている。
+
+### 第5段-7 追加コマンド ＋ RX FIFO 化
+
+シェルにコマンドを追加し、UART受信を FIFO 化した（`kozos_sh.c` / `main_vio_console.v`）。
+
+- `kill <id>`: 指定ワーカースレッドを終了（スロット解放）。`run`/`ps`/`kill` で簡易プロセス管理。
+- `peek <hex>`: 番地の値を読んで表示（例 `peek 30008` = mtime下位、打つたびに変化＝タイマ稼働）。
+- `poke <hex> <hex>`: 番地に書き込み（例 `poke 40000 5a` = UART送信レジスタに 'Z' を書く→送信）。
+  → 再合成せずにメモリ/MMIO を対話で読み書きできる。
+- **`m_uart_rx` を16段FIFO化**: 単一バイト受信→FIFO受信にし、高速入力/ペーストでの取りこぼしを防止。
+
+```
+KOZOS> kill 1
+killed t1
+KOZOS> peek 30008
+0x1cd3e49b        <- mtime下位(タイマは走り続けるので毎回変わる)
+KOZOS> poke 40000 5a
+Zok               <- UART送信レジスタに 'Z'(0x5a) を書いて送信
+```
+KV260 実機で `kill`/`peek`/`poke` と FIFO 受信を確認。

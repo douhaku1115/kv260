@@ -39,8 +39,14 @@ static void put_c(char c){ while(*UART_ST & 2); *UART_TX=(unsigned char)c; }
 static void put_s(const char*s){ while(*s) put_c(*s++); }
 static void put_dec(unsigned v){ char b[12]; int i=0;
   if(!v){ put_c('0'); return; } while(v){ b[i++]='0'+v%10; v/=10; } while(i) put_c(b[--i]); }
+static void put_hex(unsigned v){ int i; put_s("0x"); for(i=28;i>=0;i-=4){ int d=(v>>i)&0xf; put_c(d<10?'0'+d:'a'+d-10); } }
 static int  str_eq(const char*a,const char*b){ while(*a&&*b){ if(*a!=*b) return 0; a++;b++; } return *a==*b; }
 static int  has_pfx(const char*s,const char*p){ while(*p){ if(*s!=*p) return 0; s++;p++; } return 1; }
+static int  a_dec(const char*s){ int v=0; while(*s>='0'&&*s<='9'){ v=v*10+(*s-'0'); s++; } return v; }
+static unsigned a_hex(const char*s){ unsigned v=0; int d;
+  for(;;){ char c=*s++;
+    if(c>='0'&&c<='9') d=c-'0'; else if(c>='a'&&c<='f') d=c-'a'+10; else if(c>='A'&&c<='F') d=c-'A'+10; else break;
+    v=(v<<4)|d; } return v; }
 
 /* ---- timer ---- */
 static unsigned long long get_mtime(void){ unsigned h,l;
@@ -91,6 +97,13 @@ static void cmd_run(void){
   }
   int_on(m); put_s("no free slot\r\n");
 }
+static void cmd_kill(int id){
+  if(id<1 || id>=IDLE){ put_s("bad id (1.."); put_dec(IDLE-1); put_s(")\r\n"); return; }
+  unsigned m=int_off();
+  if(tcbs[id].state==ST_FREE){ int_on(m); put_s("no such thread\r\n"); return; }
+  tcbs[id].state=ST_FREE;                 /* スロット解放 */
+  int_on(m); put_s("killed t"); put_dec(id); put_s("\r\n");
+}
 
 void shell(int id){
   char line[40]; (void)id;
@@ -104,12 +117,17 @@ void shell(int id){
       if(n<39){ line[n++]=(char)c; put_c((char)c); }
     }
     line[n]=0;
-    if(str_eq(line,"help"))        put_s("cmds: help echo sum tick ps run\r\n");
+    if(str_eq(line,"help"))        put_s("cmds: help echo sum tick ps run kill<id> peek<hex> poke<hex><hex>\r\n");
     else if(has_pfx(line,"echo ")) { put_s(line+5); put_s("\r\n"); }
     else if(str_eq(line,"sum"))    { unsigned s=0,i; for(i=1;i<=100;i++) s+=i; put_dec(s); put_s("\r\n"); }
     else if(str_eq(line,"tick"))   { put_s("ticks="); put_dec(ticks); put_s("\r\n"); }
     else if(str_eq(line,"ps"))     cmd_ps();
     else if(str_eq(line,"run"))    cmd_run();
+    else if(has_pfx(line,"kill ")) cmd_kill(a_dec(line+5));
+    else if(has_pfx(line,"peek ")) { unsigned a=a_hex(line+5); put_hex(*(volatile unsigned*)a); put_s("\r\n"); }
+    else if(has_pfx(line,"poke ")) { const char*p=line+5; unsigned a=a_hex(p);
+                                     while(*p&&*p!=' ')p++; while(*p==' ')p++; unsigned v=a_hex(p);
+                                     *(volatile unsigned*)a=v; put_s("ok\r\n"); }
     else if(n)                     put_s("?\r\n");
   }
 }
