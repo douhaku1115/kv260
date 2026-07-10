@@ -496,3 +496,31 @@ vivado -mode batch -source create_kozos4.tcl
 
 **KV260 実機 VIO で `w_rslt=0x0001D97C`（=121212）/ `w_done=1` を確認。**
 sleep（時間駆動）と違い ecall のみで同期するため高速に完了（約2300サイクル）。
+
+## KOZOS メッセージング（send / recv）— 自作OS移植の第5段-5
+
+セマフォ（5-4）の `BLOCKED` 基盤の上に、**スレッド間通信 send/recv** を実装
+（`src/gcc/kozos5.c`）。KOZOS らしい IPC。各スレッドに**メールボックス（リングバッファ）**を持たせ、
+`recv` は**戻り値（`a0`）で受信値を返す**。タイマ不使用（`ecall` のみ）、コア・`kentry.S` は無変更。
+
+- `send(dst, v)` = `ecall`：`dst` が `recv` 待ちなら**直接 `dst` の `a0` に届けて**起こす、
+  でなければ `dst` のメールボックスに積む。
+- `recv()` = `ecall`：自メールボックスに在れば取り出して継続、空なら `BLOCKED`
+  （後で `send` が `a0` をセットして起こす）。
+
+**検証（producer / consumer ランデブー）**: producer が値 1,2,3 を `send` し毎回 ack を待つ、
+consumer が `recv` して `seq` に積み ack を返す。各 `recv` がブロック→対応する `send` で起床＋
+**データ転送** → `seq=123`。
+
+```
+# メッセージングを命令メモリに生成
+cd src/gcc && CSRC="kozos5.c kentry.S" bash build_gcc.sh && cd ..
+iverilog -g2012 main_vio_timer.v sim_kozos.v -o /tmp/a && vvp /tmp/a
+# => r_rslt = 0000007b (= 123)
+
+# ビルド
+vivado -mode batch -source create_kozos5.tcl
+```
+
+**KV260 実機 VIO で `w_rslt=0x0000007B`（=123）/ `w_done=1` を確認。**
+これで KOZOS の主要サービス（協調 / プリエンプティブ / sleep / セマフォ / メッセージング）が揃った。
