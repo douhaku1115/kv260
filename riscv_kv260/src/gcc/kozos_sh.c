@@ -130,6 +130,30 @@ static void cmd_kill(int id){
   int_on(m); put_s("killed t"); put_dec(id); put_s("\r\n");
 }
 
+/* シリアルから16進ワードを1個読む(空白/改行はスキップ) */
+static unsigned read_hex_word(void){
+  int c; unsigned v=0;
+  do{ c=get_c(); }while(c==' '||c=='\r'||c=='\n'||c=='\t');
+  for(;;){
+    int d;
+    if(c>='0'&&c<='9') d=c-'0';
+    else if((c|0x20)>='a'&&(c|0x20)<='f') d=(c|0x20)-'a'+10;
+    else break;
+    v=(v<<4)|d; c=get_c();
+  }
+  return v;
+}
+/* load <n>: n個の32bit命令を受信→0x13000(DMEM,実行可能)に置く→関数として呼ぶ→戻り値表示 */
+#define LOADADDR 0x00013000
+static void cmd_load(int n){
+  volatile unsigned* dst = (volatile unsigned*)LOADADDR;
+  int i;
+  put_s("send "); put_dec(n); put_s(" hex words:\r\n");
+  for(i=0;i<n;i++){ dst[i]=read_hex_word(); put_hex(dst[i]); put_c(' '); }
+  put_s("\r\nrun @13000...\r\n");
+  int r = ((int(*)(void))LOADADDR)();       /* ロードしたプログラムを実行 */
+  put_s("ret="); put_sdec(r); put_s("\r\n");
+}
 static void cmd_calc(const char* p){          /* calc <a> <op> <b> : 四則演算 */
   int a=a_dec(p); while(*p>='0'&&*p<='9')p++; while(*p==' ')p++;
   char op=*p; if(op)p++; while(*p==' ')p++;
@@ -199,6 +223,7 @@ void shell(int id){
     else if(has_pfx(line,"nice ")) { const char*p=line+5; int id=a_dec(p);
                                      while(*p&&*p!=' ')p++; while(*p==' ')p++; int pr=a_dec(p);
                                      cmd_nice(id, pr); }
+    else if(has_pfx(line,"load ")) cmd_load(a_dec(line+5));
     else if(n)                     put_s("?\r\n");
   }
 }

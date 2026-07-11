@@ -215,14 +215,15 @@ module m_am_imem(w_pc, w_insn, w_dadr, w_ddata);
 endmodule
 
 // ---- データメモリ(4096語=16KB) バイトイネーブル書き込み ----
-module m_am_dmem(w_clk, w_adr, w_we, w_be, w_wd, w_rd);
+module m_am_dmem(w_clk, w_adr, w_we, w_be, w_wd, w_rd, w_fadr, w_finsn);
   input  wire w_clk, w_we;
   input  wire [3:0]  w_be;
-  input  wire [31:0] w_adr, w_wd;
-  output wire [31:0] w_rd;
+  input  wire [31:0] w_adr, w_wd, w_fadr;
+  output wire [31:0] w_rd, w_finsn;
   reg [31:0] mem [0:4095];
   wire [11:0] idx = w_adr[13:2];
-  assign w_rd = mem[idx];
+  assign w_rd    = mem[idx];
+  assign w_finsn = mem[w_fadr[13:2]];      // フェッチ用ポート(DMEM上のプログラム実行)
   always @(posedge w_clk) if (w_we) begin
     if (w_be[0]) mem[idx][7:0]   <= w_wd[7:0];
     if (w_be[1]) mem[idx][15:8]  <= w_wd[15:8];
@@ -260,6 +261,12 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   reg [63:0] mtimecmp=64'hFFFF_FFFF_FFFF_FFFF;
   wire w_mtip = (mtime >= mtimecmp);            // mip.MTIP
   reg [4:0] P2_rd=0, P2_rs1=0, P2_rs2=0, P3_rd=0, P4_rd=0;
+  reg P2_m=0;                       // RV32M命令(EX段)
+  // ---- RV32M 除算器(多サイクル反復)の状態 ----
+  reg        r_dbusy=0, r_ddone=0;
+  reg [5:0]  r_dcnt=0;
+  reg [31:0] r_acc=0, r_q=0, r_dvsr=0, r_dividend=0;
+  reg        r_qneg=0, r_rneg=0, r_wantrem=0, r_div0=0;
   reg P1_v=0, P2_v=0, P3_v=0, P4_v=0;
   reg [31:0] r_pc = 0;
 
@@ -280,6 +287,7 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   // ALU が funct3 を使うのは OP(R形式)と OP-IMM のみ。
   // ロード/ストア/lui/auipc/jal/jalr はアドレス・リンク計算=常に加算。
   wire w_usef3 = w_r | (w_op5==5'b00100);
+  wire w_muldiv = w_r & P1_ir[25];              // RV32M: R形式 funct7=0000001(bit25)
 
   // ---- SYSTEM命令(CSR/例外)のデコード ----
   wire w_sys      = (w_op5==5'b11100);
@@ -301,6 +309,9 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   wire [31:0] w_csr_new = (P2_f3==3'b010) ? (w_csr_old | w_in1) : w_in1;  // csrrs=OR / csrrw=上書
   wire w_csr_we = P2_csr & P2_v & ~((P2_f3==3'b010) & (P2_rs1==5'd0));
 
+  // 除算がEX段で計算中はパイプラインを停止(結果完了 r_ddone まで)
+  wire w_div_stall = P2_m & P2_f3[2] & P2_v & ~r_ddone;
+
   // ---- リダイレクト(P2境界): 割込み > 分岐/ジャンプ/トラップ ----
   wire w_brcond;
   wire w_take_b    = P2_b   & w_brcond & P2_v;
@@ -313,7 +324,7 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   wire w_ext_pend  = csr_mie[11] & w_meip;           // 外部(UART)割込み
   wire w_tmr_pend  = csr_mie[7]  & w_mtip;           // タイマ割込み
   wire w_irq       = csr_mstatus[3] & (w_ext_pend | w_tmr_pend);
-  wire w_take_irq  = w_irq & P2_v & ~P2_ecall & ~P2_mret;
+  wire w_take_irq  = w_irq & P2_v & ~P2_ecall & ~P2_mret & ~w_div_stall;  // 除算中は保留(完了後に受理)
   wire w_redir     = w_take_irq | w_take_b | w_take_jal | w_take_jalr | w_trap_e | w_trap_r;
   assign w_pcin = (w_take_irq | w_trap_e)  ? csr_mtvec :          // 割込み/ecall: ->mtvec
                   (w_trap_r)               ? csr_mepc :           // mret : ->mepc
@@ -323,10 +334,13 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
 
   wire w_lduse = P3_v & P3_ld &
        ((P3_rd==P2_rs1) | ((P3_rd==P2_rs2) & (P2_r | P2_b | P2_s)));
+  wire w_stall = w_lduse | w_div_stall;         // ロード使用ハザード or 除算中
 
-  wire [31:0] w_imem_word;
+  wire [31:0] w_imem_word, w_imem_insn, w_dmem_insn;
   m_adder   m2 (32'h4, r_pc, w_npc);
-  m_am_imem m3 (r_pc, w_ir, P3_alu, w_imem_word);   // 第2ポート=データ読み(P3_alu)
+  m_am_imem m3 (r_pc, w_imem_insn, P3_alu, w_imem_word);   // 第2ポート=データ読み(P3_alu)
+  // フェッチ: PCがDMEM領域(0x0001_xxxx)ならDMEMから、それ以外はIMEMから命令を取る
+  assign w_ir = (r_pc[31:16]==16'h0001) ? w_dmem_insn : w_imem_insn;
   m_gen_imm m4 (P1_ir, w_imm, w_r, w_i, w_s, w_b, w_u, w_j);
   m_RF2     m5 (w_clk, P1_ir[19:15], P1_ir[24:20], w_r1, w_r2,
                 P4_rd, !P4_s & !P4_b & P4_v, w_rt);
@@ -334,7 +348,7 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   m_mux     m7 (w_r2, w_imm, !w_r & !w_b, w_s2);      // ALU in2 = (R|B)?rs2:imm
 
   // ---- IF/ID -> EX ----
-  always @(posedge w_clk) if (!w_lduse) begin
+  always @(posedge w_clk) if (!w_stall) begin
     {P1_v, P2_v} <= {!w_redir, !w_redir & P1_v};
     {r_pc, P1_ir, P1_pc, P2_pc} <= {w_pcin, w_ir, r_pc, P1_pc};
     {P2_r1, P2_r2, P2_s2, P2_tpc} <= {w_r1, w_r2, w_s2, w_tpc};
@@ -343,7 +357,8 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
     {P2_f3, P2_sub, P2_sra, P2_usef3} <= {w_f3, w_sub, w_sra, w_usef3};
     {P2_jal, P2_jalr, P2_lui, P2_auipc} <= {w_jal, w_jalr, w_lui, w_auipc};
     {P2_csr, P2_ecall, P2_mret, P2_csraddr} <= {w_csr, w_ecall, w_mret, w_csraddr};
-  end else {P2_r1, P2_r2, P2_s2} <= {w_in1, w_in3, w_in2};
+    P2_m <= w_muldiv;
+  end else if (w_lduse) {P2_r1, P2_r2, P2_s2} <= {w_in1, w_in3, w_in2};
 
   // ---- ALU入力1: lui->0, auipc->pc, それ以外->rs1 ----
   assign w_alu_in1 = (P2_lui) ? 32'd0 : (P2_auipc) ? P2_pc : w_in1;
@@ -358,10 +373,10 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
 
   // ---- EX -> MEM -> WB ----
   always @(posedge w_clk) begin
-    {P3_v, P4_v} <= {P2_v & !w_lduse & !w_take_irq, P3_v};  // 割込まれたP2命令はcommitさせない(mepcで再実行するので二重実行防止)
+    {P3_v, P4_v} <= {P2_v & !w_stall & !w_take_irq, P3_v};  // ストール/割込み中はP3へ通さない(バブル)
     {P3_pc, P3_ld, P3_in3, P3_f3} <= {P2_pc, P2_ld, w_in3, P2_f3};
-    // WB値: CSR命令->旧値 / jump->pc+4 / それ以外->ALU
-    P3_alu <= P2_csr ? w_csr_old : (w_jump ? (P2_pc + 32'd4) : w_alu);
+    // WB値: CSR命令->旧値 / jump->pc+4 / M命令->乗除算結果 / それ以外->ALU
+    P3_alu <= P2_csr ? w_csr_old : (w_jump ? (P2_pc + 32'd4) : (P2_m ? w_m_out : w_alu));
     P3_rd  <= P2_rd;
     {P3_s, P3_b, P3_ld} <= {P2_s, P2_b, P2_ld};
     {P4_pc, P4_s, P4_b, P4_ld} <= {P3_pc, P3_s, P3_b, P3_ld};
@@ -379,7 +394,7 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
                                         4'b1111;          // sw
   wire [3:0]  w_be  = (w_be0 << w_boff);
   wire [31:0] w_word;
-  m_am_dmem m9 (w_clk, P3_alu, w_st & w_is_dmem, w_be, w_wdata, w_word);
+  m_am_dmem m9 (w_clk, P3_alu, w_st & w_is_dmem, w_be, w_wdata, w_word, r_pc, w_dmem_insn);
   // ---- タイマMMIO(0x0003_xxxx): 64bitを上下2ワードで, lw/sw前提 ----
   wire w_is_timer = (P3_alu[31:16]==16'h0003);
   wire [31:0] w_timer_rd =
@@ -434,6 +449,50 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   assign w_in1 = (w_fwd1_P3) ? P3_alu : (w_fwd1_P4) ? w_rt : P2_r1;
   assign w_in2 = (w_fwd2_P3) ? P3_alu : (w_fwd2_P4) ? w_rt : P2_s2;
   assign w_in3 = (w_fwd3_P3) ? P3_alu : (w_fwd3_P4) ? w_rt : P2_r2;
+
+  // ================= RV32M: 乗算(組合せ/DSP) / 除算(多サイクル反復) =================
+  // 乗算: 符号有無に応じ33bitへ拡張し 33x33 積の上位/下位を取る(MUL/MULH/MULHSU/MULHU)
+  wire w_ms1 = (P2_f3==3'b001) | (P2_f3==3'b010);        // MULH/MULHSU: rs1 符号付
+  wire w_ms2 = (P2_f3==3'b001);                          // MULH: rs2 符号付
+  wire signed [32:0] w_mopa = {w_ms1 & w_in1[31], w_in1};
+  wire signed [32:0] w_mopb = {w_ms2 & w_in2[31], w_in2};
+  wire signed [65:0] w_mprod = w_mopa * w_mopb;
+  wire [31:0] w_mul_out = (P2_f3==3'b000) ? w_mprod[31:0] : w_mprod[63:32];
+
+  // 除算: DIV(100)/DIVU(101)/REM(110)/REMU(111)。被除数/除数の絶対値で無符号除算し符号を後付け。
+  wire w_divop   = P2_m & P2_f3[2];
+  wire w_dsigned = ~P2_f3[0];                            // 100/110=符号付, 101/111=無し
+  wire w_dn1 = w_dsigned & w_in1[31];
+  wire w_dn2 = w_dsigned & w_in2[31];
+  wire [31:0] w_absn = w_dn1 ? (~w_in1 + 32'd1) : w_in1; // |被除数|
+  wire [31:0] w_absd = w_dn2 ? (~w_in2 + 32'd1) : w_in2; // |除数|
+  wire [31:0] w_shifted = {r_acc[30:0], r_q[31]};        // 剰余を1bit左シフト+次桁導入
+  wire w_ge = (w_shifted >= r_dvsr);
+  wire w_div_start = w_divop & P2_v & ~r_dbusy & ~r_ddone & ~w_lduse;
+
+  always @(posedge w_clk) begin
+    if (w_div_start) begin                               // 除算開始:オペランド取り込み
+      r_dbusy<=1; r_dcnt<=0; r_acc<=0;
+      r_q<=w_absn; r_dvsr<=w_absd;
+      r_qneg<=w_dn1^w_dn2; r_rneg<=w_dn1;                // 商符号=被除数^除数, 剰余符号=被除数
+      r_wantrem<=P2_f3[1]; r_div0<=(w_in2==32'd0); r_dividend<=w_in1;
+    end else if (r_dbusy) begin                          // 32回の反復
+      if (r_dcnt==6'd32) begin r_dbusy<=0; r_ddone<=1; end
+      else begin
+        r_acc <= w_ge ? (w_shifted - r_dvsr) : w_shifted;
+        r_q   <= {r_q[30:0], w_ge};
+        r_dcnt<= r_dcnt + 6'd1;
+      end
+    end
+    if (r_ddone & ~w_lduse) r_ddone<=0;                  // コミット後にクリア
+  end
+
+  // 除算結果(符号適用 + 特殊ケース: 0除算は DIV->-1 / REM->被除数)
+  wire [31:0] w_div_q = r_qneg ? (~r_q   + 32'd1) : r_q;
+  wire [31:0] w_div_r = r_rneg ? (~r_acc + 32'd1) : r_acc;
+  wire [31:0] w_div_out = r_div0 ? (r_wantrem ? r_dividend : 32'hFFFFFFFF)
+                                 : (r_wantrem ? w_div_r : w_div_q);
+  wire [31:0] w_m_out = w_divop ? w_div_out : w_mul_out;
 
   // ---- CSR 書き込み / トラップ(P2, lduse でない時) ----
   //   優先: 割込み > ecall > mret > csr書込。割込み/ecallは MPIE<-MIE,MIE<-0。
