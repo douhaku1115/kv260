@@ -12,19 +12,21 @@
 #define MTIME_LO    ((volatile unsigned*)0x00030008)
 #define MTIME_HI    ((volatile unsigned*)0x0003000C)
 
-#define SYS_EXIT  1
-#define SYS_SLEEP 2
+#define SYS_EXIT   1
+#define SYS_SLEEP  2
+#define SYS_WAITRX 7          /* UART受信待ち(割込み駆動) */
 #define CTXW     32
 #define INTERVAL 1000
 #define NTHREAD  6            /* 0=shell, 1..4=worker, 5=idle */
 #define IDLE     (NTHREAD-1)
 #define STK      256          /* 1スレッドのスタック語数 */
-#define ST_FREE  0
-#define ST_READY 1
-#define ST_SLEEP 2
-#define ST_DEAD  3
+#define ST_FREE   0
+#define ST_READY  1
+#define ST_SLEEP  2
+#define ST_DEAD   3
+#define ST_WAITRX 4          /* UART RX 待ちでブロック中 */
 
-typedef struct { unsigned *sp; int state; unsigned wake; } tcb_t;
+typedef struct { unsigned *sp; int state; unsigned wake; int prio; } tcb_t;
 extern void trap_entry(void);
 extern void dispatch(unsigned *sp);
 
@@ -56,28 +58,41 @@ static void set_cmp(unsigned long long t){ *MTIMECMP_HI=0xFFFFFFFF; *MTIMECMP_LO
 /* ---- syscall / 割込み制御(csrr/csrw で手動) ---- */
 static inline void sys_sleep(int n){ register int a0 __asm__("a0")=n,a7 __asm__("a7")=SYS_SLEEP;
   __asm__ volatile("ecall"::"r"(a0),"r"(a7):"memory"); }
+static inline void sys_waitrx(void){ register int a7 __asm__("a7")=SYS_WAITRX;
+  __asm__ volatile("ecall"::"r"(a7):"memory"); }
 static inline unsigned int_off(void){ unsigned m;
   __asm__ volatile("csrr %0, mstatus":"=r"(m));
   __asm__ volatile("csrw mstatus, %0"::"r"(m & ~8u));   /* MIE(bit3) クリア */
   return m; }
 static inline void int_on(unsigned m){ __asm__ volatile("csrw mstatus, %0"::"r"(m)); }
+/* MEIE(mie bit11 = UART RX割込み許可) の arm/mask。csrrc非対応なので clear は csrr+csrw */
+static inline void meie_on(void){ __asm__ volatile("csrs mie, %0"::"r"(1<<11)); }
+static inline void meie_off(void){ unsigned m; __asm__ volatile("csrr %0, mie":"=r"(m));
+  __asm__ volatile("csrw mie, %0"::"r"(m & ~(1u<<11))); }
 
-/* 入力が無ければ sleep して他スレッドに譲る */
-static int get_c(void){ while(!(*UART_ST & 1)) sys_sleep(1); return (int)(*UART_RX & 0xff); }
+/* RX読みはFIFOをpopする副作用があるので割込み禁止で保護(非冪等ロード対策)。
+   保護しないと読み中にタイマ割込みが入り lw が再実行され、2度popして取りこぼす。 */
+static int rx_read(void){ unsigned m=int_off(); int c=(int)(*UART_RX & 0xff); int_on(m); return c; }
+/* 割込み駆動: 入力が無ければ ST_WAITRX でブロック→UART割込みで起床 */
+static int get_c(void){
+  if(*UART_ST & 1) return rx_read();                /* 即読める */
+  sys_waitrx();                                     /* ブロック(kernelがMEIE arm) */
+  return rx_read();
+}
 
 /* ---- threads ---- */
 void worker(int id){ for(;;){ cnt[id]++; sys_sleep(3); } }
 void idle_thread(void){ for(;;); }
 
-static void tstart(int i, void *f, int arg){
+static void tstart(int i, void *f, int arg, int prio){
   unsigned *fr = &stk[i][STK] - CTXW; int k;
   for(k=0;k<CTXW;k++) fr[k]=0;
   fr[0]=(unsigned)f; fr[10]=(unsigned)arg;   /* mepc=f, a0=arg */
-  cnt[i]=0; tcbs[i].sp=fr; tcbs[i].state=ST_READY;
+  cnt[i]=0; tcbs[i].sp=fr; tcbs[i].prio=prio; tcbs[i].state=ST_READY;
 }
 
 static const char* stname(int s){
-  return s==ST_READY?"READY":s==ST_SLEEP?"SLEEP":s==ST_DEAD?"DEAD ":"FREE ";
+  return s==ST_READY?"READY":s==ST_SLEEP?"SLEEP":s==ST_DEAD?"DEAD ":s==ST_WAITRX?"WAITR":"FREE ";
 }
 static void cmd_ps(void){
   int i;
@@ -85,13 +100,22 @@ static void cmd_ps(void){
     if(tcbs[i].state==ST_FREE && i!=cur) continue;
     put_s(" t"); put_dec(i); put_c(' ');
     put_s(i==cur?"RUN  ":stname(tcbs[i].state));
+    put_s(" pri="); put_dec(tcbs[i].prio);
     put_s(" cnt="); put_dec(cnt[i]); put_s("\r\n");
   }
+}
+static void cmd_dump(unsigned a, int n){
+  int i; if(n>16) n=16;
+  for(i=0;i<n;i++){
+    if((i&3)==0){ if(i) put_s("\r\n"); put_hex(a+i*4); put_c(':'); }
+    put_c(' '); put_hex(*(volatile unsigned*)(a+i*4));
+  }
+  put_s("\r\n");
 }
 static void cmd_run(void){
   unsigned m=int_off();
   int i; for(i=1;i<IDLE;i++) if(tcbs[i].state==ST_FREE || tcbs[i].state==ST_DEAD){
-    tstart(i, (void*)worker, i);
+    tstart(i, (void*)worker, i, 1);       /* ワーカーは優先度1 */
     int_on(m);
     put_s("spawned t"); put_dec(i); put_s("\r\n"); return;
   }
@@ -117,7 +141,7 @@ void shell(int id){
       if(n<39){ line[n++]=(char)c; put_c((char)c); }
     }
     line[n]=0;
-    if(str_eq(line,"help"))        put_s("cmds: help echo sum tick ps run kill<id> peek<hex> poke<hex><hex>\r\n");
+    if(str_eq(line,"help"))        put_s("cmds: help echo sum tick ps run kill peek poke dump<hex><n>\r\n");
     else if(has_pfx(line,"echo ")) { put_s(line+5); put_s("\r\n"); }
     else if(str_eq(line,"sum"))    { unsigned s=0,i; for(i=1;i<=100;i++) s+=i; put_dec(s); put_s("\r\n"); }
     else if(str_eq(line,"tick"))   { put_s("ticks="); put_dec(ticks); put_s("\r\n"); }
@@ -128,6 +152,9 @@ void shell(int id){
     else if(has_pfx(line,"poke ")) { const char*p=line+5; unsigned a=a_hex(p);
                                      while(*p&&*p!=' ')p++; while(*p==' ')p++; unsigned v=a_hex(p);
                                      *(volatile unsigned*)a=v; put_s("ok\r\n"); }
+    else if(has_pfx(line,"dump ")) { const char*p=line+5; unsigned a=a_hex(p);
+                                     while(*p&&*p!=' ')p++; while(*p==' ')p++; int nn=a_dec(p);
+                                     cmd_dump(a, nn?nn:4); }
     else if(n)                     put_s("?\r\n");
   }
 }
@@ -135,23 +162,33 @@ void shell(int id){
 /* ---- scheduler ---- */
 unsigned* ksched(unsigned *frame, int sc, unsigned mcause){
   tcbs[cur].sp = frame;
-  if ((int)mcause < 0){                    /* タイマ=システムティック */
-    set_cmp(get_mtime()+INTERVAL); ticks++;
-    int i; for(i=0;i<IDLE;i++)
-      if(tcbs[i].state==ST_SLEEP && ticks>=tcbs[i].wake) tcbs[i].state=ST_READY;
+  int i;
+  if ((int)mcause < 0){                    /* 割込み */
+    unsigned code = mcause & 0xff;
+    if (code == 7){                         /* タイマ=システムティック */
+      set_cmp(get_mtime()+INTERVAL); ticks++;
+      for(i=0;i<IDLE;i++)
+        if(tcbs[i].state==ST_SLEEP && ticks>=tcbs[i].wake) tcbs[i].state=ST_READY;
+    } else if (code == 11){                 /* 外部=UART RX。maskして待ちスレッドを起こす */
+      meie_off();
+      for(i=0;i<IDLE;i++) if(tcbs[i].state==ST_WAITRX) tcbs[i].state=ST_READY;
+    }
   } else if (sc==SYS_SLEEP){ tcbs[cur].state=ST_SLEEP; tcbs[cur].wake=ticks+frame[10]; }
+  else if (sc==SYS_WAITRX){ tcbs[cur].state=ST_WAITRX; meie_on(); }  /* UART割込みをarm */
   else if (sc==SYS_EXIT){ tcbs[cur].state=ST_DEAD; }
-  int n=-1,i;                              /* real(0..IDLE-1) round-robin, 無ければidle */
-  for(i=1;i<=IDLE;i++){ int c=(cur+i)%IDLE; if(tcbs[c].state==ST_READY){ n=c; break; } }
-  if(n<0) n=IDLE;
-  cur=n; return tcbs[n].sp;
+  /* 優先度スケジューリング: READYの中で最高prioを選ぶ(同prioはround-robin) */
+  int best=-1, bestp=-1;
+  for(i=1;i<=IDLE;i++){ int c=(cur+i)%IDLE;
+    if(tcbs[c].state==ST_READY && tcbs[c].prio>bestp){ bestp=tcbs[c].prio; best=c; } }
+  if(best<0) best=IDLE;
+  cur=best; return tcbs[best].sp;
 }
 
 int main(void){
   cur=0; ticks=0;
   int i; for(i=0;i<NTHREAD;i++){ tcbs[i].state=ST_FREE; cnt[i]=0; }
-  tstart(0, (void*)shell, 0);              /* shell */
-  tstart(IDLE, (void*)idle_thread, 0);     /* idle */
+  tstart(0, (void*)shell, 0, 2);           /* shell 優先度2(最高) */
+  tstart(IDLE, (void*)idle_thread, 0, 0);  /* idle 優先度0 */
   __asm__ volatile("csrw mtvec, %0"   :: "r"((unsigned)(unsigned long)trap_entry));
   set_cmp(get_mtime()+INTERVAL);
   __asm__ volatile("csrs mie, %0"     :: "r"(0x80));   /* MTIE */

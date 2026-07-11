@@ -296,7 +296,7 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
        (P2_csraddr==12'h340) ? csr_mscratch :
        (P2_csraddr==12'h300) ? csr_mstatus :
        (P2_csraddr==12'h304) ? csr_mie :
-       (P2_csraddr==12'h344) ? {24'd0, w_mtip, 7'd0} :   // mip: bit7=MTIP
+       (P2_csraddr==12'h344) ? {20'd0, w_meip, 3'd0, w_mtip, 7'd0} :  // mip: bit11=MEIP,bit7=MTIP
                                32'd0;
   wire [31:0] w_csr_new = (P2_f3==3'b010) ? (w_csr_old | w_in1) : w_in1;  // csrrs=OR / csrrw=上書
   wire w_csr_we = P2_csr & P2_v & ~((P2_f3==3'b010) & (P2_rs1==5'd0));
@@ -308,8 +308,11 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   wire w_take_jalr = P2_jalr& P2_v;
   wire w_trap_e    = P2_ecall & P2_v;               // ecall
   wire w_trap_r    = P2_mret  & P2_v;               // mret
-  // タイマ割込み: MIE & MTIE & MTIP。P2の有効命令(ecall/mret以外)に相乗り。
-  wire w_irq       = csr_mstatus[3] & csr_mie[7] & w_mtip;
+  // 割込み: MIE & ((MTIE&MTIP) | (MEIE&MEIP))。MEIP=UART RX有(rx_valid)。
+  wire w_meip      = w_rx_valid;                     // 外部割込み保留(UART RX)
+  wire w_ext_pend  = csr_mie[11] & w_meip;           // 外部(UART)割込み
+  wire w_tmr_pend  = csr_mie[7]  & w_mtip;           // タイマ割込み
+  wire w_irq       = csr_mstatus[3] & (w_ext_pend | w_tmr_pend);
   wire w_take_irq  = w_irq & P2_v & ~P2_ecall & ~P2_mret;
   wire w_redir     = w_take_irq | w_take_b | w_take_jal | w_take_jalr | w_trap_e | w_trap_r;
   assign w_pcin = (w_take_irq | w_trap_e)  ? csr_mtvec :          // 割込み/ecall: ->mtvec
@@ -435,9 +438,9 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   // ---- CSR 書き込み / トラップ(P2, lduse でない時) ----
   //   優先: 割込み > ecall > mret > csr書込。割込み/ecallは MPIE<-MIE,MIE<-0。
   always @(posedge w_clk) if (!w_lduse) begin
-    if (w_take_irq) begin                // タイマ割込みエントリ(P2命令に相乗り→復帰点)
+    if (w_take_irq) begin                // 割込みエントリ(P2命令に相乗り→復帰点)
       csr_mepc      <= P2_pc;            // 割込まれた命令のPC(再実行する)
-      csr_mcause    <= 32'h8000_0007;    // Interrupt + code7(machine timer)
+      csr_mcause    <= w_ext_pend ? 32'h8000_000B : 32'h8000_0007;  // 外部(UART)=11 / タイマ=7
       csr_mstatus[7]<= csr_mstatus[3];   // MPIE <- MIE
       csr_mstatus[3]<= 1'b0;             // MIE  <- 0
     end else if (w_trap_e) begin         // ecall: 例外エントリ
