@@ -268,7 +268,7 @@ module m_proc_timer(w_clk, r_rslt, r_done);
 
   // ---- EX -> MEM -> WB ----
   always @(posedge w_clk) begin
-    {P3_v, P4_v} <= {P2_v & !w_lduse, P3_v};
+    {P3_v, P4_v} <= {P2_v & !w_lduse & !w_take_irq, P3_v};  // 割込まれたP2命令はcommitさせない(二重実行防止)
     {P3_pc, P3_ld, P3_in3, P3_f3} <= {P2_pc, P2_ld, w_in3, P2_f3};
     // WB値: CSR命令->旧値 / jump->pc+4 / それ以外->ALU
     P3_alu <= P2_csr ? w_csr_old : (w_jump ? (P2_pc + 32'd4) : w_alu);

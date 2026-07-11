@@ -42,6 +42,7 @@ static void put_s(const char*s){ while(*s) put_c(*s++); }
 static void put_dec(unsigned v){ char b[12]; int i=0;
   if(!v){ put_c('0'); return; } while(v){ b[i++]='0'+v%10; v/=10; } while(i) put_c(b[--i]); }
 static void put_hex(unsigned v){ int i; put_s("0x"); for(i=28;i>=0;i-=4){ int d=(v>>i)&0xf; put_c(d<10?'0'+d:'a'+d-10); } }
+static void put_sdec(int v){ if(v<0){ put_c('-'); v=-v; } put_dec((unsigned)v); }
 static int  str_eq(const char*a,const char*b){ while(*a&&*b){ if(*a!=*b) return 0; a++;b++; } return *a==*b; }
 static int  has_pfx(const char*s,const char*p){ while(*p){ if(*s!=*p) return 0; s++;p++; } return 1; }
 static int  a_dec(const char*s){ int v=0; while(*s>='0'&&*s<='9'){ v=v*10+(*s-'0'); s++; } return v; }
@@ -129,21 +130,61 @@ static void cmd_kill(int id){
   int_on(m); put_s("killed t"); put_dec(id); put_s("\r\n");
 }
 
+static void cmd_calc(const char* p){          /* calc <a> <op> <b> : 四則演算 */
+  int a=a_dec(p); while(*p>='0'&&*p<='9')p++; while(*p==' ')p++;
+  char op=*p; if(op)p++; while(*p==' ')p++;
+  int b=a_dec(p), r;
+  switch(op){
+    case '+': r=a+b; break;
+    case '-': r=a-b; break;
+    case '*': r=a*b; break;
+    case '/': if(b==0){ put_s("div0\r\n"); return; } r=a/b; break;
+    default:  put_s("op? (+ - * /)\r\n"); return;
+  }
+  put_sdec(r); put_s("\r\n");
+}
+static void cmd_nice(int id, int pr){
+  if(id<0 || id>=NTHREAD){ put_s("bad id\r\n"); return; }
+  unsigned m=int_off(); tcbs[id].prio=pr; int_on(m);
+  put_s("t"); put_dec(id); put_s(" prio="); put_dec(pr); put_s("\r\n");
+}
+
+/* ---- コマンド履歴 ---- */
+#define HISTN 4
+static char hist[HISTN][40];
+static int  histn=0, histw=0;         /* 件数 / 次の書込み位置 */
+static void s_cpy(char*d,const char*s){ while((*d++=*s++)); }
+
 void shell(int id){
   char line[40]; (void)id;
-  put_s("\r\nKOZOS shell (help/echo/sum/tick/ps/run)\r\n");
+  put_s("\r\nKOZOS shell (help)  history:up/down\r\n");
   for(;;){
     put_s("KOZOS> ");
-    int n=0;
+    int n=0, hp=0;                     /* hp=履歴ナビ位置(0=新規行) */
     for(;;){ int c=get_c();
+      if(c==0x1b){                     /* ESC: 矢印キー(ESC [ A/B) */
+        int a=get_c(), b=get_c();
+        if(a=='['&&(b=='A'||b=='B')){
+          if(b=='A'){ if(hp<histn) hp++; }          /* ↑ 古い方へ */
+          else      { if(hp>0)    hp--; }           /* ↓ 新しい方へ */
+          if(hp==0) line[0]=0;
+          else s_cpy(line, hist[(histw-hp+HISTN)%HISTN]);
+          n=0; while(line[n]) n++;
+          put_c('\r'); put_s("KOZOS> "); put_s(line); put_s("\033[K");  /* 行を書き直し */
+        }
+        continue;
+      }
       if(c=='\r'||c=='\n'){ put_s("\r\n"); break; }
       if(c==8||c==127){ if(n){ n--; put_s("\b \b"); } continue; }
-      if(n<39){ line[n++]=(char)c; put_c((char)c); }
+      if(c>=32 && c<127 && n<39){ line[n++]=(char)c; put_c((char)c); }
     }
     line[n]=0;
-    if(str_eq(line,"help"))        put_s("cmds: help echo sum tick ps run kill peek poke dump<hex><n>\r\n");
+    if(n>0){ s_cpy(hist[histw], line); histw=(histw+1)%HISTN; if(histn<HISTN) histn++; }
+    if(str_eq(line,"help"))        put_s("cmds: help echo sum[ n] calc tick ps run kill peek poke dump nice\r\n");
     else if(has_pfx(line,"echo ")) { put_s(line+5); put_s("\r\n"); }
+    else if(has_pfx(line,"sum "))  { unsigned n=a_dec(line+4),s=0,i; for(i=1;i<=n;i++) s+=i; put_dec(s); put_s("\r\n"); }
     else if(str_eq(line,"sum"))    { unsigned s=0,i; for(i=1;i<=100;i++) s+=i; put_dec(s); put_s("\r\n"); }
+    else if(has_pfx(line,"calc ")) cmd_calc(line+5);
     else if(str_eq(line,"tick"))   { put_s("ticks="); put_dec(ticks); put_s("\r\n"); }
     else if(str_eq(line,"ps"))     cmd_ps();
     else if(str_eq(line,"run"))    cmd_run();
@@ -155,6 +196,9 @@ void shell(int id){
     else if(has_pfx(line,"dump ")) { const char*p=line+5; unsigned a=a_hex(p);
                                      while(*p&&*p!=' ')p++; while(*p==' ')p++; int nn=a_dec(p);
                                      cmd_dump(a, nn?nn:4); }
+    else if(has_pfx(line,"nice ")) { const char*p=line+5; int id=a_dec(p);
+                                     while(*p&&*p!=' ')p++; while(*p==' ')p++; int pr=a_dec(p);
+                                     cmd_nice(id, pr); }
     else if(n)                     put_s("?\r\n");
   }
 }
