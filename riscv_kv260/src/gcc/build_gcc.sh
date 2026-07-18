@@ -9,10 +9,11 @@ OBJCOPY=$TC/riscv64-unknown-elf-objcopy
 OBJDUMP=$TC/riscv64-unknown-elf-objdump
 OUT=${1:-$HERE/../asm_gcc.txt}
 CSRC=${CSRC:-main.c}
+MARCH=${MARCH:-rv32i_zicsr}      # RVC核なら MARCH=rv32imc_zicsr を指定
 
 cd "$HERE"
-# RV32I / ilp32 / 圧縮命令なし。標準ライブラリ・スタートアップ不使用。
-$GCC -march=rv32i_zicsr -mabi=ilp32 -O2 -nostdlib -nostartfiles \
+# 既定=RV32I / ilp32 / 圧縮命令なし。標準ライブラリ・スタートアップ不使用。
+$GCC -march=$MARCH -mabi=ilp32 -O2 -nostdlib -nostartfiles \
      -ffreestanding -Wl,--build-id=none -Wl,-T,link.ld \
      crt0.S $CSRC -lgcc -o prog.elf   # -lgcc: RV32Iの soft div/mul(__udivsi3等)
 
