@@ -207,7 +207,15 @@ void shell(int id){
     }
     line[n]=0;
     if(n>0){ s_cpy(hist[histw], line); histw=(histw+1)%HISTN; if(histn<HISTN) histn++; }
-    if(str_eq(line,"help"))        put_s("cmds: help echo sum[ n] calc tick ps run kill peek poke dump nice\r\n");
+    if(str_eq(line,"help"))        put_s("cmds: help echo sum[ n] calc tick ps run kill peek poke dump nice rsum smp\r\n");
+    else if(has_pfx(line,"rsum ")) { /* core1にsumを依頼(結果を待つ間もOSは動く) */
+      *(volatile unsigned*)0x00060020 = a_dec(line+5);   /* ARG */
+      *(volatile unsigned*)0x00060028 = 1;               /* ST=req */
+      while (*(volatile unsigned*)0x00060028 != 2) sys_sleep(1);
+      put_s("core1: "); put_dec(*(volatile unsigned*)0x00060024); put_s("\r\n");
+      *(volatile unsigned*)0x00060028 = 0; }
+    else if(str_eq(line,"smp"))    { put_s("hart="); put_dec(*(volatile unsigned*)0x00060008);
+      put_s(" core1_hb="); put_dec(*(volatile unsigned*)0x0006002C); put_s("\r\n"); }
     else if(has_pfx(line,"echo ")) { put_s(line+5); put_s("\r\n"); }
     else if(has_pfx(line,"sum "))  { unsigned n=a_dec(line+4),s=0,i; for(i=1;i<=n;i++) s+=i; put_dec(s); put_s("\r\n"); }
     else if(str_eq(line,"sum"))    { unsigned s=0,i; for(i=1;i<=100;i++) s+=i; put_dec(s); put_s("\r\n"); }
@@ -256,7 +264,27 @@ unsigned* ksched(unsigned *frame, int sc, unsigned mcause){
   cur=best; return tcbs[best].sp;
 }
 
+/* ---- SMP(段B1): core1はジョブ実行エージェント ----
+   共有レジスタ(0x60020-): ARG/RES/ST(0=idle,1=req,2=done)/HB(生存カウンタ) */
+#define SMP_ARG (*(volatile unsigned*)0x00060020)
+#define SMP_RES (*(volatile unsigned*)0x00060024)
+#define SMP_ST  (*(volatile unsigned*)0x00060028)
+#define SMP_HB  (*(volatile unsigned*)0x0006002C)
+static void core1_agent(void){
+  for(;;){
+    SMP_HB = SMP_HB + 1;                       /* 生存カウンタ */
+    if (SMP_ST == 1){                          /* ジョブ要求 */
+      unsigned n = SMP_ARG, s = 0, i;
+      for(i=1;i<=n;i++) s += i;                /* sum 1..n をcore1で計算 */
+      SMP_RES = s;
+      SMP_ST  = 2;                             /* 完了通知 */
+    }
+  }
+}
+
 int main(void){
+  /* SMP: core1はエージェント(単一コアではhartid MMIO=0を読むので無害) */
+  if (*(volatile unsigned*)0x00060008 != 0) core1_agent();
   cur=0; ticks=0;
   int i; for(i=0;i<NTHREAD;i++){ tcbs[i].state=ST_FREE; cnt[i]=0; }
   tstart(0, (void*)shell, 0, 2);           /* shell 優先度2(最高) */
