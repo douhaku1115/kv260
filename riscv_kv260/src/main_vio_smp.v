@@ -146,13 +146,17 @@ endmodule
 // ============================================================
 // 5段パイプライン 完全RV32I
 // ============================================================
-module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_rd, w_ipi_pend);
+module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_rd, w_ipi_pend,
+                 w_sr_adr, w_sr_wd, w_sr_we, w_sr_be, w_sr_rd);
   input  wire w_clk;
   input  wire [1:0]  w_hartid;             // このコアのhart ID(0/1)
   output wire [31:0] w_sh_adr, w_sh_wd;    // 共有ブロックへの要求(アドレス/書込データ)
   output wire w_sh_we, w_sh_rdreq;         // 共有への書込 / 読み要求(TAS副作用用)
   input  wire [31:0] w_sh_rd;              // 共有ブロックからの読みデータ
   input  wire w_ipi_pend;                  // このコア宛のIPI保留(共有ブロックから)
+  output wire [31:0] w_sr_adr, w_sr_wd;    // 共有RAM(0x0004_xxxx, スタック/TCB)への接続
+  output wire w_sr_we;  output wire [3:0] w_sr_be;
+  input  wire [31:0] w_sr_rd;
 
   reg [31:0] P1_ir=32'h13, P1_pc=0, P2_pc=0, P3_pc=0, P4_pc=0;
   // ---- CSR/割込み(IPI用, timerコアから移植) ----
@@ -273,7 +277,8 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
   // ---- MEM: アドレスデコード + バイト/ハーフ ld/st ----
   wire [1:0] w_boff = P3_alu[1:0];
   wire w_is_dmem   = (P3_alu[31:16]==16'h0001);           // 0x0001_xxxx 私有DMEM
-  wire w_is_shared = (P3_alu[31:16]==16'h0003);           // 0x0003_xxxx 共有ブロック
+  wire w_is_shared = (P3_alu[31:16]==16'h0003);           // 0x0003_xxxx 共有ブロック(MMIO)
+  wire w_is_sram   = (P3_alu[31:16]==16'h0004);           // 0x0004_xxxx 共有RAM(スタック/TCB)
   wire w_is_hartid = (P3_alu==32'h0003_0008);             // hartid読み(コア内で返す)
   wire w_st        = P3_s & P3_v;
   wire [31:0] w_wdata = P3_in3 << (8*w_boff);             // ストアデータを該当レーンへ
@@ -281,8 +286,15 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
                       (P3_f3==3'b001) ? 4'b0011 :         // sh
                                         4'b1111;          // sw
   wire [3:0]  w_be  = (w_be0 << w_boff);
-  wire [31:0] w_word;
-  m_am_dmem m9 (w_clk, P3_alu, w_st & w_is_dmem, w_be, w_wdata, w_word);
+  wire [31:0] w_pword;
+  m_am_dmem m9 (w_clk, P3_alu, w_st & w_is_dmem, w_be, w_wdata, w_pword);
+  // ---- 共有RAM(0x0004_xxxx)への接続 ----
+  assign w_sr_adr = P3_alu;
+  assign w_sr_wd  = w_wdata;
+  assign w_sr_we  = w_st & w_is_sram;
+  assign w_sr_be  = w_be;
+  // ロード対象の生ワード: 私有DMEM or 共有RAM
+  wire [31:0] w_word = w_is_sram ? w_sr_rd : w_pword;
   // ---- 共有ブロックへの接続(0x0003_xxxx: lock/counter/done) ----
   assign w_sh_adr   = P3_alu;
   assign w_sh_wd    = P3_in3;
@@ -403,16 +415,44 @@ module m_shared(w_clk,
   end
 endmodule
 
-// ---- KV260 top: pl_clk0 + 2コア(hartid 0/1) + 共有ブロック + VIO ----
+// ============================================================
+// 共有RAM(デュアルポートBRAM, 4KB): 2コアがスレッドスタック/TCBを共有する
+//   0x0004_0000.. (idx=adr[11:2])。同一番地同時書込はソフトのロック/スレッド所有で回避。
+// ============================================================
+module m_sharedram(w_clk, a0,we0,be0,wd0,rd0, a1,we1,be1,wd1,rd1);
+  input  wire w_clk;
+  input  wire [31:0] a0,wd0, a1,wd1;
+  input  wire we0,we1;  input wire [3:0] be0,be1;
+  output wire [31:0] rd0,rd1;
+  reg [31:0] mem [0:1023];
+  wire [9:0] i0=a0[11:2], i1=a1[11:2];
+  assign rd0 = mem[i0];  assign rd1 = mem[i1];
+  always @(posedge w_clk) begin
+    if (we0) begin
+      if(be0[0])mem[i0][7:0]<=wd0[7:0];   if(be0[1])mem[i0][15:8]<=wd0[15:8];
+      if(be0[2])mem[i0][23:16]<=wd0[23:16]; if(be0[3])mem[i0][31:24]<=wd0[31:24];
+    end
+    if (we1) begin
+      if(be1[0])mem[i1][7:0]<=wd1[7:0];   if(be1[1])mem[i1][15:8]<=wd1[15:8];
+      if(be1[2])mem[i1][23:16]<=wd1[23:16]; if(be1[3])mem[i1][31:24]<=wd1[31:24];
+    end
+  end
+  integer i; initial for (i=0;i<1024;i=i+1) mem[i]=32'd0;
+endmodule
+
+// ---- KV260 top: pl_clk0 + 2コア(hartid 0/1) + 共有ブロック + 共有RAM + VIO ----
 module m_top_kv260;
   wire w_clk;
   wire [31:0] a0,d0, a1,d1, r0,r1;
   wire we0,rq0, we1,rq1;
   wire [31:0] w_counter, w_done;
   wire w_ipi0, w_ipi1;
+  wire [31:0] sa0,sd0,srd0, sa1,sd1,srd1;      // 共有RAMバス
+  wire swe0,swe1;  wire [3:0] sbe0,sbe1;
   clk_bd_wrapper m0 (.pl_clk0(w_clk));
-  m_smpcore c0 (w_clk, 2'd0, a0,d0,we0,rq0, r0, w_ipi0);
-  m_smpcore c1 (w_clk, 2'd1, a1,d1,we1,rq1, r1, w_ipi1);
-  m_shared  sh (w_clk, a0,d0,we0,rq0,r0, a1,d1,we1,rq1,r1, w_counter, w_done, , w_ipi0, w_ipi1);
-  vio_0 v (w_clk, w_counter, w_done);   // VIO: 共有カウンタ(受信IPI数) / done
+  m_smpcore c0 (w_clk, 2'd0, a0,d0,we0,rq0, r0, w_ipi0, sa0,sd0,swe0,sbe0,srd0);
+  m_smpcore c1 (w_clk, 2'd1, a1,d1,we1,rq1, r1, w_ipi1, sa1,sd1,swe1,sbe1,srd1);
+  m_shared    sh (w_clk, a0,d0,we0,rq0,r0, a1,d1,we1,rq1,r1, w_counter, w_done, , w_ipi0, w_ipi1);
+  m_sharedram sr (w_clk, sa0,swe0,sbe0,sd0,srd0, sa1,swe1,sbe1,sd1,srd1);
+  vio_0 v (w_clk, w_counter, w_done);   // VIO: 共有カウンタ / done
 endmodule
