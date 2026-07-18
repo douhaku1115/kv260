@@ -3,7 +3,7 @@ title: "自作RISC-Vを2コアにしてSMPにする：ハードウェアロッ�
 emoji: "🧩"
 type: "tech"
 topics: ["fpga", "kv260", "riscv", "os", "verilog"]
-published: false
+published: true
 ---
 
 ## はじめに
