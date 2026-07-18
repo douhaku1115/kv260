@@ -805,4 +805,17 @@ sim で排他の効果を対比（`gcc/smp_norace.c` = ロック無し版）:
 | ロック **なし** | **100**（2コアが同期実行で衝突し半分取りこぼす） |
 
 `create_smp.tcl` でビルド（VIO: probe0=counter, probe1=done）。ビルド WNS +3.229ns。
-次段の予定: IPI（コア間割込み）＋最小 SMP カーネル → KOZOS の SMP 化。
+
+### 2コア SMP（段2: IPI = コア間割込み）— 第5段-13b
+
+段1の `m_smpcore` は割込み機構が無いので、まず **最小の CSR/割込み**（timer コアから移植:
+`mtvec`/`mepc`/`mstatus(MIE/MPIE)`/`mcause`/`mret`/`csrrw/csrrs`）を足し、割込み源を **IPI** にした。
+
+- **IPI 機構**（`m_shared` に追加）: `0x30010`=IPI 送信（書込値の bit で対象コア）、`0x30014`=ack（自コア
+  pending クリア）。各コアの pending を割込み源（mip bit3=MSIP 相当）として供給。`mie` bit3(MSIE)+`mstatus`
+  MIE で許可すると、pending で `mepc←PC, PC←mtvec, MIE←0`、ハンドラで ack→`mret` 復帰。
+- **デモ**（`gcc/ipi_test.c`）: core0 が core1 へ IPI を 50 回送信（受信カウンタでハンドシェイクし 1 件ずつ確実に配送）、
+  core1 は `__attribute__((interrupt("machine")))` のハンドラで受信・ack。→ **受信数=50 / done=3**。
+
+sim で 50 IPI の配送・ハンドラ実行を確認（1471 サイクル）。ビルド WNS +3.156ns。
+次段（段3）: 共有レディキュー＋per-hart current の最小 SMP スケジューラ → KOZOS の SMP 化。

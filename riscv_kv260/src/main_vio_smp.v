@@ -146,14 +146,21 @@ endmodule
 // ============================================================
 // 5段パイプライン 完全RV32I
 // ============================================================
-module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_rd);
+module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_rd, w_ipi_pend);
   input  wire w_clk;
   input  wire [1:0]  w_hartid;             // このコアのhart ID(0/1)
   output wire [31:0] w_sh_adr, w_sh_wd;    // 共有ブロックへの要求(アドレス/書込データ)
   output wire w_sh_we, w_sh_rdreq;         // 共有への書込 / 読み要求(TAS副作用用)
   input  wire [31:0] w_sh_rd;              // 共有ブロックからの読みデータ
+  input  wire w_ipi_pend;                  // このコア宛のIPI保留(共有ブロックから)
 
   reg [31:0] P1_ir=32'h13, P1_pc=0, P2_pc=0, P3_pc=0, P4_pc=0;
+  // ---- CSR/割込み(IPI用, timerコアから移植) ----
+  reg P2_csr=0, P2_ecall=0, P2_mret=0;
+  reg [11:0] P2_csraddr=0;
+  reg [31:0] csr_mtvec=0, csr_mepc=0, csr_mcause=0, csr_mscratch=0;
+  reg [31:0] csr_mstatus=0;    // bit3=MIE, bit7=MPIE
+  reg [31:0] csr_mie=0;        // bit3=MSIE(ソフトウェア割込み許可=IPI)
   reg [31:0] P2_r1=0, P2_s2=0, P2_r2=0, P2_tpc=0;
   reg [31:0] P3_alu, P3_in3, P4_alu=0, P4_ldd=0;
   reg P2_r=0, P2_s=0, P2_b=0, P2_ld=0, P4_s=0, P4_b=0, P4_ld=0;
@@ -182,13 +189,39 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
   // ロード/ストア/lui/auipc/jal/jalr はアドレス・リンク計算=常に加算。
   wire w_usef3 = w_r | (w_op5==5'b00100);
 
-  // ---- リダイレクト(P2境界) ----
+  // ---- SYSTEM命令(CSR/ecall/mret)のデコード ----
+  wire w_sys      = (w_op5==5'b11100);
+  wire w_ecall    = w_sys & (w_f3==3'b000) & (P1_ir[31:20]==12'h000);
+  wire w_mret     = w_sys & (w_f3==3'b000) & (P1_ir[31:20]==12'h302);
+  wire w_csr      = w_sys & (w_f3!=3'b000);          // csrrw(001)/csrrs(010)
+  wire [11:0] w_csraddr = P1_ir[31:20];
+
+  // ---- CSR読み出し(旧値)/書き込み新値 ----
+  wire [31:0] w_csr_old =
+       (P2_csraddr==12'h305) ? csr_mtvec :
+       (P2_csraddr==12'h341) ? csr_mepc :
+       (P2_csraddr==12'h342) ? csr_mcause :
+       (P2_csraddr==12'h340) ? csr_mscratch :
+       (P2_csraddr==12'h300) ? csr_mstatus :
+       (P2_csraddr==12'h304) ? csr_mie :
+       (P2_csraddr==12'h344) ? {28'd0, w_ipi_pend, 3'd0} :  // mip: bit3=MSIP(IPI保留)
+                               32'd0;
+  wire [31:0] w_csr_new = (P2_f3==3'b010) ? (w_csr_old | w_in1) : w_in1;  // csrrs=OR / csrrw=上書
+  wire w_csr_we = P2_csr & P2_v & ~((P2_f3==3'b010) & (P2_rs1==5'd0));
+
+  // ---- リダイレクト(P2境界): 割込み(IPI) > 分岐/ジャンプ/トラップ ----
   wire w_brcond;
   wire w_take_b    = P2_b   & w_brcond & P2_v;
   wire w_take_jal  = P2_jal & P2_v;
   wire w_take_jalr = P2_jalr& P2_v;
-  wire w_redir     = w_take_b | w_take_jal | w_take_jalr;
-  assign w_pcin = (w_take_jalr)            ? (w_alu & ~32'd1) :   // jalr: (rs1+imm)&~1
+  wire w_trap_e    = P2_ecall & P2_v;               // ecall
+  wire w_trap_r    = P2_mret  & P2_v;               // mret
+  wire w_irq       = csr_mstatus[3] & csr_mie[3] & w_ipi_pend;  // MIE & MSIE & IPI保留
+  wire w_take_irq  = w_irq & P2_v & ~P2_ecall & ~P2_mret;
+  wire w_redir     = w_take_irq | w_take_b | w_take_jal | w_take_jalr | w_trap_e | w_trap_r;
+  assign w_pcin = (w_take_irq | w_trap_e)  ? csr_mtvec :          // 割込み/ecall: ->mtvec
+                  (w_trap_r)               ? csr_mepc :           // mret: ->mepc
+                  (w_take_jalr)            ? (w_alu & ~32'd1) :   // jalr: (rs1+imm)&~1
                   (w_take_b | w_take_jal)  ? P2_tpc :             // branch/jal: pc+imm
                                              w_npc;               // pc+4
 
@@ -212,6 +245,7 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
     {P2_rs2, P2_rs1, P2_rd} <= {P1_ir[24:15], P1_ir[11:7]};
     {P2_f3, P2_sub, P2_sra, P2_usef3} <= {w_f3, w_sub, w_sra, w_usef3};
     {P2_jal, P2_jalr, P2_lui, P2_auipc} <= {w_jal, w_jalr, w_lui, w_auipc};
+    {P2_csr, P2_ecall, P2_mret, P2_csraddr} <= {w_csr, w_ecall, w_mret, w_csraddr};
   end else {P2_r1, P2_r2, P2_s2} <= {w_in1, w_in3, w_in2};
 
   // ---- ALU入力1: lui->0, auipc->pc, それ以外->rs1 ----
@@ -227,9 +261,9 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
 
   // ---- EX -> MEM -> WB ----
   always @(posedge w_clk) begin
-    {P3_v, P4_v} <= {P2_v & !w_lduse, P3_v};
+    {P3_v, P4_v} <= {P2_v & !w_lduse & !w_take_irq, P3_v};  // 割込まれたP2命令はcommitさせない
     {P3_pc, P3_ld, P3_in3, P3_f3} <= {P2_pc, P2_ld, w_in3, P2_f3};
-    P3_alu <= w_jump ? (P2_pc + 32'd4) : w_alu;     // jump: rd<-pc+4
+    P3_alu <= P2_csr ? w_csr_old : (w_jump ? (P2_pc + 32'd4) : w_alu);  // CSR->旧値/jump->pc+4/他->ALU
     P3_rd  <= P2_rd;
     {P3_s, P3_b, P3_ld} <= {P2_s, P2_b, P2_ld};
     {P4_pc, P4_s, P4_b, P4_ld} <= {P3_pc, P3_s, P3_b, P3_ld};
@@ -279,6 +313,33 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
   assign w_in2 = (w_fwd2_P3) ? P3_alu : (w_fwd2_P4) ? w_rt : P2_s2;
   assign w_in3 = (w_fwd3_P3) ? P3_alu : (w_fwd3_P4) ? w_rt : P2_r2;
 
+  // ---- CSR書込 / トラップ(P2, lduseでない時). 優先: 割込み>ecall>mret>csr書込 ----
+  always @(posedge w_clk) if (!w_lduse) begin
+    if (w_take_irq) begin                // IPI割込みエントリ(P2命令に相乗り→復帰点)
+      csr_mepc      <= P2_pc;
+      csr_mcause    <= 32'h8000_0003;    // Interrupt + code3(machine software=IPI)
+      csr_mstatus[7]<= csr_mstatus[3];   // MPIE <- MIE
+      csr_mstatus[3]<= 1'b0;             // MIE  <- 0
+    end else if (w_trap_e) begin         // ecall
+      csr_mepc      <= P2_pc;
+      csr_mcause    <= 32'd11;
+      csr_mstatus[7]<= csr_mstatus[3];
+      csr_mstatus[3]<= 1'b0;
+    end else if (w_trap_r) begin         // mret: 復帰
+      csr_mstatus[3]<= csr_mstatus[7];   // MIE  <- MPIE
+      csr_mstatus[7]<= 1'b1;
+    end else if (P2_csr & P2_v) begin    // csrrw / csrrs
+      case (P2_csraddr)
+        12'h305: if (w_csr_we) csr_mtvec    <= w_csr_new;
+        12'h341: if (w_csr_we) csr_mepc     <= w_csr_new;
+        12'h342: if (w_csr_we) csr_mcause   <= w_csr_new;
+        12'h340: if (w_csr_we) csr_mscratch <= w_csr_new;
+        12'h300: if (w_csr_we) csr_mstatus  <= w_csr_new;
+        12'h304: if (w_csr_we) csr_mie      <= w_csr_new;
+      endcase
+    end
+  end
+
 endmodule
 
 // ============================================================
@@ -288,10 +349,12 @@ endmodule
 //   0x0003_0004 : 共有カウンタ (R/W。排他はソフトのロックで保証)
 //   0x0003_000C : done フラグ  書込値をORで蓄積(各コアが 1<<hartid を書く)
 // ============================================================
+//   0x0003_0010 : IPI送信  書込値のbitで対象コア(bit0=core0,bit1=core1)のpendingを立てる
+//   0x0003_0014 : IPI ack   書込で自コアのpendingをクリア
 module m_shared(w_clk,
   w_adr0, w_wd0, w_we0, w_rdreq0, w_rd0,
   w_adr1, w_wd1, w_we1, w_rdreq1, w_rd1,
-  r_counter, r_done, r_lock);
+  r_counter, r_done, r_lock, r_ipi0, r_ipi1);
   input  wire w_clk;
   input  wire [31:0] w_adr0, w_wd0, w_adr1, w_wd1;
   input  wire w_we0, w_rdreq0, w_we1, w_rdreq1;
@@ -299,6 +362,7 @@ module m_shared(w_clk,
   output reg  [31:0] r_counter = 0;
   output reg  [31:0] r_done = 0;
   output reg  r_lock = 0;
+  output reg  r_ipi0 = 0, r_ipi1 = 0;          // 各コア宛のIPI保留
 
   // アドレスデコード(各ポート)
   wire lk0=(w_adr0==32'h0003_0000), ct0=(w_adr0==32'h0003_0004), dn0=(w_adr0==32'h0003_000C);
@@ -314,12 +378,19 @@ module m_shared(w_clk,
   assign w_rd1 = lk1 ? {31'd0, r_lock | acq0} : ct1 ? r_counter : 32'd0;
   // カウンタ書込(排他はソフト保証。念のためcore0優先)
   wire cwr0=w_we0&ct0, cwr1=w_we1&ct1;
+  // ---- IPI: 送信(0x30010)/ack(0x30014) ----
+  wire sn0=w_we0&(w_adr0==32'h0003_0010), sn1=w_we1&(w_adr1==32'h0003_0010);
+  wire ak0=w_we0&(w_adr0==32'h0003_0014), ak1=w_we1&(w_adr1==32'h0003_0014);
+  wire set0 = (sn0&w_wd0[0]) | (sn1&w_wd1[0]);   // core0宛
+  wire set1 = (sn0&w_wd0[1]) | (sn1&w_wd1[1]);   // core1宛
   always @(posedge w_clk) begin
     if (rel0 | rel1)        r_lock <= 1'b0;      // 解放優先
     else if (acq0 | acq1)   r_lock <= 1'b1;      // 取得
     if      (cwr0)          r_counter <= w_wd0;
     else if (cwr1)          r_counter <= w_wd1;
     r_done <= r_done | (w_we0&dn0 ? w_wd0 : 0) | (w_we1&dn1 ? w_wd1 : 0);
+    r_ipi0 <= set0 ? 1'b1 : (ak0 ? 1'b0 : r_ipi0);   // set優先(送信とackが競合しても保留維持)
+    r_ipi1 <= set1 ? 1'b1 : (ak1 ? 1'b0 : r_ipi1);
   end
 endmodule
 
@@ -329,9 +400,10 @@ module m_top_kv260;
   wire [31:0] a0,d0, a1,d1, r0,r1;
   wire we0,rq0, we1,rq1;
   wire [31:0] w_counter, w_done;
+  wire w_ipi0, w_ipi1;
   clk_bd_wrapper m0 (.pl_clk0(w_clk));
-  m_smpcore c0 (w_clk, 2'd0, a0,d0,we0,rq0, r0);
-  m_smpcore c1 (w_clk, 2'd1, a1,d1,we1,rq1, r1);
-  m_shared  sh (w_clk, a0,d0,we0,rq0,r0, a1,d1,we1,rq1,r1, w_counter, w_done, );
-  vio_0 v (w_clk, w_counter, w_done);   // VIO: 共有カウンタ / done
+  m_smpcore c0 (w_clk, 2'd0, a0,d0,we0,rq0, r0, w_ipi0);
+  m_smpcore c1 (w_clk, 2'd1, a1,d1,we1,rq1, r1, w_ipi1);
+  m_shared  sh (w_clk, a0,d0,we0,rq0,r0, a1,d1,we1,rq1,r1, w_counter, w_done, , w_ipi0, w_ipi1);
+  vio_0 v (w_clk, w_counter, w_done);   // VIO: 共有カウンタ(受信IPI数) / done
 endmodule
