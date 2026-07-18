@@ -680,14 +680,14 @@ module m_kshared(w_clk, a0,wd0,we0,rq0,rd0, a1,wd1,we1,rq1,rd1,
   end
 endmodule
 
-// ---- 共有RAM(デュアルポートBRAM 4KB, 0x0007_xxxx): スレッドTCB/スタック ----
+// ---- 共有RAM(デュアルポートBRAM 16KB, 0x0007_xxxx): スレッドTCB/スタック ----
 module m_ksram(w_clk, a0,we0,be0,wd0,rd0, a1,we1,be1,wd1,rd1);
   input  wire w_clk;
   input  wire [31:0] a0,wd0,a1,wd1;
   input  wire we0,we1;  input wire [3:0] be0,be1;
   output wire [31:0] rd0,rd1;
-  reg [31:0] mem [0:1023];
-  wire [9:0] i0=a0[11:2], i1=a1[11:2];
+  reg [31:0] mem [0:4095];
+  wire [11:0] i0=a0[13:2], i1=a1[13:2];
   assign rd0=mem[i0];  assign rd1=mem[i1];
   always @(posedge w_clk) begin
     if (we0) begin
@@ -697,7 +697,7 @@ module m_ksram(w_clk, a0,we0,be0,wd0,rd0, a1,we1,be1,wd1,rd1);
       if(be1[0])mem[i1][7:0]<=wd1[7:0];     if(be1[1])mem[i1][15:8]<=wd1[15:8];
       if(be1[2])mem[i1][23:16]<=wd1[23:16]; if(be1[3])mem[i1][31:24]<=wd1[31:24]; end
   end
-  integer i; initial for(i=0;i<1024;i=i+1) mem[i]=32'd0;
+  integer i; initial for(i=0;i<4096;i=i+1) mem[i]=32'd0;
 endmodule
 
 // ---- KV260 top: 2×m_kcore + 共有UART/共有ブロック/共有RAM + VIO ----

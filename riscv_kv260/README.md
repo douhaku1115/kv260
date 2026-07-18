@@ -909,5 +909,34 @@ KOZOS> rsum 1000
 core1: 500500               <- 第2コアが計算した結果
 ```
 
-次: 段B2 = KOZOS カーネル自体の SMP 化（TCB/スレッドスタックを共有 RAM へ、カーネルロック、
-per-hart current、両コアで ksched、ps に hart 列）。
+### 本コアで KOZOS SMP（段B2: カーネル SMP 化）— 第5段-14 完結
+
+KOZOS カーネル自体を SMP 化した（`gcc/kozos_smp.c`）。**対話シェルを持つ本物の SMP OS** になった。
+
+- **TCB とスレッドスタックを共有 RAM（16KB に拡大）へ**移し、**両コアが同じ `ksched` を実行**。
+  カーネルはハードウェア TAS ロック（`0x60000`）で直列化（トラップ中= MIE0 で取得するので
+  自コアのプリエンプションとはデッドロックしない。ユーザ文脈からは `int_off → klock` の順）。
+- **スレッド配置**: shell(t0) は hart0 固定（UART RX/MEIE が core0 のみ）。worker(t1..t4) は**両コアを移動**。
+  idle は hart ごとに 1 本（t5=hart0, t6=hart1）。`ST_RUN` 状態を導入し他コアの実行中スレッドを選ばない。
+- ticks は hart0 のタイマだけが進める（sleep 起床も hart0 側で処理）。タイマ位相は hart で
+  ずらし（1000/1300）、両コアのスケジューリング機会を分散。
+- `ps` に **h 列（最後に実行した hart）**を追加。`smp` は各 hart の現スレッドを表示。
+
+sim（`run`×3 でワーカー3本起動後の `ps`）:
+
+```
+KOZOS> ps
+ t0 RUN   pri=2 h=0 cnt=0     <- シェル(hart0)
+ t1 READY pri=1 h=0 cnt=24
+ t2 RUN   pri=1 h=1 cnt=21    <- いままさに hart1 で実行中
+ t3 READY pri=1 h=1 cnt=18
+ t5 READY pri=0 h=0 cnt=0
+ t6 RUN   pri=0 h=1 cnt=0
+KOZOS> smp
+hart0: t0  hart1: t6
+KOZOS> sum
+5050                          <- 回帰 OK
+```
+
+ワーカーが h=0/h=1 に分散し、シェルが応答しつつ**もう一方のコアでスレッドが並列実行**されている。
+教科書の最小コアから始めた自作 CPU が、**対話シェル付きデュアルコア SMP OS** まで到達した。
