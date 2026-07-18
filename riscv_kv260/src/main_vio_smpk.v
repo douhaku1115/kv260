@@ -295,6 +295,8 @@ module m_kcore(w_clk, w_hartid, r_rslt, r_done,
   reg [31:0] P2_r1=0, P2_s2=0, P2_r2=0, P2_tpc=0;
   reg [31:0] P3_alu, P3_in3, P4_alu=0, P4_ldd=0;
   reg P2_r=0, P2_s=0, P2_b=0, P2_ld=0, P4_s=0, P4_b=0, P4_ld=0;
+  reg P4_sram=0;                   // P4のロードが共有RAM(0x0007)由来か
+  reg [2:0] P4_f3=0;  reg [1:0] P4_boff=0;   // 共有RAMロードのP4段での幅/符号抽出用
   reg P3_s=0, P3_b=0, P3_ld=0;
   reg P2_sub=0, P2_sra=0, P2_jal=0, P2_jalr=0, P2_lui=0, P2_auipc=0, P2_usef3=0;
   reg P2_csr=0, P2_ecall=0, P2_mret=0;          // CSR/例外(第2段統合)
@@ -450,6 +452,8 @@ module m_kcore(w_clk, w_hartid, r_rslt, r_done,
     {P3_s, P3_b, P3_ld} <= {P2_s, P2_b, P2_ld};
     {P4_pc, P4_s, P4_b, P4_ld} <= {P3_pc, P3_s, P3_b, P3_ld};
     {P4_alu, P4_ldd, P4_rd} <= {P3_alu, w_ldd, P3_rd};
+    P4_sram <= (P3_alu[31:16]==16'h0007) & P3_ld & P3_v;   // 共有RAMロード(同期読みBRAM)
+    {P4_f3, P4_boff} <= {P3_f3, P3_alu[1:0]};              // P4段での幅/符号抽出用
   end
 
   // ---- MEM: アドレスデコード + バイト/ハーフ ld/st ----
@@ -471,10 +475,10 @@ module m_kcore(w_clk, w_hartid, r_rslt, r_done,
        (P3_alu==32'h0003_0004) ? mtimecmp[63:32] :
        (P3_alu==32'h0003_0008) ? mtime[31:0]     :
        (P3_alu==32'h0003_000C) ? mtime[63:32]    : 32'd0;
-  // ロード対象の生ワード: text/rodata(0x0000)=IMEM, 共有RAM(0x0007)=w_sr_rd, DMEM=w_word
+  // ロード対象の生ワード: text/rodata(0x0000)=IMEM, DMEM=w_word
+  // (共有RAM 0x0007 は同期読みBRAM→P4段で w_sr_rd を直接使う。lw限定)
   wire w_is_imem = (P3_alu[31:16]==16'h0000);
-  wire [31:0] w_ld_word = w_is_imem ? w_imem_word :
-                          (P3_alu[31:16]==16'h0007) ? w_sr_rd : w_word;
+  wire [31:0] w_ld_word = w_is_imem ? w_imem_word : w_word;
   // 幅/符号拡張(imem/dmem共通)。タイマ領域はワード。
   wire [31:0] w_sh = w_ld_word >> (8*w_boff);
   wire [31:0] w_ldd_mem =
@@ -520,7 +524,16 @@ module m_kcore(w_clk, w_hartid, r_rslt, r_done,
     if (w_st & (P3_alu==32'h0005_0000)) r_bp_en <= P3_in3[0];        // 予測ON/OFF書換
   end
 
-  m_mux m10 (P4_alu, P4_ldd, P4_ld, w_rt);
+  // 共有RAMロード: BRAM読出レジスタからP4段で幅/符号抽出(lb/lbu/lh/lhu/lw対応)
+  wire [31:0] w_sr_sh  = w_sr_rd >> (8*P4_boff);
+  wire [31:0] w_sr_ext =
+       (P4_f3==3'b000) ? {{24{w_sr_sh[7]}},  w_sr_sh[7:0]}  :   // lb
+       (P4_f3==3'b100) ? {24'd0,             w_sr_sh[7:0]}  :   // lbu
+       (P4_f3==3'b001) ? {{16{w_sr_sh[15]}}, w_sr_sh[15:0]} :   // lh
+       (P4_f3==3'b101) ? {16'd0,             w_sr_sh[15:0]} :   // lhu
+                          w_sr_rd;                              // lw
+  wire [31:0] w_p4ld = P4_sram ? w_sr_ext : P4_ldd;
+  m_mux m10 (P4_alu, w_p4ld, P4_ld, w_rt);
 
   // ---- フォワーディング ----
   wire w_f3f = !P3_s & !P3_b & |P3_rd & P3_v;
@@ -680,22 +693,28 @@ module m_kshared(w_clk, a0,wd0,we0,rq0,rd0, a1,wd1,we1,rq1,rd1,
   end
 endmodule
 
-// ---- 共有RAM(デュアルポートBRAM 16KB, 0x0007_xxxx): スレッドTCB/スタック ----
+// ---- 共有RAM(真デュアルポートBRAM 16KB, 0x0007_xxxx): スレッドTCB/スタック ----
+//   BRAM必須の同期読み(1サイクル遅れ)。コア側はP4(WB)段で読出レジスタを使うのでストール不要。
+//   制約: 共有RAMのロードはlwのみ(バイト/ハーフ読み不可。書込はbyte-enable対応)。
+//   ポートごとに独立alwaysブロック=VivadoのTDP BRAM推論パターン。
 module m_ksram(w_clk, a0,we0,be0,wd0,rd0, a1,we1,be1,wd1,rd1);
   input  wire w_clk;
   input  wire [31:0] a0,wd0,a1,wd1;
   input  wire we0,we1;  input wire [3:0] be0,be1;
-  output wire [31:0] rd0,rd1;
+  output reg [31:0] rd0,rd1;
   reg [31:0] mem [0:4095];
   wire [11:0] i0=a0[13:2], i1=a1[13:2];
-  assign rd0=mem[i0];  assign rd1=mem[i1];
-  always @(posedge w_clk) begin
+  always @(posedge w_clk) begin        // port0
     if (we0) begin
       if(be0[0])mem[i0][7:0]<=wd0[7:0];     if(be0[1])mem[i0][15:8]<=wd0[15:8];
       if(be0[2])mem[i0][23:16]<=wd0[23:16]; if(be0[3])mem[i0][31:24]<=wd0[31:24]; end
+    rd0 <= mem[i0];
+  end
+  always @(posedge w_clk) begin        // port1
     if (we1) begin
       if(be1[0])mem[i1][7:0]<=wd1[7:0];     if(be1[1])mem[i1][15:8]<=wd1[15:8];
       if(be1[2])mem[i1][23:16]<=wd1[23:16]; if(be1[3])mem[i1][31:24]<=wd1[31:24]; end
+    rd1 <= mem[i1];
   end
   integer i; initial for(i=0;i<4096;i=i+1) mem[i]=32'd0;
 endmodule
