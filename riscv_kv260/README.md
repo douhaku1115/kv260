@@ -735,6 +735,22 @@ ret=1010
 
 sim で `.data`（初期値）・`.bss`（ゼロ初期化依存）・グローバル配列・再帰関数（gcd）を確認。**実機で `ret=1010`（一致 18/18 語）確認済み**。
 
+### SD自動起動 — 第5段-11
+
+**電源ONだけで自作RISC-V＋KOZOSが立ち上がる**ようにした。PetaLinuxプロジェクトに
+systemdサービス（`riscv-load.service` = fpgautil＋pl_clk0設定）とビットストリームを焼き込み、
+SDカードから起動する。毎回の scp→fpgautil→devmem の手動3手順が不要になる。
+
+```
+電源ON → U-Boot(QSPI) → SDのboot.scr → uEnv.txt
+  → 自ビルドカーネル + SD ext4 rootfs → systemd → riscv-load.service → KOZOS>
+```
+
+部品（Yoctoレシピ・uEnv.txt）と組み立て手順・ハマりどころ4件
+（pmu-firmwareの`VERSAL_PLM`バグ、`IMAGE_BOOT_FILES`のimage.ub、
+巨大initramfsのRAM起動ハング→SD ext4 root化、rootfs.ext4の鮮度）は
+[`sdboot/README.md`](sdboot/README.md) にまとめた。SDを抜けば従来の純正QSPI Linuxに戻る。
+
 #### ローダの堅牢化（シリアル雑音耐性）＋ 送信スクリプト
 
 hex を手貼りすると UART RX FIFO（16B）溢れや、ポートのライン揺れで紛れ込む雑音バイトにより **語がずれて誤ロード**することがあった（`read_hex_word` が 16 進以外の文字を「0 の語」と数えてしまうため）。

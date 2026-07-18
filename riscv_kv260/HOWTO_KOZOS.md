@@ -34,9 +34,23 @@
   ```
   `ID_MODEL=FT232R` の行の番号(例 `/dev/ttyUSB4`)を使う。`ML_Carrier_Card` はKV260本体なので違う。
 
-## 3. 起動手順 (電源ON後、毎回)
+## 3. 起動手順
 
-KV260はRAM rootfsで再起動するとbitが消えるので、毎回このscp→ロードが要る。
+### 3a. SD自動起動 (2026-07-18完成・推奨)
+
+**RISC-V自動起動SDカード**(kv260_audioプロジェクトでビルド)を挿して電源ONするだけ。
+- 電源ON → SDからLinux起動 → riscv-load.service が自動で fpgautil+pl_clk0 → KOZOS稼働
+- あとは 2. の tio で接続すれば `KOZOS>`(手順4へ)
+- 確認: KV260にsshして `systemctl status riscv-load` が SUCCESS
+- 仕組み: SDのbootパーティションの uEnv.txt が「カーネル単体+SD ext4 root」で起動
+  (root=/dev/mmcblk1p2 rootwait。image.ub/巨大initramfsのRAM起動はハングするので使わない)
+- **QSPI純正Linuxに戻すには SDを抜いて電源ON**(従来のQSPI起動になる)
+- SDを作り直す時の注意は memory の project_riscv_kozos 5-11 参照
+  (IMAGE_BOOT_FILESにimage.ub / rootfs.ext4の鮮度 / uEnv.txt)
+
+### 3b. 手動ロード (QSPI起動時・従来の方法)
+
+QSPI起動(SD無し)のLinuxはRAM rootfsで再起動するとbitが消えるので、毎回このscp→ロードが要る。
 
 ```
 # ホストPCで:

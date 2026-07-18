@@ -1,0 +1,2 @@
+bootargs=earlycon console=ttyPS1,115200 root=/dev/mmcblk1p2 rw rootwait cma=256M
+uenvcmd=fatload ${devtype} ${devnum}:${distro_bootpart} 0x00200000 Image; booti 0x00200000 - ${fdtcontroladdr}

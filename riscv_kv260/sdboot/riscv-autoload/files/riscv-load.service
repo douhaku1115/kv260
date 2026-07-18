@@ -1,0 +1,11 @@
+[Unit]
+Description=Load RISC-V(KOZOS) bitstream into PL and enable pl_clk0
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/riscv-load.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
