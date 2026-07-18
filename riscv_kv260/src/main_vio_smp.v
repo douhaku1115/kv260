@@ -164,7 +164,11 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
   reg [11:0] P2_csraddr=0;
   reg [31:0] csr_mtvec=0, csr_mepc=0, csr_mcause=0, csr_mscratch=0;
   reg [31:0] csr_mstatus=0;    // bit3=MIE, bit7=MPIE
-  reg [31:0] csr_mie=0;        // bit3=MSIE(ソフトウェア割込み許可=IPI)
+  reg [31:0] csr_mie=0;        // bit3=MSIE(IPI許可), bit7=MTIE(タイマ許可)
+  // ---- per-core タイマ(プリエンプション用, MMIO 0x0006_xxxx) ----
+  reg [63:0] mtime=0;                                  // 自走カウンタ(毎サイクル+1)
+  reg [63:0] mtimecmp=64'hFFFF_FFFF_FFFF_FFFF;
+  wire w_mtip = (mtime >= mtimecmp);                   // mip.MTIP
   reg [31:0] P2_r1=0, P2_s2=0, P2_r2=0, P2_tpc=0;
   reg [31:0] P3_alu, P3_in3, P4_alu=0, P4_ldd=0;
   reg P2_r=0, P2_s=0, P2_b=0, P2_ld=0, P4_s=0, P4_b=0, P4_ld=0;
@@ -208,7 +212,7 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
        (P2_csraddr==12'h340) ? csr_mscratch :
        (P2_csraddr==12'h300) ? csr_mstatus :
        (P2_csraddr==12'h304) ? csr_mie :
-       (P2_csraddr==12'h344) ? {28'd0, w_ipi_pend, 3'd0} :  // mip: bit3=MSIP(IPI保留)
+       (P2_csraddr==12'h344) ? {24'd0, w_mtip, 3'd0, w_ipi_pend, 3'd0} :  // mip: bit7=MTIP,bit3=MSIP
                                32'd0;
   wire [31:0] w_csr_new = (P2_f3==3'b010) ? (w_csr_old | w_in1) : w_in1;  // csrrs=OR / csrrw=上書
   wire w_csr_we = P2_csr & P2_v & ~((P2_f3==3'b010) & (P2_rs1==5'd0));
@@ -220,7 +224,9 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
   wire w_take_jalr = P2_jalr& P2_v;
   wire w_trap_e    = P2_ecall & P2_v;               // ecall
   wire w_trap_r    = P2_mret  & P2_v;               // mret
-  wire w_irq       = csr_mstatus[3] & csr_mie[3] & w_ipi_pend;  // MIE & MSIE & IPI保留
+  wire w_tmr_pend  = csr_mie[7] & w_mtip;                        // タイマ割込み保留
+  wire w_ipi_p     = csr_mie[3] & w_ipi_pend;                    // IPI割込み保留
+  wire w_irq       = csr_mstatus[3] & (w_tmr_pend | w_ipi_p);    // MIE & (MTIE&MTIP | MSIE&IPI)
   wire w_take_irq  = w_irq & P2_v & ~P2_ecall & ~P2_mret;
   wire w_redir     = w_take_irq | w_take_b | w_take_jal | w_take_jalr | w_trap_e | w_trap_r;
   assign w_pcin = (w_take_irq | w_trap_e)  ? csr_mtvec :          // 割込み/ecall: ->mtvec
@@ -300,10 +306,23 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
   assign w_sh_wd    = P3_in3;
   assign w_sh_we    = w_st & w_is_shared;                 // 共有への書込(解放/カウンタ/done)
   assign w_sh_rdreq = P3_ld & P3_v & w_is_shared;         // 共有の読み(lockのTAS副作用に必要)
-  // ロード: 共有/hartidを優先、それ以外は私有DMEMから幅/符号拡張
+  // ---- per-core タイマ MMIO(0x0006_xxxx) ----
+  wire w_is_timer = (P3_alu[31:16]==16'h0006);
+  wire [31:0] w_timer_rd =
+       (P3_alu==32'h0006_0000) ? mtimecmp[31:0]  :
+       (P3_alu==32'h0006_0004) ? mtimecmp[63:32] :
+       (P3_alu==32'h0006_0008) ? mtime[31:0]     :
+       (P3_alu==32'h0006_000C) ? mtime[63:32]    : 32'd0;
+  always @(posedge w_clk) begin
+    mtime <= mtime + 64'd1;
+    if (w_st & (P3_alu==32'h0006_0000)) mtimecmp[31:0]  <= P3_in3;
+    if (w_st & (P3_alu==32'h0006_0004)) mtimecmp[63:32] <= P3_in3;
+  end
+  // ロード: 共有/hartid/タイマを優先、それ以外は私有DMEMから幅/符号拡張
   wire [31:0] w_sh = w_word >> (8*w_boff);
   assign w_ldd = w_is_hartid ? {30'd0, w_hartid}       :   // hartid
                  w_is_shared ? w_sh_rd                 :   // lock/counter(外部共有)
+                 w_is_timer  ? w_timer_rd              :   // タイマ(mtime/mtimecmp)
                  (P3_f3==3'b000) ? {{24{w_sh[7]}},  w_sh[7:0]}  :   // lb
                  (P3_f3==3'b100) ? {24'd0,          w_sh[7:0]}  :   // lbu
                  (P3_f3==3'b001) ? {{16{w_sh[15]}}, w_sh[15:0]} :   // lh
@@ -329,7 +348,7 @@ module m_smpcore(w_clk, w_hartid, w_sh_adr, w_sh_wd, w_sh_we, w_sh_rdreq, w_sh_r
   always @(posedge w_clk) if (!w_lduse) begin
     if (w_take_irq) begin                // IPI割込みエントリ(P2命令に相乗り→復帰点)
       csr_mepc      <= P2_pc;
-      csr_mcause    <= 32'h8000_0003;    // Interrupt + code3(machine software=IPI)
+      csr_mcause    <= w_tmr_pend ? 32'h8000_0007 : 32'h8000_0003;  // タイマ(7)/ソフトウェア=IPI(3)
       csr_mstatus[7]<= csr_mstatus[3];   // MPIE <- MIE
       csr_mstatus[3]<= 1'b0;             // MIE  <- 0
     end else if (w_trap_e) begin         // ecall
