@@ -233,6 +233,42 @@ module m_am_dmem(w_clk, w_adr, w_we, w_be, w_wd, w_rd, w_fadr, w_finsn);
   integer i; initial for (i=0; i<4096; i=i+1) mem[i] = 32'd0;
 endmodule
 
+// ---- BTB(分岐先キャッシュ): 64エントリ index=pc[7:2], tag=pc[31:8] ----
+//   tag+indexでフルPC[31:2]一致=精密(非分岐PCへの誤ヒット無し)。分岐コミット時に書込。
+module m_btb(w_clk, w_rpc, w_hit, w_tgt, w_wpc, w_we, w_wtgt);
+  input  wire w_clk, w_we;
+  input  wire [31:0] w_rpc, w_wpc, w_wtgt;
+  output wire w_hit;
+  output wire [31:0] w_tgt;
+  reg [56:0] mem [0:63];                    // {valid(1), tag=pc[31:8](24), target(32)}
+  always @(posedge w_clk) if (w_we) mem[w_wpc[7:2]] <= {1'b1, w_wpc[31:8], w_wtgt};
+  wire w_v; wire [23:0] w_tag; wire [31:0] w_data;
+  assign {w_v, w_tag, w_data} = mem[w_rpc[7:2]];
+  assign w_hit = w_v & (w_tag == w_rpc[31:8]);
+  assign w_tgt = w_data;
+  integer i; initial for (i=0;i<64;i=i+1) mem[i]=0;
+endmodule
+
+// ---- gshare 予測器: 64エントリPHT(2bit飽和), index=pc[7:2]^BHR(6bit) ----
+//   予測=cnt[1]。分岐解決(w_tkn)でカウンタ更新+BHRシフト。初期値1(weakly not-taken)。
+module m_gshare(w_clk, w_rpc, w_pred, w_wpc, w_we, w_tkn);
+  input  wire w_clk, w_we;
+  input  wire [31:0] w_rpc, w_wpc;
+  input  wire w_tkn;
+  output wire w_pred;
+  reg [1:0] mem [0:63];
+  reg [5:0] r_bhr = 0;
+  wire [5:0] w_ridx = w_rpc[7:2] ^ r_bhr;
+  wire [5:0] w_widx = w_wpc[7:2] ^ r_bhr;
+  assign w_pred = mem[w_ridx][1];
+  wire [1:0] w_cnt = mem[w_widx];
+  always @(posedge w_clk) if (w_we) begin
+    mem[w_widx] <= (w_cnt<3 & w_tkn) ? w_cnt+2'd1 : (w_cnt>0 & !w_tkn) ? w_cnt-2'd1 : w_cnt;
+    r_bhr <= {w_tkn, r_bhr[5:1]};
+  end
+  integer i; initial for (i=0;i<64;i=i+1) mem[i]=2'd1;
+endmodule
+
 // ============================================================
 // 5段パイプライン 完全RV32I
 // ============================================================
@@ -312,9 +348,19 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   // 除算がEX段で計算中はパイプラインを停止(結果完了 r_ddone まで)
   wire w_div_stall = P2_m & P2_f3[2] & P2_v & ~r_ddone;
 
-  // ---- リダイレクト(P2境界): 割込み > 分岐/ジャンプ/トラップ ----
-  wire w_brcond;
-  wire w_take_b    = P2_b   & w_brcond & P2_v;
+  // ---- 分岐予測(BTB+gshare): 条件分岐をフェッチ段で予測 ----
+  reg  r_bp_en = 1'b1;                  // 予測ON/OFF(A/B測定, MMIO 0x0005_0000で書換)
+  reg  [31:0] r_bp_miss=0, r_bp_brn=0;  // 観測: ミス予測回数 / コミット分岐回数
+  wire w_brcond;                        // m_bru の分岐条件(後段でassign)
+  wire w_bp_hit, w_bp_pred;  wire [31:0] w_bp_tgt;
+  wire w_br_commit = P2_b & P2_v & !w_stall;     // 分岐が1回処理される
+  m_btb    mbtb (w_clk, r_pc, w_bp_hit, w_bp_tgt, P2_pc, w_br_commit, P2_tpc);
+  m_gshare mgsh (w_clk, r_pc, w_bp_pred, P2_pc, w_br_commit, w_brcond);
+  wire w_bp_tkn = r_bp_en & w_bp_hit & w_bp_pred;             // 投機taken
+  wire [31:0] w_br_truepc = (P2_b & P2_v & w_brcond) ? P2_tpc : (P2_pc + 32'd4);
+  wire w_bmiss = P2_b & P2_v & P1_v & (P1_pc != w_br_truepc); // 予測ミス(P1の実フェッチ先≠真の次PC)
+
+  // ---- リダイレクト(P2境界): 割込み > 分岐ミス/ジャンプ/トラップ ----
   wire w_take_jal  = P2_jal & P2_v;
   wire w_take_jalr = P2_jalr& P2_v;
   wire w_trap_e    = P2_ecall & P2_v;               // ecall
@@ -325,12 +371,22 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   wire w_tmr_pend  = csr_mie[7]  & w_mtip;           // タイマ割込み
   wire w_irq       = csr_mstatus[3] & (w_ext_pend | w_tmr_pend);
   wire w_take_irq  = w_irq & P2_v & ~P2_ecall & ~P2_mret & ~w_div_stall;  // 除算中は保留(完了後に受理)
-  wire w_redir     = w_take_irq | w_take_b | w_take_jal | w_take_jalr | w_trap_e | w_trap_r;
+  wire w_redir     = w_take_irq | w_bmiss | w_take_jal | w_take_jalr | w_trap_e | w_trap_r;
   assign w_pcin = (w_take_irq | w_trap_e)  ? csr_mtvec :          // 割込み/ecall: ->mtvec
                   (w_trap_r)               ? csr_mepc :           // mret : ->mepc
                   (w_take_jalr)            ? (w_alu & ~32'd1) :    // jalr: (rs1+imm)&~1
-                  (w_take_b | w_take_jal)  ? P2_tpc :             // branch/jal: pc+imm
-                                             w_npc;               // pc+4
+                  (w_take_jal)             ? P2_tpc :             // jal: pc+imm(予測対象外)
+                  (w_bmiss)                ? w_br_truepc :        // 分岐ミス回復: 真の次PCへ
+                  (w_bp_tkn)               ? w_bp_tgt :           // 投機: 予測taken先へ
+                                             w_npc;               // pc+4(逐次/予測not-taken)
+  // ---- 観測カウンタ(0x0005_0004書込でリセット) ----
+  always @(posedge w_clk) begin
+    if (w_st & (P3_alu==32'h0005_0004)) begin r_bp_miss<=0; r_bp_brn<=0; end
+    else begin
+      if (w_bmiss & !w_stall) r_bp_miss <= r_bp_miss + 32'd1;
+      if (w_br_commit)        r_bp_brn  <= r_bp_brn  + 32'd1;
+    end
+  end
 
   wire w_lduse = P3_v & P3_ld &
        ((P3_rd==P2_rs1) | ((P3_rd==P2_rs2) & (P2_r | P2_b | P2_s)));
@@ -426,13 +482,22 @@ module m_proc_console(w_clk, r_rslt, r_done, uart_tx, uart_rx);
   m_uart_tx #(.DIV(`UARTDIV)) u_tx (w_clk, w_uart_tx_we, P3_in3[7:0], uart_tx, w_tx_full);
   m_uart_rx #(.DIV(`UARTDIV)) u_rx (w_clk, uart_rx, w_uart_rx_rd, w_rx_byte, w_rx_valid);
 
-  assign w_ldd = w_is_uart ? w_uart_rd : w_is_timer ? w_timer_rd : w_ldd_mem;
+  // ---- 分岐予測 MMIO(0x0005_xxxx): en書換/カウンタ読出(A/B測定用) ----
+  wire w_is_bp = (P3_alu[31:16]==16'h0005);
+  wire [31:0] w_bp_rd =
+       (P3_alu==32'h0005_0000) ? {31'd0, r_bp_en} :   // 予測ON/OFF
+       (P3_alu==32'h0005_0004) ? r_bp_miss        :   // ミス予測回数
+       (P3_alu==32'h0005_0008) ? r_bp_brn         :   // コミット分岐回数
+                                 32'd0;
 
-  // ---- mtime 自走 + mtimecmp ストア ----
+  assign w_ldd = w_is_uart ? w_uart_rd : w_is_timer ? w_timer_rd : w_is_bp ? w_bp_rd : w_ldd_mem;
+
+  // ---- mtime 自走 + mtimecmp ストア + 分岐予測制御 ----
   always @(posedge w_clk) begin
     mtime <= mtime + 64'd1;
     if (w_st & (P3_alu==32'h0003_0000)) mtimecmp[31:0]  <= P3_in3;   // mtimecmp lo
     if (w_st & (P3_alu==32'h0003_0004)) mtimecmp[63:32] <= P3_in3;   // mtimecmp hi
+    if (w_st & (P3_alu==32'h0005_0000)) r_bp_en <= P3_in3[0];        // 予測ON/OFF書換
   end
 
   m_mux m10 (P4_alu, P4_ldd, P4_ld, w_rt);
