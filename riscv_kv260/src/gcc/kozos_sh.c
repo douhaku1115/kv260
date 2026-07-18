@@ -131,9 +131,12 @@ static void cmd_kill(int id){
 }
 
 /* シリアルから16進ワードを1個読む(空白/改行はスキップ) */
+static int is_hex(int c){
+  return (c>='0'&&c<='9') || ((c|0x20)>='a'&&(c|0x20)<='f');
+}
 static unsigned read_hex_word(void){
   int c; unsigned v=0;
-  do{ c=get_c(); }while(c==' '||c=='\r'||c=='\n'||c=='\t');
+  do{ c=get_c(); }while(!is_hex(c));   // 16進数字が来るまでスキップ(空白+シリアル雑音を無視=語ずれ防止)
   for(;;){
     int d;
     if(c>='0'&&c<='9') d=c-'0';
