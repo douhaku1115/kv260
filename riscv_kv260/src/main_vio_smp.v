@@ -364,6 +364,12 @@ module m_shared(w_clk,
   output reg  r_lock = 0;
   output reg  r_ipi0 = 0, r_ipi1 = 0;          // 各コア宛のIPI保留
 
+  // 汎用共有レジスタ 8本(0x0003_0020..0x0003_003C): next_task/result/hart処理数 等に使用
+  reg [31:0] r_rf [0:7];
+  integer k; initial for (k=0;k<8;k=k+1) r_rf[k]=0;
+  wire rf0 = (w_adr0[31:5]==27'h1801);  wire [2:0] ix0 = w_adr0[4:2];
+  wire rf1 = (w_adr1[31:5]==27'h1801);  wire [2:0] ix1 = w_adr1[4:2];
+
   // アドレスデコード(各ポート)
   wire lk0=(w_adr0==32'h0003_0000), ct0=(w_adr0==32'h0003_0004), dn0=(w_adr0==32'h0003_000C);
   wire lk1=(w_adr1==32'h0003_0000), ct1=(w_adr1==32'h0003_0004), dn1=(w_adr1==32'h0003_000C);
@@ -374,8 +380,8 @@ module m_shared(w_clk,
   wire acq0 = tas0 & ~r_lock;
   wire acq1 = tas1 & ~r_lock & ~tas0;
   // 読みデータ: lock読=旧値(core1はcore0の同時取得を反映) / counter読
-  assign w_rd0 = lk0 ? {31'd0, r_lock}        : ct0 ? r_counter : 32'd0;
-  assign w_rd1 = lk1 ? {31'd0, r_lock | acq0} : ct1 ? r_counter : 32'd0;
+  assign w_rd0 = lk0 ? {31'd0, r_lock}        : ct0 ? r_counter : rf0 ? r_rf[ix0] : 32'd0;
+  assign w_rd1 = lk1 ? {31'd0, r_lock | acq0} : ct1 ? r_counter : rf1 ? r_rf[ix1] : 32'd0;
   // カウンタ書込(排他はソフト保証。念のためcore0優先)
   wire cwr0=w_we0&ct0, cwr1=w_we1&ct1;
   // ---- IPI: 送信(0x30010)/ack(0x30014) ----
@@ -391,6 +397,9 @@ module m_shared(w_clk,
     r_done <= r_done | (w_we0&dn0 ? w_wd0 : 0) | (w_we1&dn1 ? w_wd1 : 0);
     r_ipi0 <= set0 ? 1'b1 : (ak0 ? 1'b0 : r_ipi0);   // set優先(送信とackが競合しても保留維持)
     r_ipi1 <= set1 ? 1'b1 : (ak1 ? 1'b0 : r_ipi1);
+    // 汎用共有レジスタ書込(同一idx競合はcore0優先。排他はソフトのロックで保証)
+    if (w_we0 & rf0) r_rf[ix0] <= w_wd0;
+    if (w_we1 & rf1 & ~(w_we0 & rf0 & (ix0==ix1))) r_rf[ix1] <= w_wd1;
   end
 endmodule
 
