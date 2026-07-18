@@ -3,7 +3,7 @@ title: "自作RISC-VコアにRV32C(圧縮命令)を実装する：コード30%�
 emoji: "🗜️"
 type: "tech"
 topics: ["fpga", "kv260", "riscv", "verilog", "computerarchitecture"]
-published: false
+published: true
 ---
 
 ## はじめに
