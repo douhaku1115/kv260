@@ -93,8 +93,89 @@ Pmod I2S2 の ADC 入力(J5)は**ライン入力**。エレクトレットマイ
 
 ---
 
+## 段3: メロディ再生（きらきら星）
+
+固定トーンの NCO を拡張し、音階を切り替えてメロディを鳴らす（`i2s_melody.v` / `i2s2_melody`）。
+
+### 固定トーンからの変更点
+
+| | 段1（固定トーン） | 段3（メロディ） |
+|---|---|---|
+| 位相の進め方 | 1フレームごとに +1 | 24ビット位相アキュムレータに音ごとの増分を加算 |
+| 周波数 | fs/64 = 762Hz 固定 | 任意（増分で決まる） |
+
+```
+PHASE_INC = 周波数 × 2^24 / fs        (fs = 48828.125Hz → 係数 343.597)
+```
+
+| 音 | 周波数 | PHASE_INC |
+|---|---|---|
+| ド C4 | 261.63Hz | 89893 |
+| レ D4 | 293.66Hz | 100902 |
+| ミ E4 | 329.63Hz | 113258 |
+| ファ F4 | 349.23Hz | 119994 |
+| ソ G4 | 392.00Hz | 134687 |
+| ラ A4 | 440.00Hz | 151183 |
+| シ B4 | 493.88Hz | 169696 |
+| ド C5 | 523.25Hz | 179787 |
+
+シーケンサは `NOTE_LEN`（12000標本 ≒ 0.25秒）ごとに次の音へ進み、16音でループする。
+
+```bash
+vivado -mode batch -source build_melody.tcl
+# 生成物: vivado_melody/i2s2_melody.runs/impl_1/design_1_wrapper.bit
+```
+
+---
+
+## 段4: 音声ファイル再生
+
+内蔵メモリに焼き込んだ16ビットPCMを毎標本読み出して送出する（`i2s_player.v` / `i2s2_player`）。
+合成ではなく、実際の録音をそのまま鳴らす。
+
+```
+音源(MP3等) --ffmpeg--> 生PCM --raw2hex.py--> audio_rom.hex --$readmemh--> 内蔵メモリ
+```
+
+音声データの作り方は [`audio/README.md`](audio/README.md) を参照。
+音声データ自体は第三者の録音由来のためリポジトリには含めていない。
+
+```bash
+vivado -mode batch -source build_player.tcl
+# 生成物: vivado_player/i2s2_player.runs/impl_1/design_1_wrapper.bit
+```
+
+### 容量
+
+4秒（195312標本）で 3.12Mbit。内蔵メモリ 5.1Mbit の 61%。上限は6秒前後。
+
+---
+
+## ★書き込みは fpgautil を使う（重要）
+
+**Vivado の JTAG 書き込みでは PL クロックが供給されず、無音になる。**
+JTAG は PL のみを書き換え、PS 側の設定（クロック出力）を変更しないため。
+
+```bash
+# パソコン側（末尾の :~/ を忘れない。無いとローカルコピーになる）
+scp -O <bitファイル> petalinux@<KV260のIP>:~/player.bit
+
+# KV260 側
+sudo fpgautil -b ~/player.bit              # ← JTAG ではなくこれ
+sudo devmem 0xFF5E00C0 32 0x01010A00       # PLクロック有効化
+```
+
+止めるときは PL クロックを切る:
+
+```bash
+sudo devmem 0xFF5E00C0 32 0x00010A00
+```
+
+---
+
 ## 環境
 
 - ボード: Kria KV260 (xck26-sfvc784-2LV-c)
-- ツール: Vivado 2025.1
+- ツール: Vivado 2025.1 / 2025.2
 - Pmod: Digilent Pmod I2S2 (CS5343 ADC / CS4344 DAC)
+- OS: PetaLinux（ユーザー名 `petalinux`）

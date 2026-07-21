@@ -1,7 +1,17 @@
 vivado/
 vivado_loop/
+vivado_melody/
+vivado_player/
 simbuild/
 *.jou
 *.log
 *.str
 .Xil/
+dfx_runtime.txt
+
+# 音声データは第三者の録音由来のため配布しない
+# (変換手順は audio/raw2hex.py にあるので各自の音源で再現できる)
+audio/*.raw
+audio/*.hex
+audio/*.wav
+audio/*.mp3
