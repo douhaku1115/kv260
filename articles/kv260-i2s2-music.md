@@ -3,7 +3,7 @@ title: "KV260のFPGAでメロディと実際の録音を鳴らす（Pmod I2S2・
 emoji: "🎵"
 type: "tech"
 topics: ["fpga", "kv260", "verilog", "i2s", "vivado"]
-published: false
+published: true
 ---
 
 ## はじめに
