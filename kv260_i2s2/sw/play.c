@@ -28,7 +28,11 @@
 #include <unistd.h>
 #include <time.h>
 #include <termios.h>
+#include <math.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #define BASE_ADDR   0xA0000000UL
 #define MAP_SIZE    0x1000UL
@@ -55,6 +59,71 @@ static double now_sec(void)
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     return t.tv_sec + t.tv_nsec / 1e9;
+}
+
+/* ---- スペクトル: 音ブロックを FFT してパソコンへ送る ---- */
+#define NFFT   8192                 /* FFT点数（分解能 ≒ 48828/8192 ≒ 5.96Hz） */
+#define NSEND  840                  /* 送る低域ビン数（0〜約5000Hz） */
+
+/* 反復 radix-2 FFT（その場計算） */
+static void fft(float *re, float *im)
+{
+    int n = NFFT;
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) {
+            float t;
+            t = re[i]; re[i] = re[j]; re[j] = t;
+            t = im[i]; im[i] = im[j]; im[j] = t;
+        }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        double ang = -2.0 * M_PI / len;
+        float wr = cosf(ang), wi = sinf(ang);
+        for (int i = 0; i < n; i += len) {
+            float cr = 1, ci = 0;
+            for (int k = 0; k < len / 2; k++) {
+                float xr = re[i+k+len/2] * cr - im[i+k+len/2] * ci;
+                float xi = re[i+k+len/2] * ci + im[i+k+len/2] * cr;
+                re[i+k+len/2] = re[i+k] - xr;
+                im[i+k+len/2] = im[i+k] - xi;
+                re[i+k] += xr;
+                im[i+k] += xi;
+                float ncr = cr * wr - ci * wi;
+                ci = cr * wi + ci * wr;
+                cr = ncr;
+            }
+        }
+    }
+}
+
+/* スペクトル送信先(パソコン)。argv[2] で IP を指定されたら有効 */
+static int g_sock = -1;
+static struct sockaddr_in g_dest;
+
+/* 左ch標本(NFFT点)を FFT し、低域NSENDビンの振幅をパソコンへ UDP 送信する */
+static void fft_send(const int16_t *mono, double sec, double total_sec)
+{
+    static float re[NFFT], im[NFFT];
+    for (int i = 0; i < NFFT; i++) {
+        float w = 0.5f - 0.5f * cosf(2.0f * M_PI * i / (NFFT - 1)); /* Hann窓 */
+        re[i] = mono[i] * w;
+        im[i] = 0.0f;
+    }
+    fft(re, im);
+
+    static float mag[NSEND];
+    for (int k = 0; k < NSEND; k++)
+        mag[k] = sqrtf(re[k] * re[k] + im[k] * im[k]);
+
+    if (g_sock >= 0)
+        sendto(g_sock, mag, sizeof(mag), 0,
+               (struct sockaddr *)&g_dest, sizeof(g_dest));
+
+    printf("\r再生 %3.0f / %3.0f 秒", sec, total_sec);
+    fflush(stdout);
 }
 
 /* ---- 端末をキー1つずつ・非ブロッキングで読めるようにする ---- */
@@ -89,7 +158,7 @@ static int get_key(void)
 int main(int argc, char **argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "使い方: %s <生PCMファイル(16ビット単音48828Hz)>\n", argv[0]);
+        fprintf(stderr, "使い方: %s <生PCMファイル> [スペクトル送信先パソコンIP]\n", argv[0]);
         return 1;
     }
 
@@ -110,6 +179,16 @@ int main(int argc, char **argv)
     regs = (volatile uint32_t *)mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
                                      MAP_SHARED, fd, BASE_ADDR);
     if (regs == MAP_FAILED) { perror("mmap 失敗"); return 1; }
+
+    /* ---- スペクトルをパソコンへ送る(引数2でIP指定時) ---- */
+    if (argc >= 3) {
+        g_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        memset(&g_dest, 0, sizeof(g_dest));
+        g_dest.sin_family = AF_INET;
+        g_dest.sin_port   = htons(50007);
+        inet_pton(AF_INET, argv[2], &g_dest.sin_addr);
+        printf("スペクトルを %s:50007 へ送信します\n", argv[2]);
+    }
 
     /* ---- 自己診断: レジスタの読み書きができるか調べる ---- */
     printf("\n--- 自己診断 ---\n");
@@ -137,6 +216,8 @@ int main(int argc, char **argv)
     printf("再生開始   [f=10秒送り  b=10秒戻し  q=終了]\n");
 
     int16_t buf[CHUNK * 2];             /* 左右インターリーブ L,R,L,R... */
+    static int16_t accbuf[NFFT];        /* FFT用に左chを NFFT点ためる */
+    int     accn = 0;
     long played = 0;                    /* これまでに送った左右組数(=ファイル位置) */
     size_t n;
     double t_start = now_sec();
@@ -176,17 +257,13 @@ int main(int argc, char **argv)
             t_start = now_sec() - played / FS;   /* 経過表示を位置に合わせる */
         }
 
-        /* 1秒ごとに表示 */
-        static long last_shown = 0;
-        if (played - last_shown >= 48828 || key) {
-            last_shown = played;
-            uint32_t st = reg_read(REG_STATUS);
-            printf("\r再生 %.1f / %.1f 秒   経過 %.1f 秒   溜まり=%u %s%s     ",
-                   played / FS, total / FS, now_sec() - t_start,
-                   (st >> 16) & 0x3FFF,
-                   (st & ST_FULL)  ? "満杯" : "",
-                   (st & ST_EMPTY) ? "空"   : "");
-            fflush(stdout);
+        /* 左chを NFFT 点ためて、たまるごとに FFT して送信 */
+        for (size_t i = 0; i < n; i++) {
+            accbuf[accn++] = buf[2 * i];
+            if (accn >= NFFT) {
+                fft_send(accbuf, played / FS, total / FS);
+                accn = 0;
+            }
         }
     }
 

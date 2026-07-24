@@ -1,4 +1,4 @@
-# kv260_i2s2 — Pmod I2S2 で I2S 送受信（段1〜段7）
+# kv260_i2s2 — Pmod I2S2 で I2S 送受信（段1〜段8）
 
 KV260 の PL で I2S 送受信を組み、Pmod I2S2（CS5343 ADC / CS4344 DAC）で音を扱う。
 - **段1**: PL 生成のサイン波を I2S 送信し、DAC からイヤホンで鳴らす（`i2s_tx.v` / `i2s2_tone`）
@@ -8,6 +8,7 @@ KV260 の PL で I2S 送受信を組み、Pmod I2S2（CS5343 ADC / CS4344 DAC）
 - **段5**: PS→PL AXI ストリーミングで曲まるごと再生（`i2s_stream_axi.v` / `audio_fifo.v`、早送り対応）
 - **段6**: ステレオ化（FIFO32ビットで左右をまとめて流す）
 - **段7**: PL でのリアルタイム音声加工（音量・エコー、`audio_fx.v`）
+- **段8**: 再生中の音を FFT してパソコンにリアルタイムスペクトル表示（`spectrum_view.py`）
 
 ---
 
@@ -245,6 +246,32 @@ FIFO → [音量 ×GAIN] → [+ エコー(遅延0.25秒×ECHO)] → 16bit飽和 
 sudo devmem 0xA0000040 32 0x80   # エコーを入れる
 sudo devmem 0xA0000030 32 0x20   # 音量を半分に
 ```
+
+---
+
+## 段8: リアルタイムスペクトル表示
+
+再生中の音を FFT して周波数成分をパソコンにグラフ表示する。
+
+```
+KV260(play.c)                          パソコン(spectrum_view.py)
+  左chを8192点FFT ─ UDP:50007 ─> 840ビン(0〜5kHz) ─> matplotlibで線グラフ
+```
+
+- FFT は PS 側（`play.c`）で計算（反復 radix-2、8192点、分解能 ≒ 6Hz）
+- 低域 840 ビン（0〜約5kHz）の振幅を UDP でパソコンへ送る
+- パソコンの `sw/spectrum_view.py`（matplotlib）がリアルタイムに描画
+
+```bash
+# パソコン側（matplotlib が必要）
+pip install matplotlib numpy
+python sw/spectrum_view.py
+
+# KV260 側（第2引数にパソコンのIP。echo $SSH_CLIENT 等で確認）
+sudo ./play song.raw <パソコンのIP>
+```
+
+FFT を PL に載せれば KV260 単体で完結できる（今後の課題）。
 
 ---
 
