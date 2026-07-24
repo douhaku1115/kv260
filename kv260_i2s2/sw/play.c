@@ -8,11 +8,11 @@
  *   再生中のキー操作:
  *     f … 10秒送り   b … 10秒戻し   q … 終了
  *
- *   音源の作り方(パソコン側):
- *     ffmpeg -i 曲.mp3 -ac 1 -ar 48828 -f s16le -acodec pcm_s16le song.raw
+ *   音源の作り方(パソコン側): ステレオ(2ch)で変換する
+ *     ffmpeg -i 曲.mp3 -ac 2 -ar 48828 -f s16le -acodec pcm_s16le song.raw
  *
  *   レジスタ (ベース 0xA000_0000。0x10 刻みに整列。非整列だと読み出しが 0 になる):
- *     0x00 [W]  DATA   標本を1つ書き込む(下位16ビット)
+ *     0x00 [W]  DATA   左右1組を書き込む([31:16]=左, [15:0]=右, 各16ビット)
  *     0x10 [R]  STATUS bit0:満杯 bit1:空 bit29..16:溜まっている数
  *     0x20 [RW] CTRL   bit0:再生有効
  *
@@ -99,9 +99,9 @@ int main(int argc, char **argv)
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    long total = fsize / 2;
+    long total = fsize / 4;          /* ステレオ: 1組=左右2標本=4バイト */
     printf("ファイル : %s\n", argv[1]);
-    printf("標本数   : %ld\n", total);
+    printf("左右組数 : %ld\n", total);
     printf("再生時間 : %.1f 秒\n", total / FS);
 
     int fd = open("/dev/mem", O_RDWR | O_SYNC);
@@ -120,10 +120,10 @@ int main(int argc, char **argv)
            ctrl_back, (ctrl_back & 1) ? "(読み出し成功)" : "(読み出せていない)");
     printf("STATUS 生の値              : 0x%08X\n", st0);
 
-    /* 標本を数個書いてから溜まり具合が増えるか見る */
+    /* 数組書いてから溜まり具合が増えるか見る */
     for (int i = 0; i < 100; i++) reg_write(REG_DATA, 0);
     uint32_t st1 = reg_read(REG_STATUS);
-    printf("100標本書いた後の STATUS   : 0x%08X  溜まり=%u\n",
+    printf("100組書いた後の STATUS     : 0x%08X  溜まり=%u\n",
            st1, (st1 >> 16) & 0x3FFF);
 
     int status_ok = (ctrl_back & 1) ? 1 : 0;
@@ -136,19 +136,22 @@ int main(int argc, char **argv)
     reg_write(REG_CTRL, 1);
     printf("再生開始   [f=10秒送り  b=10秒戻し  q=終了]\n");
 
-    int16_t buf[CHUNK];
-    long played = 0;                    /* これまでに送った標本数(=ファイル位置) */
+    int16_t buf[CHUNK * 2];             /* 左右インターリーブ L,R,L,R... */
+    long played = 0;                    /* これまでに送った左右組数(=ファイル位置) */
     size_t n;
     double t_start = now_sec();
-    long seek_step = (long)(SEEK_SEC * FS);  /* 10秒ぶんの標本数 */
+    long seek_step = (long)(SEEK_SEC * FS);  /* 10秒ぶんの組数 */
 
-    while ((n = fread(buf, 2, CHUNK, fp)) > 0) {
+    while ((n = fread(buf, 4, CHUNK, fp)) > 0) {   /* n = 読めた組数 */
         for (size_t i = 0; i < n; i++) {
             if (status_ok) {
                 /* 満杯の間は待つ */
                 while (reg_read(REG_STATUS) & ST_FULL) usleep(500);
             }
-            reg_write(REG_DATA, (uint32_t)(uint16_t)buf[i]);
+            /* [31:16]=左, [15:0]=右 にまとめて1回で書く */
+            uint32_t lr = ((uint32_t)(uint16_t)buf[2 * i]     << 16)
+                        |  (uint32_t)(uint16_t)buf[2 * i + 1];
+            reg_write(REG_DATA, lr);
         }
         played += n;
 
@@ -168,7 +171,7 @@ int main(int argc, char **argv)
             long np = (key == 'f') ? played + seek_step : played - seek_step;
             if (np < 0)     np = 0;
             if (np > total) np = total;
-            fseek(fp, np * 2, SEEK_SET);
+            fseek(fp, np * 4, SEEK_SET);    /* 1組=4バイト */
             played  = np;
             t_start = now_sec() - played / FS;   /* 経過表示を位置に合わせる */
         }

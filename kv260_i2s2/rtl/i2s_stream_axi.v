@@ -1,9 +1,11 @@
 // -----------------------------------------------------------------------------
-// i2s_stream_axi.v -- 段5: 長時間再生（PS から流し込む方式）
+// i2s_stream_axi.v -- 段5: 長時間再生（PS から流し込む方式・ステレオ）
 //
-//   PS(Linux)が音声標本を AXI4-Lite 経由で FIFO に書き込み、
-//   PL が 1標本ごとに取り出して I2S で送出する。
-//   内蔵メモリの容量制限が無くなり、曲を丸ごと再生できる。
+//   PS(Linux)が左右1組の標本を AXI4-Lite 経由で FIFO に書き込み、
+//   PL が1組ずつ取り出して L/R に振り分けて I2S で送出する。
+//   内蔵メモリの容量制限が無くなり、曲を丸ごとステレオで再生できる。
+//
+//   FIFO は32ビット幅。1段に左右をまとめて置く（[31:16]=左, [15:0]=右）。
 //
 //   ★クロックは mclk(12.5MHz)の1つだけ。AXI もこのクロックで動かす。
 //     異なるクロック間の受け渡しを無くし、取りこぼしを防ぐため。
@@ -12,10 +14,12 @@
 //
 //   fs = 12.5MHz / 256 = 48828.125 Hz
 //
-// 【レジスタマップ（ベースアドレス 0xA000_0000）】
-//   0x00 [W]  DATA   - 標本を1つ書き込む（下位16ビット、符号付き）
-//   0x04 [R]  STATUS - bit0:満杯 bit1:空 bit29..16:溜まっている数
-//   0x08 [RW] CTRL   - bit0:再生有効（0で無音）
+// 【レジスタマップ（ベースアドレス 0xA000_0000。すべて 0x10 刻みに整列）】
+//   0x00 [W]  DATA   - 左右1組を書き込む（[31:16]=左, [15:0]=右, 各16ビット符号付き）
+//   0x10 [R]  STATUS - bit0:満杯 bit1:空 bit29..16:溜まっている数
+//   0x20 [RW] CTRL   - bit0:再生有効（0で無音）
+//   0x30 [RW] GAIN   - 音量 [7:0]（64で等倍。再生中に変えられる）
+//   0x40 [RW] ECHO   - エコー量 [7:0]（0で無効。大きいほど残響が長い）
 //
 // 【PS 側の手順】
 //   1. CTRL に 1 を書いて再生開始
@@ -25,13 +29,14 @@
 // ※ レジスタは 0x10 刻みに配置する。0x10 境界に整列していないアドレスは
 //    devmem/mmap での読み出しが 0 を返す(Zynq US+ の既知問題)。
 //    実機で 0x00=0xDEADBEEF が返り 0x04/0x08 が 0 だったことで確認済み。
-//    アドレス幅は 0x00〜0x3F を覆う 6 ビット。
+//    0x00〜0x40 を覆うため アドレス幅は 7 ビット、デコードは [6:4]。
 module i2s_stream_axi #(
-    parameter integer DW         = 16,      // 標本のビット幅
+    parameter integer SMP        = 16,      // 片チャンネルの標本ビット幅
+    parameter integer DW         = 32,      // FIFO幅（左16+右16をまとめて1段）
     parameter integer FIFO_DEPTH = 8192,    // FIFO段数（約0.17秒分）
     parameter integer FIFO_AW    = 13,      // log2(FIFO_DEPTH)
     parameter integer C_S_AXI_DATA_WIDTH = 32,
-    parameter integer C_S_AXI_ADDR_WIDTH = 6
+    parameter integer C_S_AXI_ADDR_WIDTH = 7
 )(
     // ---- AXI4-Lite スレーブ（クロックは mclk と同一） ----
     input  wire                          S_AXI_ACLK,
@@ -113,24 +118,30 @@ module i2s_stream_axi #(
     wire wr_en = axi_wready && S_AXI_WVALID && axi_awready && S_AXI_AWVALID;
 
     // ---- レジスタ書き込み ----
-    reg          reg_play;                  // 0x08 CTRL bit0: 再生有効
+    reg          reg_play;                  // 0x20 CTRL bit0: 再生有効
+    reg [7:0]    reg_gain;                  // 0x30 GAIN: 音量（64で等倍）
+    reg [7:0]    reg_echo;                  // 0x40 ECHO: エコー量（0で無効）
     reg          fifo_wr;                   // FIFOへの書き込み（1クロックだけ1）
     reg [DW-1:0] fifo_wr_data;
 
     always @(posedge clk) begin
         if (!rst_n) begin
             reg_play     <= 1'b0;
+            reg_gain     <= 8'd64;          // 既定は等倍
+            reg_echo     <= 8'd0;           // 既定はエコー無効
             fifo_wr      <= 1'b0;
             fifo_wr_data <= {DW{1'b0}};
         end else begin
             fifo_wr <= 1'b0;                // 既定は書かない
             if (wr_en) begin
-                case (axi_awaddr[5:4])
-                    2'd0: begin             // 0x00 DATA
+                case (axi_awaddr[6:4])
+                    3'd0: begin             // 0x00 DATA
                         fifo_wr_data <= S_AXI_WDATA[DW-1:0];
                         fifo_wr      <= 1'b1;
                     end
-                    2'd2: reg_play <= S_AXI_WDATA[0];   // 0x20 CTRL
+                    3'd2: reg_play <= S_AXI_WDATA[0];       // 0x20 CTRL
+                    3'd3: reg_gain <= S_AXI_WDATA[7:0];     // 0x30 GAIN
+                    3'd4: reg_echo <= S_AXI_WDATA[7:0];     // 0x40 ECHO
                     default: ;
                 endcase
             end
@@ -175,13 +186,14 @@ module i2s_stream_axi #(
         if (!rst_n)
             axi_rdata <= 32'b0;
         else if (~axi_rvalid && S_AXI_ARVALID) begin
-            case (S_AXI_ARADDR[5:4])
+            case (S_AXI_ARADDR[6:4])
                 // 0x00: 動作確認用の固定値(整列アドレス)。0xDEADBEEF が返れば AXI 正常。
-                2'd0: axi_rdata <= 32'hDEADBEEF;
+                3'd0: axi_rdata <= 32'hDEADBEEF;
                 // 0x10 STATUS: bit29..16=溜まっている数, bit1=空, bit0=満杯
-                2'd1: axi_rdata <= {2'b0, fifo_count, 14'b0, fifo_empty, fifo_full};
-                // 0x20 CTRL
-                2'd2: axi_rdata <= {31'b0, reg_play};
+                3'd1: axi_rdata <= {2'b0, fifo_count, 14'b0, fifo_empty, fifo_full};
+                3'd2: axi_rdata <= {31'b0, reg_play};   // 0x20 CTRL
+                3'd3: axi_rdata <= {24'b0, reg_gain};   // 0x30 GAIN
+                3'd4: axi_rdata <= {24'b0, reg_echo};   // 0x40 ECHO
                 default: axi_rdata <= 32'b0;
             endcase
         end
@@ -206,26 +218,37 @@ module i2s_stream_axi #(
     );
 
     // =========================================================================
-    // I2S 送信（段1〜4と同一。音源が FIFO になっただけ）
+    // I2S 送信（ステレオ: 左右1組をフレーム頭で取り込み、L/R期間で振り分ける）
     // =========================================================================
     reg [7:0] c;
     always @(posedge clk)
         if (!rst_n) c <= 8'd0;
         else        c <= c + 8'd1;
 
-    assign sample_tick = (c == 8'hFF);      // 1標本ごとに1回
+    assign sample_tick = (c == 8'hFF);      // 左右1組ごとに1回
     wire [5:0] bi = c[7:2];
     wire [4:0] cb = bi[4:0];
 
-    reg signed [DW-1:0] sample;
-    always @(posedge clk)
-        if (!rst_n)           sample <= {DW{1'b0}};
-        else if (sample_tick) sample <= reg_play ? fifo_out : {DW{1'b0}};
+    // FIFO出力を左右に分ける（再生無効なら0）。これを audio_fx へ渡す
+    wire signed [SMP-1:0] fx_in_l = reg_play ? $signed(fifo_out[DW-1:SMP]) : {SMP{1'b0}};
+    wire signed [SMP-1:0] fx_in_r = reg_play ? $signed(fifo_out[SMP-1:0])  : {SMP{1'b0}};
+
+    // PL でのリアルタイム音声加工（音量・エコー）。tick でフレーム頭に処理
+    wire signed [SMP-1:0] fx_l, fx_r;
+    audio_fx u_fx (
+        .clk(clk), .rst_n(rst_n), .tick(sample_tick),
+        .in_l(fx_in_l), .in_r(fx_in_r),
+        .gain(reg_gain), .echo(reg_echo),
+        .out_l(fx_l), .out_r(fx_r)
+    );
+
+    // lrck=c[7]。前半(c[7]=0)は左、後半(c[7]=1)は右を送出
+    wire [SMP-1:0] cur = c[7] ? fx_r : fx_l;
 
     reg sd;
     always @(*) begin
-        if (cb >= 5'd1 && cb <= DW[4:0]) sd = sample[DW-1 - (cb - 5'd1)];
-        else                             sd = 1'b0;
+        if (cb >= 5'd1 && cb <= SMP[4:0]) sd = cur[SMP-1 - (cb - 5'd1)];
+        else                              sd = 1'b0;
     end
 
     always @(posedge clk) begin
