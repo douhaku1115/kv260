@@ -2,6 +2,7 @@ vivado/
 vivado_loop/
 vivado_melody/
 vivado_player/
+vivado_stream/
 simbuild/
 *.jou
 *.log

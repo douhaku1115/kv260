@@ -1,8 +1,11 @@
-# kv260_i2s2 — Pmod I2S2 で I2S 送受信（段1: トーン再生 / 段2: ループバック）
+# kv260_i2s2 — Pmod I2S2 で I2S 送受信（段1〜段5）
 
 KV260 の PL で I2S 送受信を組み、Pmod I2S2（CS5343 ADC / CS4344 DAC）で音を扱う。
 - **段1**: PL 生成のサイン波を I2S 送信し、DAC からイヤホンで鳴らす（`i2s_tx.v` / `i2s2_tone`）
 - **段2**: ADC 入力を PL でデジタル増幅して DAC へ戻すループバック（`i2s_loop.v` / `i2s2_loop`）
+- **段3**: 位相アキュムレータでメロディ（きらきら星）を鳴らす（`i2s_melody.v`）
+- **段4**: 内蔵メモリに焼いた録音を再生（`i2s_player.v`、上限6秒前後）
+- **段5**: PS→PL AXI ストリーミングで曲まるごと再生（`i2s_stream_axi.v` / `audio_fifo.v`、早送り対応）
 
 ---
 
@@ -148,6 +151,55 @@ vivado -mode batch -source build_player.tcl
 ### 容量
 
 4秒（195312標本）で 3.12Mbit。内蔵メモリ 5.1Mbit の 61%。上限は6秒前後。
+
+---
+
+## 段5: 長時間再生（PS→PL AXI ストリーミング）
+
+段4 は内蔵メモリに焼くため数秒が上限だった。段5 では PS(Linux) が音声標本を
+AXI4-Lite 経由で PL の FIFO に流し込み、PL が 1 標本ずつ取り出して送出する。
+内蔵メモリの容量制限が無くなり、**28分の曲でもそのまま鳴らせる**（`i2s_stream_axi.v` / `audio_fifo.v`）。
+
+```
+PS(Linux) ─M_AXI_HPM0_FPD─> AXI Interconnect ─AXI4-Lite─> i2s_stream_axi
+   play song.raw                                            ├ FIFO(8192段)に積む
+   (満杯を見て流量制御)                                       └ I2S 送信 ─SDIN→ DAC
+```
+
+### レジスタマップ（ベース 0xA000_0000）
+
+| オフセット | 種別 | 内容 |
+|------|------|------|
+| 0x00 | W  | DATA   標本を1つ書き込む（下位16ビット） |
+| 0x10 | R  | STATUS bit0:満杯 bit1:空 bit29..16:溜まっている数 |
+| 0x20 | RW | CTRL   bit0:再生有効 |
+
+**レジスタは 0x10 刻みに整列させる。** 0x10 境界に整列していないアドレスは
+devmem/mmap の読み出しが 0 を返す（Zynq US+ の既知の挙動）。
+0x04/0x08 に置いた STATUS/CTRL が常に 0 で読めず、原因究明に時間を要した。
+動作確認用に 0x00 の読み出しで `0xDEADBEEF` を返すようにし、整列アドレスなら
+正しく読めることを実機で確認して切り分けた。
+
+### 使い方
+
+```bash
+# 音源(28分でも可)を生PCMに変換
+ffmpeg -i 曲.mp3 -ac 1 -ar 48828 -f s16le -acodec pcm_s16le song.raw
+
+# ビルド（生成物: vivado_stream/i2s2_stream.runs/impl_1/design_1_wrapper.bit）
+vivado -mode batch -source build_stream.tcl
+
+# KV260 側: 書き込み → クロック有効化 → 再生プログラムをコンパイルして実行
+sudo fpgautil -b ~/stream.bit
+sudo devmem 0xFF5E00C0 32 0x01010A00
+gcc -O2 -o play play.c
+sudo ./play song.raw
+```
+
+再生プログラム `sw/play.c` は STATUS の満杯ビットを見て流量を調整するので、
+早送りにならず正しい速さで鳴る。再生中のキー操作：
+
+- **f** … 10秒送り　**b** … 10秒戻し　**q** … 終了
 
 ---
 
