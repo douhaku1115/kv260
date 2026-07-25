@@ -41,6 +41,9 @@
 #define REG_DATA    0x00
 #define REG_STATUS  0x10
 #define REG_CTRL    0x20
+#define REG_FBIN    0x50            /* PL FFT: 読み出すビン番号を書く */
+#define REG_FRE     0x60            /* PL FFT: そのビンの実部 */
+#define REG_FIM     0x70            /* PL FFT: そのビンの虚部 */
 
 #define ST_FULL     0x1
 #define ST_EMPTY    0x2
@@ -61,68 +64,31 @@ static double now_sec(void)
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-/* ---- スペクトル: 音ブロックを FFT してパソコンへ送る ---- */
-#define NFFT   8192                 /* FFT点数（分解能 ≒ 48828/8192 ≒ 5.96Hz） */
-#define NSEND  1680                 /* 送る低域ビン数（0〜約10000Hz） */
-
-/* 反復 radix-2 FFT（その場計算） */
-static void fft(float *re, float *im)
-{
-    int n = NFFT;
-    for (int i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            float t;
-            t = re[i]; re[i] = re[j]; re[j] = t;
-            t = im[i]; im[i] = im[j]; im[j] = t;
-        }
-    }
-    for (int len = 2; len <= n; len <<= 1) {
-        double ang = -2.0 * M_PI / len;
-        float wr = cosf(ang), wi = sinf(ang);
-        for (int i = 0; i < n; i += len) {
-            float cr = 1, ci = 0;
-            for (int k = 0; k < len / 2; k++) {
-                float xr = re[i+k+len/2] * cr - im[i+k+len/2] * ci;
-                float xi = re[i+k+len/2] * ci + im[i+k+len/2] * cr;
-                re[i+k+len/2] = re[i+k] - xr;
-                im[i+k+len/2] = im[i+k] - xi;
-                re[i+k] += xr;
-                im[i+k] += xi;
-                float ncr = cr * wr - ci * wi;
-                ci = cr * wi + ci * wr;
-                cr = ncr;
-            }
-        }
-    }
-}
+/* ---- スペクトル: PL側FFTの結果を AXI で読んでパソコンへ送る ---- */
+#define NBIN  256                   /* 512点FFTの片側ビン数(0〜約24kHz) */
 
 /* スペクトル送信先(パソコン)。argv[2] で IP を指定されたら有効 */
 static int g_sock = -1;
 static struct sockaddr_in g_dest;
 
-/* 左ch標本(NFFT点)を FFT し、低域NSENDビンの振幅をパソコンへ UDP 送信する */
-static void fft_send(const int16_t *mono, double sec, double total_sec)
+/* PL の FFT結果(256ビン)を AXI で読み、振幅をパソコンへ UDP 送信する */
+static void read_send_fft(double sec, double total_sec)
 {
-    static float re[NFFT], im[NFFT];
-    for (int i = 0; i < NFFT; i++) {
-        float w = 0.5f - 0.5f * cosf(2.0f * M_PI * i / (NFFT - 1)); /* Hann窓 */
-        re[i] = mono[i] * w;
-        im[i] = 0.0f;
+    static float mag[NBIN];
+    float mx = 0.0f;
+    for (int k = 0; k < NBIN; k++) {
+        reg_write(REG_FBIN, (uint32_t)k);         /* 読みたいビンを選ぶ */
+        (void)reg_read(REG_FRE);                  /* ダミー読み: reg_fbin反映を待つ */
+        int32_t re = (int32_t)reg_read(REG_FRE);  /* 実部(符号拡張済み) */
+        int32_t im = (int32_t)reg_read(REG_FIM);  /* 虚部 */
+        mag[k] = sqrtf((float)re * re + (float)im * im);
+        if (mag[k] > mx) mx = mag[k];
     }
-    fft(re, im);
-
-    static float mag[NSEND];
-    for (int k = 0; k < NSEND; k++)
-        mag[k] = sqrtf(re[k] * re[k] + im[k] * im[k]);
-
     if (g_sock >= 0)
         sendto(g_sock, mag, sizeof(mag), 0,
                (struct sockaddr *)&g_dest, sizeof(g_dest));
 
-    printf("\r再生 %3.0f / %3.0f 秒", sec, total_sec);
+    printf("\r再生 %3.0f/%3.0f秒  maxmag=%.0f", sec, total_sec, mx);   /* 診断 */
     fflush(stdout);
 }
 
@@ -216,8 +182,6 @@ int main(int argc, char **argv)
     printf("再生開始   [f=10秒送り  b=10秒戻し  q=終了]\n");
 
     int16_t buf[CHUNK * 2];             /* 左右インターリーブ L,R,L,R... */
-    static int16_t accbuf[NFFT];        /* FFT用に左chを NFFT点ためる */
-    int     accn = 0;
     long played = 0;                    /* これまでに送った左右組数(=ファイル位置) */
     size_t n;
     double t_start = now_sec();
@@ -257,14 +221,8 @@ int main(int argc, char **argv)
             t_start = now_sec() - played / FS;   /* 経過表示を位置に合わせる */
         }
 
-        /* 左chを NFFT 点ためて、たまるごとに FFT して送信 */
-        for (size_t i = 0; i < n; i++) {
-            accbuf[accn++] = buf[2 * i];
-            if (accn >= NFFT) {
-                fft_send(accbuf, played / FS, total / FS);
-                accn = 0;
-            }
-        }
+        /* PL の FFT結果を読んでパソコンへ送る */
+        read_send_fft(played / FS, total / FS);
     }
 
     if (status_ok) {

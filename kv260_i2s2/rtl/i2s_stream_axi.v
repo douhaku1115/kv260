@@ -121,6 +121,7 @@ module i2s_stream_axi #(
     reg          reg_play;                  // 0x20 CTRL bit0: 再生有効
     reg [7:0]    reg_gain;                  // 0x30 GAIN: 音量（64で等倍）
     reg [7:0]    reg_echo;                  // 0x40 ECHO: エコー量（0で無効）
+    reg [8:0]    reg_fbin;                  // 0x50 FBIN: FFT結果の読み出しビン番号
     reg          fifo_wr;                   // FIFOへの書き込み（1クロックだけ1）
     reg [DW-1:0] fifo_wr_data;
 
@@ -129,6 +130,7 @@ module i2s_stream_axi #(
             reg_play     <= 1'b0;
             reg_gain     <= 8'd64;          // 既定は等倍
             reg_echo     <= 8'd0;           // 既定はエコー無効
+            reg_fbin     <= 9'd0;
             fifo_wr      <= 1'b0;
             fifo_wr_data <= {DW{1'b0}};
         end else begin
@@ -142,6 +144,7 @@ module i2s_stream_axi #(
                     3'd2: reg_play <= S_AXI_WDATA[0];       // 0x20 CTRL
                     3'd3: reg_gain <= S_AXI_WDATA[7:0];     // 0x30 GAIN
                     3'd4: reg_echo <= S_AXI_WDATA[7:0];     // 0x40 ECHO
+                    3'd5: reg_fbin <= S_AXI_WDATA[8:0];     // 0x50 FBIN
                     default: ;
                 endcase
             end
@@ -181,6 +184,8 @@ module i2s_stream_axi #(
     // ---- レジスタ読み出し ----
     wire             fifo_full, fifo_empty;
     wire [FIFO_AW:0] fifo_count;            // 0〜DEPTH（14ビット）
+    wire               fft_ready, fft_done; // PL側FFT
+    wire signed [15:0] fft_re, fft_im;
 
     always @(posedge clk) begin
         if (!rst_n)
@@ -194,6 +199,8 @@ module i2s_stream_axi #(
                 3'd2: axi_rdata <= {31'b0, reg_play};   // 0x20 CTRL
                 3'd3: axi_rdata <= {24'b0, reg_gain};   // 0x30 GAIN
                 3'd4: axi_rdata <= {24'b0, reg_echo};   // 0x40 ECHO
+                3'd6: axi_rdata <= {{16{fft_re[15]}}, fft_re};  // 0x60 FFT実部
+                3'd7: axi_rdata <= {{16{fft_im[15]}}, fft_im};  // 0x70 FFT虚部
                 default: axi_rdata <= 32'b0;
             endcase
         end
@@ -265,5 +272,44 @@ module i2s_stream_axi #(
 
     ODDRE1 #(.SRVAL(1'b0)) u_mclk_oddr (
         .Q(mclk_o), .C(clk), .D1(1'b1), .D2(1'b0), .SR(1'b0)
+    );
+
+    // =========================================================================
+    // PL側FFT（段9: 再生中の左ch音を512点FFT。結果は AXI 0x60/0x70 で読む）
+    //   ready(IDLE/DONE) のとき起動し、sample_tick ごとに1標本ずつ512点供給する。
+    //   計算完了後、次に ready になるまで結果が保持される。
+    // =========================================================================
+    reg       fft_start, fft_loading;
+    reg [9:0] fcnt;
+    wire signed [15:0] fft_sample = reg_play ? $signed(fifo_out[DW-1:SMP]) : 16'sd0;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            fft_start   <= 1'b0;
+            fft_loading <= 1'b0;
+            fcnt        <= 10'd0;
+        end else begin
+            fft_start <= 1'b0;
+            if (fft_ready && !fft_loading && !fft_start) begin
+                fft_start   <= 1'b1;        // FFT起動
+                fft_loading <= 1'b1;
+                fcnt        <= 10'd0;
+            end else if (fft_loading && sample_tick) begin
+                fcnt <= fcnt + 1'b1;        // 1標本ごとに供給
+                if (fcnt == 10'd511) fft_loading <= 1'b0;
+            end
+        end
+    end
+
+    fft512 u_fft (
+        .clk(clk), .rst_n(rst_n),
+        .start(fft_start),
+        .in_valid(fft_loading & sample_tick),
+        .in_data(fft_sample),
+        .done(fft_done),
+        .ready(fft_ready),
+        .rd_addr(reg_fbin),
+        .rd_re(fft_re),
+        .rd_im(fft_im)
     );
 endmodule

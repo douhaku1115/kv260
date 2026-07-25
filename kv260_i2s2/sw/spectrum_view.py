@@ -16,8 +16,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-NSEND = 1680              # play.c から届く低域ビン数（0〜約10000Hz）
-NFFT  = 8192
+NSEND = 256               # PL FFT(512点)の片側ビン数（0〜約24kHz）
+NFFT  = 512
 PORT  = 50007
 FS    = 48828.125
 
@@ -31,7 +31,7 @@ freqs = np.arange(NSEND) * FS / NFFT          # 各ビンの周波数[Hz]
 plt.rcParams["font.family"] = "Meiryo"
 plt.rcParams["axes.unicode_minus"] = False
 
-FLOOR   = 20.0            # dB表示の下限（塗りつぶしの底）
+FLOOR   = 0.0             # dB表示の下限（PL FFTは振幅が小さいので0から）
 SMOOTH  = 0.4             # 時間平滑化（大きいほど反応が速い）
 DROP    = 1.0            # ピークの下降速度 [dB/フレーム]
 
@@ -47,7 +47,7 @@ fill = ax.fill_between(freqs, FLOOR, db0, color="deepskyblue", alpha=0.5)
 line, = ax.plot(freqs, db0, color="deepskyblue", linewidth=1.2)
 peakline, = ax.plot(freqs, peak, color="crimson", linewidth=0.8, label="ピーク")
 
-ax.set_ylim(FLOOR, 150)
+ax.set_ylim(FLOOR, 90)
 ax.set_xlim(0, 10000)
 ax.set_xticks(np.arange(0, 10001, 1000))
 ax.set_title("KV260 リアルタイムスペクトル")
