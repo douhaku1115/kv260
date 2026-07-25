@@ -78,12 +78,13 @@ FFT ではなくこの段の話ですが、`audio_fx` を xsim で検証した�
 
 ```
 KV260(play.c)                          パソコン(spectrum_view.py)
-  左chを8192点FFT ─ UDP:50007 ─> 840ビン(0〜5kHz) ─> matplotlibで線グラフ
+  左chを8192点FFT ─ UDP:50007 ─> 1680ビン(0〜10kHz) ─> matplotlibで表示(dB軸)
 ```
 
 まずは手早く可視化するため、FFT は PS 側（`play.c`）で計算しました（反復 radix-2、
-8192点、分解能 ≒ 48828/8192 ≒ 6Hz）。低域 840 ビン（0〜約5kHz）の振幅を
-UDP でパソコンへ送り、パソコンの `spectrum_view.py`（matplotlib）が線グラフで描きます。
+8192点、分解能 ≒ 48828/8192 ≒ 6Hz）。低域 1680 ビン（0〜約10kHz）の振幅を
+UDP でパソコンへ送り、パソコンの `spectrum_view.py`（matplotlib）が描きます。
+表示は dB軸・塗りつぶし・ピークホールド（赤線）・時間平滑化で見やすくしています。
 
 ```python
 # パソコン側: UDPで受けて線グラフを更新

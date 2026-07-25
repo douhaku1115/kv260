@@ -255,12 +255,12 @@ sudo devmem 0xA0000030 32 0x20   # 音量を半分に
 
 ```
 KV260(play.c)                          パソコン(spectrum_view.py)
-  左chを8192点FFT ─ UDP:50007 ─> 840ビン(0〜5kHz) ─> matplotlibで線グラフ
+  左chを8192点FFT ─ UDP:50007 ─> 1680ビン(0〜10kHz) ─> matplotlibで表示(dB軸)
 ```
 
 - FFT は PS 側（`play.c`）で計算（反復 radix-2、8192点、分解能 ≒ 6Hz）
-- 低域 840 ビン（0〜約5kHz）の振幅を UDP でパソコンへ送る
-- パソコンの `sw/spectrum_view.py`（matplotlib）がリアルタイムに描画
+- 低域 1680 ビン（0〜約10kHz）の振幅を UDP でパソコンへ送る
+- パソコンの `sw/spectrum_view.py`（matplotlib）が dB軸・塗りつぶし・ピークホールド・時間平滑化で描画
 
 ```bash
 # パソコン側（matplotlib が必要）

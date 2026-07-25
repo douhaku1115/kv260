@@ -63,7 +63,7 @@ static double now_sec(void)
 
 /* ---- スペクトル: 音ブロックを FFT してパソコンへ送る ---- */
 #define NFFT   8192                 /* FFT点数（分解能 ≒ 48828/8192 ≒ 5.96Hz） */
-#define NSEND  840                  /* 送る低域ビン数（0〜約5000Hz） */
+#define NSEND  1680                 /* 送る低域ビン数（0〜約10000Hz） */
 
 /* 反復 radix-2 FFT（その場計算） */
 static void fft(float *re, float *im)
