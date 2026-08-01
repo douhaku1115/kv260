@@ -17,7 +17,7 @@ create_project $proj_name $proj_dir -part $part -force
 set_property board_part $board [current_project]
 
 # ---- ソース追加 ----
-add_files -norecurse [list $origin_dir/rtl/i2s_stream_axi.v $origin_dir/rtl/audio_fifo.v $origin_dir/rtl/audio_fx.v $origin_dir/rtl/fft512.v $origin_dir/rtl/twiddle_cos.hex $origin_dir/rtl/twiddle_sin.hex]
+add_files -norecurse [list $origin_dir/rtl/i2s_stream_axi.v $origin_dir/rtl/audio_fifo.v $origin_dir/rtl/audio_fx.v $origin_dir/rtl/fft512.v $origin_dir/rtl/axi_reader.v $origin_dir/rtl/twiddle_cos.hex $origin_dir/rtl/twiddle_sin.hex]
 add_files -fileset constrs_1 -norecurse $origin_dir/constraints/pmod_i2s2.xdc
 update_compile_order -fileset sources_1
 
@@ -36,7 +36,11 @@ set_property -dict [list \
   CONFIG.PSU__USE__M_AXI_GP0 {1} \
   CONFIG.PSU__USE__M_AXI_GP1 {0} \
   CONFIG.PSU__MAXIGP0__DATA_WIDTH {32} \
+  CONFIG.PSU__USE__S_AXI_GP2 {1} \
+  CONFIG.PSU__SAXIGP2__DATA_WIDTH {64} \
 ] [get_bd_cells ps]
+# ※ S_AXI_GP2 = S_AXI_HP0_FPD。段11 で PL(自作AXI4マスタ)が PS の DDR を読むための入口。
+#    HPM(制御用 AXI4-Lite) と違い、データ転送向けの広帯域ポート。
 
 # clk_wiz: 12.5MHz (I2S用 mclk)
 create_bd_cell -type ip -vlnv $clk_vlnv clk
@@ -84,6 +88,17 @@ connect_bd_net $aclk [get_bd_pins i2s/S_AXI_ACLK]
 connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins i2s/S_AXI_ARESETN]
 connect_bd_intf_net [get_bd_intf_pins axi_ic/M00_AXI] [get_bd_intf_pins i2s/S_AXI]
 
+# ---- 段11: 自作AXI4マスタ → PS の HP0 ポート（PL が DDR を読む） ----
+#   自作モジュールの M_AXI 端子群を BD のインターフェースとして束ね、HP0 に繋ぐ。
+connect_bd_net $aclk [get_bd_pins ps/saxihp0_fpd_aclk]
+# M_AXI は S_AXI と同じクロックで動く。Vivado は既定で 100MHz と見なすため明示する
+#   （合わないと "FREQ_HZ does not match" で validate_bd_design が失敗する）
+#   ★12500000 ちょうどではなく、clk_wiz が実際に出す周波数に合わせること。
+#     PS 側がその実値(例 12501995)を見ているため、丸めた値では一致しない。
+set_property CONFIG.FREQ_HZ [get_property CONFIG.FREQ_HZ [get_bd_pins clk/clk_out1]] \
+    [get_bd_intf_pins i2s/M_AXI]
+connect_bd_intf_net [get_bd_intf_pins i2s/M_AXI] [get_bd_intf_pins ps/S_AXI_HP0_FPD]
+
 # ---- I2S 出力ポート ----
 create_bd_port -dir O -type clk pmod_mclk
 connect_bd_net [get_bd_pins i2s/mclk_o] [get_bd_port pmod_mclk]
@@ -97,6 +112,11 @@ connect_bd_net [get_bd_pins i2s/sdout] [get_bd_port pmod_sdin]
 # ---- アドレス割り当て: 0xA000_0000 ----
 assign_bd_address -target_address_space [get_bd_addr_spaces ps/Data] \
     [get_bd_addr_segs i2s/S_AXI/reg0] -range 4K -offset 0xA0000000
+
+# ---- 段11: DMA から見た DDR のアドレス割り当て ----
+#   自作AXI4マスタが PS の DDR を見えるようにする（未割当だと読めない）
+assign_bd_address -target_address_space [get_bd_addr_spaces i2s/M_AXI] \
+    [get_bd_addr_segs ps/SAXIGP2/HP0_DDR_LOW] -force
 
 regenerate_bd_layout
 validate_bd_design

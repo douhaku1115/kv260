@@ -26,6 +26,12 @@
 //   0x80 [W]  FBIN   - PL FFT: 読み出すビン番号
 //   0x90 [R]  FRE    - PL FFT: 実部
 //   0xA0 [R]  FIM    - PL FFT: 虚部
+//   -- 段11 DMA (PL が PS の DDR を自分で読む) --
+//   0xB0 [RW] DMA_ADDR - 読み出し開始アドレス（DDR 物理アドレス）
+//   0xC0 [RW] DMA_LEN  - 読み出す長さ（バイト）
+//   0xD0 [W]  DMA_CTRL - bit0 に 1 を書くと開始
+//   0xE0 [R]  DMA_STAT - bit0=busy, bit1=done, [31:16]=読んだバイト数の上位
+//   0xF0 [R]  DMA_DATA - 最後に読めたデータの下位32ビット（確認用）
 //
 // 【PS 側の手順】
 //   1. CTRL に 1 を書いて再生開始
@@ -35,14 +41,14 @@
 // ※ レジスタは 0x10 刻みに配置する。0x10 境界に整列していないアドレスは
 //    devmem/mmap での読み出しが 0 を返す(Zynq US+ の既知問題)。
 //    実機で 0x00=0xDEADBEEF が返り 0x04/0x08 が 0 だったことで確認済み。
-//    0x00〜0xA0 を覆うため アドレス幅は 8 ビット、デコードは [7:4]。
+//    0x00〜0xE0 を覆うため アドレス幅は 9 ビット、デコードは [8:4]。
 module i2s_stream_axi #(
     parameter integer SMP        = 16,      // 片チャンネルの標本ビット幅
     parameter integer DW         = 32,      // FIFO幅（左16+右16をまとめて1段）
     parameter integer FIFO_DEPTH = 8192,    // FIFO段数（約0.17秒分）
     parameter integer FIFO_AW    = 13,      // log2(FIFO_DEPTH)
     parameter integer C_S_AXI_DATA_WIDTH = 32,
-    parameter integer C_S_AXI_ADDR_WIDTH = 8
+    parameter integer C_S_AXI_ADDR_WIDTH = 9
 )(
     // ---- AXI4-Lite スレーブ（クロックは mclk と同一） ----
     input  wire                          S_AXI_ACLK,
@@ -71,6 +77,40 @@ module i2s_stream_axi #(
     output wire [1:0]                    S_AXI_RRESP,
     output wire                          S_AXI_RVALID,
     input  wire                          S_AXI_RREADY,
+
+    // ---- 段11: AXI4 マスタ（PL が PS の DDR を読む。HP ポートへ繋ぐ）----
+    //   読み出しのみ使うが、Vivado が AXI4 インターフェースとして認識するよう
+    //   書き込みチャネル(AW/W/B)も端子だけ用意して 0 に固定する。
+    output wire [31:0] M_AXI_AWADDR,
+    output wire [7:0]  M_AXI_AWLEN,
+    output wire [2:0]  M_AXI_AWSIZE,
+    output wire [1:0]  M_AXI_AWBURST,
+    output wire [3:0]  M_AXI_AWCACHE,
+    output wire [2:0]  M_AXI_AWPROT,
+    output wire        M_AXI_AWVALID,
+    input  wire        M_AXI_AWREADY,
+    output wire [63:0] M_AXI_WDATA,
+    output wire [7:0]  M_AXI_WSTRB,
+    output wire        M_AXI_WLAST,
+    output wire        M_AXI_WVALID,
+    input  wire        M_AXI_WREADY,
+    input  wire [1:0]  M_AXI_BRESP,
+    input  wire        M_AXI_BVALID,
+    output wire        M_AXI_BREADY,
+
+    output wire [31:0] M_AXI_ARADDR,
+    output wire [7:0]  M_AXI_ARLEN,
+    output wire [2:0]  M_AXI_ARSIZE,
+    output wire [1:0]  M_AXI_ARBURST,
+    output wire [3:0]  M_AXI_ARCACHE,
+    output wire [2:0]  M_AXI_ARPROT,
+    output wire        M_AXI_ARVALID,
+    input  wire        M_AXI_ARREADY,
+    input  wire [63:0] M_AXI_RDATA,
+    input  wire [1:0]  M_AXI_RRESP,
+    input  wire        M_AXI_RLAST,
+    input  wire        M_AXI_RVALID,
+    output wire        M_AXI_RREADY,
 
     // ---- I2S 出力（Pmod I2S2 へ） ----
     output wire mclk_o,
@@ -131,6 +171,9 @@ module i2s_stream_axi #(
     reg [7:0]    reg_treble;                // 0x60 TREBLE: 高音の強さ（64で等倍）
     reg [7:0]    reg_dist;                  // 0x70 DIST: 歪み（0で無効）
     reg [8:0]    reg_fbin;                  // 0x80 FBIN: FFT結果の読み出しビン番号
+    reg [31:0]   reg_dma_addr;              // 0xB0 DMA 開始アドレス
+    reg [31:0]   reg_dma_len;               // 0xC0 DMA 長さ（バイト）
+    reg          dma_start;                 // 0xD0 書込で1クロックだけ1
     reg          fifo_wr;                   // FIFOへの書き込み（1クロックだけ1）
     reg [DW-1:0] fifo_wr_data;
 
@@ -143,23 +186,30 @@ module i2s_stream_axi #(
             reg_treble   <= 8'd64;          // 既定は等倍
             reg_dist     <= 8'd0;           // 既定は歪み無効
             reg_fbin     <= 9'd0;
+            reg_dma_addr <= 32'd0;
+            reg_dma_len  <= 32'd0;
+            dma_start    <= 1'b0;
             fifo_wr      <= 1'b0;
             fifo_wr_data <= {DW{1'b0}};
         end else begin
-            fifo_wr <= 1'b0;                // 既定は書かない
+            fifo_wr   <= 1'b0;              // 既定は書かない
+            dma_start <= 1'b0;              // 1クロックだけのパルス
             if (wr_en) begin
-                case (axi_awaddr[7:4])
-                    4'd0: begin             // 0x00 DATA
+                case (axi_awaddr[8:4])
+                    5'd0: begin             // 0x00 DATA
                         fifo_wr_data <= S_AXI_WDATA[DW-1:0];
                         fifo_wr      <= 1'b1;
                     end
-                    4'd2: reg_play   <= S_AXI_WDATA[0];     // 0x20 CTRL
-                    4'd3: reg_gain   <= S_AXI_WDATA[7:0];   // 0x30 GAIN
-                    4'd4: reg_echo   <= S_AXI_WDATA[7:0];   // 0x40 ECHO
-                    4'd5: reg_bass   <= S_AXI_WDATA[7:0];   // 0x50 BASS
-                    4'd6: reg_treble <= S_AXI_WDATA[7:0];   // 0x60 TREBLE
-                    4'd7: reg_dist   <= S_AXI_WDATA[7:0];   // 0x70 DIST
-                    4'd8: reg_fbin   <= S_AXI_WDATA[8:0];   // 0x80 FBIN
+                    5'd2:  reg_play     <= S_AXI_WDATA[0];    // 0x20 CTRL
+                    5'd3:  reg_gain     <= S_AXI_WDATA[7:0];  // 0x30 GAIN
+                    5'd4:  reg_echo     <= S_AXI_WDATA[7:0];  // 0x40 ECHO
+                    5'd5:  reg_bass     <= S_AXI_WDATA[7:0];  // 0x50 BASS
+                    5'd6:  reg_treble   <= S_AXI_WDATA[7:0];  // 0x60 TREBLE
+                    5'd7:  reg_dist     <= S_AXI_WDATA[7:0];  // 0x70 DIST
+                    5'd8:  reg_fbin     <= S_AXI_WDATA[8:0];  // 0x80 FBIN
+                    5'd11: reg_dma_addr <= S_AXI_WDATA;       // 0xB0 DMA_ADDR
+                    5'd12: reg_dma_len  <= S_AXI_WDATA;       // 0xC0 DMA_LEN
+                    5'd13: dma_start    <= S_AXI_WDATA[0];    // 0xD0 DMA_CTRL
                     default: ;
                 endcase
             end
@@ -201,24 +251,32 @@ module i2s_stream_axi #(
     wire [FIFO_AW:0] fifo_count;            // 0〜DEPTH（14ビット）
     wire               fft_ready, fft_done; // PL側FFT
     wire signed [15:0] fft_re, fft_im;
+    wire               dma_busy, dma_done;  // 段11 DMA の状態
+    wire [31:0]        dma_read_cnt;
+    reg  [31:0]        dma_last_data;       // 最後に読めたデータ(確認用)
 
     always @(posedge clk) begin
         if (!rst_n)
             axi_rdata <= 32'b0;
         else if (~axi_rvalid && S_AXI_ARVALID) begin
-            case (S_AXI_ARADDR[7:4])
+            case (S_AXI_ARADDR[8:4])
                 // 0x00: 動作確認用の固定値(整列アドレス)。0xDEADBEEF が返れば AXI 正常。
-                4'd0: axi_rdata <= 32'hDEADBEEF;
+                5'd0: axi_rdata <= 32'hDEADBEEF;
                 // 0x10 STATUS: bit29..16=溜まっている数, bit1=空, bit0=満杯
-                4'd1: axi_rdata <= {2'b0, fifo_count, 14'b0, fifo_empty, fifo_full};
-                4'd2: axi_rdata <= {31'b0, reg_play};     // 0x20 CTRL
-                4'd3: axi_rdata <= {24'b0, reg_gain};     // 0x30 GAIN
-                4'd4: axi_rdata <= {24'b0, reg_echo};     // 0x40 ECHO
-                4'd5: axi_rdata <= {24'b0, reg_bass};     // 0x50 BASS
-                4'd6: axi_rdata <= {24'b0, reg_treble};   // 0x60 TREBLE
-                4'd7: axi_rdata <= {24'b0, reg_dist};     // 0x70 DIST
-                4'd9: axi_rdata <= {{16{fft_re[15]}}, fft_re};  // 0x90 FFT実部
-                4'd10: axi_rdata <= {{16{fft_im[15]}}, fft_im}; // 0xA0 FFT虚部
+                5'd1: axi_rdata <= {2'b0, fifo_count, 14'b0, fifo_empty, fifo_full};
+                5'd2: axi_rdata <= {31'b0, reg_play};     // 0x20 CTRL
+                5'd3: axi_rdata <= {24'b0, reg_gain};     // 0x30 GAIN
+                5'd4: axi_rdata <= {24'b0, reg_echo};     // 0x40 ECHO
+                5'd5: axi_rdata <= {24'b0, reg_bass};     // 0x50 BASS
+                5'd6: axi_rdata <= {24'b0, reg_treble};   // 0x60 TREBLE
+                5'd7: axi_rdata <= {24'b0, reg_dist};     // 0x70 DIST
+                5'd9: axi_rdata <= {{16{fft_re[15]}}, fft_re};  // 0x90 FFT実部
+                5'd10: axi_rdata <= {{16{fft_im[15]}}, fft_im}; // 0xA0 FFT虚部
+                5'd11: axi_rdata <= reg_dma_addr;         // 0xB0 DMA_ADDR
+                5'd12: axi_rdata <= reg_dma_len;          // 0xC0 DMA_LEN
+                // 0xE0 DMA_STAT: bit0=busy, bit1=done, [31:8]=読んだバイト数
+                5'd14: axi_rdata <= {dma_read_cnt[23:0], 6'b0, dma_done, dma_busy};
+                5'd15: axi_rdata <= dma_last_data;        // 0xF0 最後に読めたデータ(下位32bit)
                 default: axi_rdata <= 32'b0;
             endcase
         end
@@ -319,6 +377,48 @@ module i2s_stream_axi #(
             end
         end
     end
+
+    // =========================================================================
+    // 段11: DMA（PL が PS の DDR を自分で読む）
+    //   段階1では「読めること」の確認が目的なので、読んだデータは捨てて
+    //   最後の値だけ 0xF0 で見られるようにする（常に受け取る = out_ready 固定1）。
+    //   段階2で、ここから FIFO へ流し込んで音を鳴らす。
+    // =========================================================================
+    wire        dma_out_valid;
+    wire [63:0] dma_out_data;
+
+    // 書き込みチャネルは使わない（読み出し専用マスタ）ので固定値にする
+    assign M_AXI_AWADDR  = 32'd0;
+    assign M_AXI_AWLEN   = 8'd0;
+    assign M_AXI_AWSIZE  = 3'd0;
+    assign M_AXI_AWBURST = 2'b01;
+    assign M_AXI_AWCACHE = 4'b0011;
+    assign M_AXI_AWPROT  = 3'b000;
+    assign M_AXI_AWVALID = 1'b0;
+    assign M_AXI_WDATA   = 64'd0;
+    assign M_AXI_WSTRB   = 8'd0;
+    assign M_AXI_WLAST   = 1'b0;
+    assign M_AXI_WVALID  = 1'b0;
+    assign M_AXI_BREADY  = 1'b1;
+
+    always @(posedge clk) begin
+        if (!rst_n)              dma_last_data <= 32'd0;
+        else if (dma_out_valid)  dma_last_data <= dma_out_data[31:0];
+    end
+
+    axi_reader #(.DW(64), .BURST(16)) u_dma (
+        .clk(clk), .rst_n(rst_n),
+        .start(dma_start), .base_addr(reg_dma_addr), .total_len(reg_dma_len),
+        .busy(dma_busy), .done(dma_done), .read_cnt(dma_read_cnt),
+        .out_valid(dma_out_valid), .out_data(dma_out_data), .out_ready(1'b1),
+        .M_AXI_ARADDR(M_AXI_ARADDR),   .M_AXI_ARLEN(M_AXI_ARLEN),
+        .M_AXI_ARSIZE(M_AXI_ARSIZE),   .M_AXI_ARBURST(M_AXI_ARBURST),
+        .M_AXI_ARCACHE(M_AXI_ARCACHE), .M_AXI_ARPROT(M_AXI_ARPROT),
+        .M_AXI_ARVALID(M_AXI_ARVALID), .M_AXI_ARREADY(M_AXI_ARREADY),
+        .M_AXI_RDATA(M_AXI_RDATA),     .M_AXI_RRESP(M_AXI_RRESP),
+        .M_AXI_RLAST(M_AXI_RLAST),     .M_AXI_RVALID(M_AXI_RVALID),
+        .M_AXI_RREADY(M_AXI_RREADY)
+    );
 
     fft512 u_fft (
         .clk(clk), .rst_n(rst_n),
