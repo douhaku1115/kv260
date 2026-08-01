@@ -11,7 +11,7 @@ KV260 の PL で I2S 送受信を組み、Pmod I2S2（CS5343 ADC / CS4344 DAC）
 - **段8**: 再生中の音を FFT してパソコンにリアルタイムスペクトル表示（`spectrum_view.py`）
 - **段9**: FFT を PL（FPGA）に載せる（自作512点FFT `fft512.v`、結果を AXI で読む）
 - **段10**: エフェクト拡張（イコライザ・歪み、`audio_fx.v`）
-- **段11**: DMA — PL が PS の DDR を自分で読む（自作AXI4マスタ `axi_reader.v`、段階1完了）
+- **段11**: DMA — PL が PS の DDR を自分で読み、CPU なしで再生（`axi_reader.v` / `dmaplay.c`）
 
 ---
 
@@ -421,10 +421,54 @@ sudo devmem 0xA00000F0 32              # → 0x11223344 (読めたデータ)
 - **書き込みチャネルもダミーで用意する**: 読み出し専用でも AW/W/B の端子が無いと
   Vivado が AXI4 インターフェースとして認識しない。0 に固定して繋いでおく。
 
-### 段階2（未着手）
+### 段階2: CPU を使わない再生（完了）
 
-読んだデータを FIFO へ流し込み、CPU を使わずに音を鳴らす。
-Linux では通常メモリが物理的に断片化しているため、**物理連続メモリの確保**が課題。
+読んだデータを FIFO へ流し込み、**CPU を一切使わずに音を鳴らす**。
+再生プログラム `sw/dmaplay.c` は音声を DDR に転送して DMA を起動したら**すぐ終了する**が、
+音は鳴り続ける。これが「PL が自律的に動く」ことの証拠。
+
+```
+DDR(0x60000000) ─HP0─> axi_reader ─64bit─> FIFO ─> audio_fx ─> I2S ─> DAC
+                            ↑ 満杯なら out_ready を下げて待つ（PL内で完結、CPU不要）
+```
+
+#### 物理連続メモリの確保（`mem=` で予約）
+
+Linux は通常メモリが物理的に断片化しているため、そのままでは PL に「ここから連続で
+読め」と教えられない。**起動引数で Linux の使用領域を制限し、その上を PL 専用にする。**
+
+SD カードのブート領域にある `uEnv.txt` を編集する（`/run/media/boot-mmcblk1p1/uEnv.txt`）:
+
+```
+bootargs=... cma=256M mem=1536M
+```
+
+| 領域 | 用途 |
+|---|---|
+| 0x00000000〜0x5FFFFFFF (1.5GB) | Linux が使う |
+| **0x60000000〜0x7FEFFFFF (約511MB)** | **Linux 管理外。PL 専用に自由に使える** |
+
+再起動後 `/proc/iomem` の System RAM が `0x00000000-0x5fffffff` に縮めば成功。
+音声に限らず、映像フレームバッファや PL の作業領域としても使える汎用の置き場になる。
+
+**注意**: 予約前に 0x10000000 などへ書くと、Linux が使用中のメモリを壊す恐れがある。
+
+#### 追加した仕組み
+
+- **流量制御**: FIFO が満杯なら `out_ready` を下げて DMA を待たせる。PL 内の配線1本で
+  完結し、CPU は関与しない（段5〜10 では CPU が STATUS を読んで待っていた）
+- **64bit → FIFO**: 1 転送(64bit) は左右2組ぶん。2 クロックに分けて FIFO へ入れる
+- **繰り返し再生**: `DMA_CTRL` bit1 を立てると、読み終わりに自動で先頭へ戻る
+
+```bash
+# パソコン側: ステレオ生PCMを用意
+ffmpeg -i 曲.mp3 -ac 2 -ar 48828 -f s16le -acodec pcm_s16le song.raw
+
+# KV260 側
+gcc -o dmaplay dmaplay.c
+sudo ./dmaplay song.raw     # 転送して再生開始。すぐ終了するが鳴り続ける
+sudo ./dmaplay --stop       # 停止
+```
 
 ---
 

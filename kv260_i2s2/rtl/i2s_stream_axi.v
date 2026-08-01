@@ -173,7 +173,8 @@ module i2s_stream_axi #(
     reg [8:0]    reg_fbin;                  // 0x80 FBIN: FFT結果の読み出しビン番号
     reg [31:0]   reg_dma_addr;              // 0xB0 DMA 開始アドレス
     reg [31:0]   reg_dma_len;               // 0xC0 DMA 長さ（バイト）
-    reg          dma_start;                 // 0xD0 書込で1クロックだけ1
+    reg          dma_start;                 // 0xD0 bit0: 書込で1クロックだけ1
+    reg          reg_dma_loop;              // 0xD0 bit1: 1 なら繰り返し再生
     reg          fifo_wr;                   // FIFOへの書き込み（1クロックだけ1）
     reg [DW-1:0] fifo_wr_data;
 
@@ -189,6 +190,7 @@ module i2s_stream_axi #(
             reg_dma_addr <= 32'd0;
             reg_dma_len  <= 32'd0;
             dma_start    <= 1'b0;
+            reg_dma_loop <= 1'b0;
             fifo_wr      <= 1'b0;
             fifo_wr_data <= {DW{1'b0}};
         end else begin
@@ -209,7 +211,10 @@ module i2s_stream_axi #(
                     5'd8:  reg_fbin     <= S_AXI_WDATA[8:0];  // 0x80 FBIN
                     5'd11: reg_dma_addr <= S_AXI_WDATA;       // 0xB0 DMA_ADDR
                     5'd12: reg_dma_len  <= S_AXI_WDATA;       // 0xC0 DMA_LEN
-                    5'd13: dma_start    <= S_AXI_WDATA[0];    // 0xD0 DMA_CTRL
+                    5'd13: begin                              // 0xD0 DMA_CTRL
+                        dma_start    <= S_AXI_WDATA[0];       //   bit0: 開始
+                        reg_dma_loop <= S_AXI_WDATA[1];       //   bit1: 繰り返し
+                    end
                     default: ;
                 endcase
             end
@@ -288,11 +293,23 @@ module i2s_stream_axi #(
     wire sample_tick;
     wire signed [DW-1:0] fifo_out;
 
+    // DMA → FIFO 用の信号は下方で駆動するが、ここで使うため前方宣言する
+    //   （Verilog は暗黙 net を作ってしまうので、必ず宣言を先に置くこと）
+    reg           dma_fifo_wr;
+    reg [DW-1:0]  dma_fifo_data;
+
+    // FIFO への書き込みは 2 系統ある：
+    //   1. PS が AXI4-Lite で 1 組ずつ書く（段5〜10 の方式。CPU が働く）
+    //   2. DMA が DDR から読んだデータを流し込む（段11。CPU 不要）
+    //   DMA 側を優先する（DMA 動作中は PS から書かない前提）。
+    wire        fifo_wr_any   = dma_fifo_wr | fifo_wr;
+    wire [DW-1:0] fifo_wr_any_data = dma_fifo_wr ? dma_fifo_data : fifo_wr_data;
+
     audio_fifo #(.DW(DW), .DEPTH(FIFO_DEPTH), .AW(FIFO_AW)) u_fifo (
         .clk     (clk),
         .rst_n   (rst_n),
-        .wr_en   (fifo_wr),
-        .wr_data (fifo_wr_data),
+        .wr_en   (fifo_wr_any),
+        .wr_data (fifo_wr_any_data),
         .rd_en   (sample_tick & reg_play),
         .rd_data (fifo_out),
         .full    (fifo_full),
@@ -386,6 +403,9 @@ module i2s_stream_axi #(
     // =========================================================================
     wire        dma_out_valid;
     wire [63:0] dma_out_data;
+    // DMA → FIFO 流し込み用（dma_fifo_wr/dma_fifo_data は上部で前方宣言済み）
+    reg           dma_half;          // 64bit を 2 回に分けて入れるための段階
+    reg [31:0]    dma_hold;          // 後半（2組目）を保持
 
     // 書き込みチャネルは使わない（読み出し専用マスタ）ので固定値にする
     assign M_AXI_AWADDR  = 32'd0;
@@ -401,16 +421,57 @@ module i2s_stream_axi #(
     assign M_AXI_WVALID  = 1'b0;
     assign M_AXI_BREADY  = 1'b1;
 
+    // ---- DMA が読んだ 64bit を FIFO へ（左右2組ぶん = 32bit×2）----
+    //   FIFO が満杯なら受け取らない（out_ready を下げる）＝ 流量制御。
+    //   これは PL 内の配線1本で完結し、CPU は関与しない。
+    //   1 転送(64bit) を 2 クロックに分けて FIFO へ書く。
+    wire dma_ready  = !dma_half & !fifo_full;   // 前半処理中でなく FIFO に空きがある時だけ受ける
+    wire dma_accept = dma_out_valid & dma_ready;
+
     always @(posedge clk) begin
         if (!rst_n)              dma_last_data <= 32'd0;
-        else if (dma_out_valid)  dma_last_data <= dma_out_data[31:0];
+        else if (dma_accept)     dma_last_data <= dma_out_data[31:0];
     end
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            dma_fifo_wr   <= 1'b0;
+            dma_half      <= 1'b0;
+            dma_hold      <= 32'd0;
+            dma_fifo_data <= {DW{1'b0}};
+        end else begin
+            dma_fifo_wr <= 1'b0;
+            if (dma_accept) begin
+                // 1 組目（下位32bit）を今すぐ FIFO へ、2 組目は保持
+                dma_fifo_data <= dma_out_data[31:0];
+                dma_fifo_wr   <= 1'b1;
+                dma_hold      <= dma_out_data[63:32];
+                dma_half      <= 1'b1;
+            end else if (dma_half && !fifo_full) begin
+                // 2 組目（上位32bit）を FIFO へ
+                dma_fifo_data <= dma_hold;
+                dma_fifo_wr   <= 1'b1;
+                dma_half      <= 1'b0;
+            end
+        end
+    end
+
+    // ---- 繰り返し再生 ----
+    //   全部読み終えたら自動で先頭からやり直す。CPU の介入なしで鳴り続ける。
+    //   reg_dma_loop(0xD0 bit1) が 1 のときだけ繰り返す。
+    reg  dma_restart;
+    always @(posedge clk) begin
+        if (!rst_n)                          dma_restart <= 1'b0;
+        else if (dma_done && reg_dma_loop)   dma_restart <= 1'b1;
+        else                                 dma_restart <= 1'b0;
+    end
+    wire dma_start_any = dma_start | dma_restart;
 
     axi_reader #(.DW(64), .BURST(16)) u_dma (
         .clk(clk), .rst_n(rst_n),
-        .start(dma_start), .base_addr(reg_dma_addr), .total_len(reg_dma_len),
+        .start(dma_start_any), .base_addr(reg_dma_addr), .total_len(reg_dma_len),
         .busy(dma_busy), .done(dma_done), .read_cnt(dma_read_cnt),
-        .out_valid(dma_out_valid), .out_data(dma_out_data), .out_ready(1'b1),
+        .out_valid(dma_out_valid), .out_data(dma_out_data), .out_ready(dma_ready),
         .M_AXI_ARADDR(M_AXI_ARADDR),   .M_AXI_ARLEN(M_AXI_ARLEN),
         .M_AXI_ARSIZE(M_AXI_ARSIZE),   .M_AXI_ARBURST(M_AXI_ARBURST),
         .M_AXI_ARCACHE(M_AXI_ARCACHE), .M_AXI_ARPROT(M_AXI_ARPROT),
