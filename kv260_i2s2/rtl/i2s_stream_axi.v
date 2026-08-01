@@ -20,6 +20,12 @@
 //   0x20 [RW] CTRL   - bit0:再生有効（0で無音）
 //   0x30 [RW] GAIN   - 音量 [7:0]（64で等倍。再生中に変えられる）
 //   0x40 [RW] ECHO   - エコー量 [7:0]（0で無効。大きいほど残響が長い）
+//   0x50 [RW] BASS   - 低音の強さ [7:0]（64で等倍）
+//   0x60 [RW] TREBLE - 高音の強さ [7:0]（64で等倍）
+//   0x70 [RW] DIST   - 歪み [7:0]（0で無効。大きいほど強く歪む）
+//   0x80 [W]  FBIN   - PL FFT: 読み出すビン番号
+//   0x90 [R]  FRE    - PL FFT: 実部
+//   0xA0 [R]  FIM    - PL FFT: 虚部
 //
 // 【PS 側の手順】
 //   1. CTRL に 1 を書いて再生開始
@@ -29,14 +35,14 @@
 // ※ レジスタは 0x10 刻みに配置する。0x10 境界に整列していないアドレスは
 //    devmem/mmap での読み出しが 0 を返す(Zynq US+ の既知問題)。
 //    実機で 0x00=0xDEADBEEF が返り 0x04/0x08 が 0 だったことで確認済み。
-//    0x00〜0x40 を覆うため アドレス幅は 7 ビット、デコードは [6:4]。
+//    0x00〜0xA0 を覆うため アドレス幅は 8 ビット、デコードは [7:4]。
 module i2s_stream_axi #(
     parameter integer SMP        = 16,      // 片チャンネルの標本ビット幅
     parameter integer DW         = 32,      // FIFO幅（左16+右16をまとめて1段）
     parameter integer FIFO_DEPTH = 8192,    // FIFO段数（約0.17秒分）
     parameter integer FIFO_AW    = 13,      // log2(FIFO_DEPTH)
     parameter integer C_S_AXI_DATA_WIDTH = 32,
-    parameter integer C_S_AXI_ADDR_WIDTH = 7
+    parameter integer C_S_AXI_ADDR_WIDTH = 8
 )(
     // ---- AXI4-Lite スレーブ（クロックは mclk と同一） ----
     input  wire                          S_AXI_ACLK,
@@ -121,7 +127,10 @@ module i2s_stream_axi #(
     reg          reg_play;                  // 0x20 CTRL bit0: 再生有効
     reg [7:0]    reg_gain;                  // 0x30 GAIN: 音量（64で等倍）
     reg [7:0]    reg_echo;                  // 0x40 ECHO: エコー量（0で無効）
-    reg [8:0]    reg_fbin;                  // 0x50 FBIN: FFT結果の読み出しビン番号
+    reg [7:0]    reg_bass;                  // 0x50 BASS: 低音の強さ（64で等倍）
+    reg [7:0]    reg_treble;                // 0x60 TREBLE: 高音の強さ（64で等倍）
+    reg [7:0]    reg_dist;                  // 0x70 DIST: 歪み（0で無効）
+    reg [8:0]    reg_fbin;                  // 0x80 FBIN: FFT結果の読み出しビン番号
     reg          fifo_wr;                   // FIFOへの書き込み（1クロックだけ1）
     reg [DW-1:0] fifo_wr_data;
 
@@ -130,21 +139,27 @@ module i2s_stream_axi #(
             reg_play     <= 1'b0;
             reg_gain     <= 8'd64;          // 既定は等倍
             reg_echo     <= 8'd0;           // 既定はエコー無効
+            reg_bass     <= 8'd64;          // 既定は等倍
+            reg_treble   <= 8'd64;          // 既定は等倍
+            reg_dist     <= 8'd0;           // 既定は歪み無効
             reg_fbin     <= 9'd0;
             fifo_wr      <= 1'b0;
             fifo_wr_data <= {DW{1'b0}};
         end else begin
             fifo_wr <= 1'b0;                // 既定は書かない
             if (wr_en) begin
-                case (axi_awaddr[6:4])
-                    3'd0: begin             // 0x00 DATA
+                case (axi_awaddr[7:4])
+                    4'd0: begin             // 0x00 DATA
                         fifo_wr_data <= S_AXI_WDATA[DW-1:0];
                         fifo_wr      <= 1'b1;
                     end
-                    3'd2: reg_play <= S_AXI_WDATA[0];       // 0x20 CTRL
-                    3'd3: reg_gain <= S_AXI_WDATA[7:0];     // 0x30 GAIN
-                    3'd4: reg_echo <= S_AXI_WDATA[7:0];     // 0x40 ECHO
-                    3'd5: reg_fbin <= S_AXI_WDATA[8:0];     // 0x50 FBIN
+                    4'd2: reg_play   <= S_AXI_WDATA[0];     // 0x20 CTRL
+                    4'd3: reg_gain   <= S_AXI_WDATA[7:0];   // 0x30 GAIN
+                    4'd4: reg_echo   <= S_AXI_WDATA[7:0];   // 0x40 ECHO
+                    4'd5: reg_bass   <= S_AXI_WDATA[7:0];   // 0x50 BASS
+                    4'd6: reg_treble <= S_AXI_WDATA[7:0];   // 0x60 TREBLE
+                    4'd7: reg_dist   <= S_AXI_WDATA[7:0];   // 0x70 DIST
+                    4'd8: reg_fbin   <= S_AXI_WDATA[8:0];   // 0x80 FBIN
                     default: ;
                 endcase
             end
@@ -191,16 +206,19 @@ module i2s_stream_axi #(
         if (!rst_n)
             axi_rdata <= 32'b0;
         else if (~axi_rvalid && S_AXI_ARVALID) begin
-            case (S_AXI_ARADDR[6:4])
+            case (S_AXI_ARADDR[7:4])
                 // 0x00: 動作確認用の固定値(整列アドレス)。0xDEADBEEF が返れば AXI 正常。
-                3'd0: axi_rdata <= 32'hDEADBEEF;
+                4'd0: axi_rdata <= 32'hDEADBEEF;
                 // 0x10 STATUS: bit29..16=溜まっている数, bit1=空, bit0=満杯
-                3'd1: axi_rdata <= {2'b0, fifo_count, 14'b0, fifo_empty, fifo_full};
-                3'd2: axi_rdata <= {31'b0, reg_play};   // 0x20 CTRL
-                3'd3: axi_rdata <= {24'b0, reg_gain};   // 0x30 GAIN
-                3'd4: axi_rdata <= {24'b0, reg_echo};   // 0x40 ECHO
-                3'd6: axi_rdata <= {{16{fft_re[15]}}, fft_re};  // 0x60 FFT実部
-                3'd7: axi_rdata <= {{16{fft_im[15]}}, fft_im};  // 0x70 FFT虚部
+                4'd1: axi_rdata <= {2'b0, fifo_count, 14'b0, fifo_empty, fifo_full};
+                4'd2: axi_rdata <= {31'b0, reg_play};     // 0x20 CTRL
+                4'd3: axi_rdata <= {24'b0, reg_gain};     // 0x30 GAIN
+                4'd4: axi_rdata <= {24'b0, reg_echo};     // 0x40 ECHO
+                4'd5: axi_rdata <= {24'b0, reg_bass};     // 0x50 BASS
+                4'd6: axi_rdata <= {24'b0, reg_treble};   // 0x60 TREBLE
+                4'd7: axi_rdata <= {24'b0, reg_dist};     // 0x70 DIST
+                4'd9: axi_rdata <= {{16{fft_re[15]}}, fft_re};  // 0x90 FFT実部
+                4'd10: axi_rdata <= {{16{fft_im[15]}}, fft_im}; // 0xA0 FFT虚部
                 default: axi_rdata <= 32'b0;
             endcase
         end
@@ -246,6 +264,7 @@ module i2s_stream_axi #(
         .clk(clk), .rst_n(rst_n), .tick(sample_tick),
         .in_l(fx_in_l), .in_r(fx_in_r),
         .gain(reg_gain), .echo(reg_echo),
+        .bass(reg_bass), .treble(reg_treble), .dist(reg_dist),
         .out_l(fx_l), .out_r(fx_r)
     );
 

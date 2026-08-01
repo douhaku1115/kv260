@@ -41,9 +41,10 @@
 #define REG_DATA    0x00
 #define REG_STATUS  0x10
 #define REG_CTRL    0x20
-#define REG_FBIN    0x50            /* PL FFT: 読み出すビン番号を書く */
-#define REG_FRE     0x60            /* PL FFT: そのビンの実部 */
-#define REG_FIM     0x70            /* PL FFT: そのビンの虚部 */
+/* 0x50 BASS / 0x60 TREBLE / 0x70 DIST はエフェクト用（devmem で操作する） */
+#define REG_FBIN    0x80            /* PL FFT: 読み出すビン番号を書く */
+#define REG_FRE     0x90            /* PL FFT: そのビンの実部 */
+#define REG_FIM     0xA0            /* PL FFT: そのビンの虚部 */
 
 #define ST_FULL     0x1
 #define ST_EMPTY    0x2
@@ -71,25 +72,48 @@ static double now_sec(void)
 static int g_sock = -1;
 static struct sockaddr_in g_dest;
 
+/* 周波数[Hz] → 音名(例 A4)。平均律、A4=440Hz基準 */
+static const char *NOTE[12] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+static void freq_to_note(double f, char *buf)
+{
+    if (f < 20.0) { strcpy(buf, "---"); return; }
+    int midi = (int)(69.0 + 12.0 * log2(f / 440.0) + 0.5);
+    int idx  = ((midi % 12) + 12) % 12;
+    int oct  = midi / 12 - 1;
+    sprintf(buf, "%s%d", NOTE[idx], oct);
+}
+
 /* PL の FFT結果(256ビン)を AXI で読み、振幅をパソコンへ UDP 送信する */
 static void read_send_fft(double sec, double total_sec)
 {
     static float mag[NBIN];
     float mx = 0.0f;
+    int   maxbin = 2;
     for (int k = 0; k < NBIN; k++) {
         reg_write(REG_FBIN, (uint32_t)k);         /* 読みたいビンを選ぶ */
         (void)reg_read(REG_FRE);                  /* ダミー読み: reg_fbin反映を待つ */
         int32_t re = (int32_t)reg_read(REG_FRE);  /* 実部(符号拡張済み) */
         int32_t im = (int32_t)reg_read(REG_FIM);  /* 虚部 */
         mag[k] = sqrtf((float)re * re + (float)im * im);
-        if (mag[k] > mx) mx = mag[k];
+        if (k >= 2 && mag[k] > mx) { mx = mag[k]; maxbin = k; }  /* DC近傍は除外 */
     }
     if (g_sock >= 0)
         sendto(g_sock, mag, sizeof(mag), 0,
                (struct sockaddr *)&g_dest, sizeof(g_dest));
 
-    printf("\r再生 %3.0f/%3.0f秒  maxmag=%.0f", sec, total_sec, mx);   /* 診断 */
-    fflush(stdout);
+    /* ピーク周波数を平滑化し、0.5秒ごとに音名を表示（速すぎて読めないのを防ぐ） */
+    static double freq_sm = 0.0, last_disp = 0.0;
+    double freq = maxbin * FS / 512.0;
+    freq_sm = (freq_sm <= 0.0) ? freq : freq_sm * 0.7 + freq * 0.3;
+    double now = now_sec();
+    if (now - last_disp >= 0.5) {
+        last_disp = now;
+        char note[8];
+        freq_to_note(freq_sm, note);
+        printf("\r再生 %3.0f/%3.0f秒  ピーク %5.0fHz  %-3s   ",
+               sec, total_sec, freq_sm, note);
+        fflush(stdout);
+    }
 }
 
 /* ---- 端末をキー1つずつ・非ブロッキングで読めるようにする ---- */
