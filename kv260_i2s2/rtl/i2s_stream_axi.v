@@ -175,6 +175,8 @@ module i2s_stream_axi #(
     reg [31:0]   reg_dma_len;               // 0xC0 DMA 長さ（バイト）
     reg          dma_start;                 // 0xD0 bit0: 書込で1クロックだけ1
     reg          reg_dma_loop;              // 0xD0 bit1: 1 なら繰り返し再生
+    reg          reg_fm_mode;               // 0xD0 bit2: 1 なら DMA データを IQ とみなし FM 復調する
+    reg [7:0]    reg_fm_vol;                // 0xD0 [15:8]: FM 復調後の音量（64で等倍）
     reg          fifo_wr;                   // FIFOへの書き込み（1クロックだけ1）
     reg [DW-1:0] fifo_wr_data;
 
@@ -191,6 +193,8 @@ module i2s_stream_axi #(
             reg_dma_len  <= 32'd0;
             dma_start    <= 1'b0;
             reg_dma_loop <= 1'b0;
+            reg_fm_mode  <= 1'b0;
+            reg_fm_vol   <= 8'd64;
             fifo_wr      <= 1'b0;
             fifo_wr_data <= {DW{1'b0}};
         end else begin
@@ -214,6 +218,8 @@ module i2s_stream_axi #(
                     5'd13: begin                              // 0xD0 DMA_CTRL
                         dma_start    <= S_AXI_WDATA[0];       //   bit0: 開始
                         reg_dma_loop <= S_AXI_WDATA[1];       //   bit1: 繰り返し
+                        reg_fm_mode  <= S_AXI_WDATA[2];       //   bit2: FM復調モード
+                        reg_fm_vol   <= S_AXI_WDATA[15:8];    //   [15:8]: FM音量
                     end
                     default: ;
                 endcase
@@ -425,8 +431,14 @@ module i2s_stream_axi #(
     //   FIFO が満杯なら受け取らない（out_ready を下げる）＝ 流量制御。
     //   これは PL 内の配線1本で完結し、CPU は関与しない。
     //   1 転送(64bit) を 2 クロックに分けて FIFO へ書く。
-    wire dma_ready  = !dma_half & !fifo_full;   // 前半処理中でなく FIFO に空きがある時だけ受ける
+    //   FM モードでは 20 組の IQ から 1 標本しか出ないので、FIFO はまず詰まらない。
+    //   IQ を止めずに流し続ける（満杯のときだけ待つ）。
+    wire dma_ready  = !dma_half & !fifo_full;
     wire dma_accept = dma_out_valid & dma_ready;
+
+    // FM 復調器の出力（下方でインスタンス化するが、ここで使うので先に宣言）
+    wire               fm_out_valid;
+    wire signed [15:0] fm_out_data;
 
     always @(posedge clk) begin
         if (!rst_n)              dma_last_data <= 32'd0;
@@ -441,20 +453,52 @@ module i2s_stream_axi #(
             dma_fifo_data <= {DW{1'b0}};
         end else begin
             dma_fifo_wr <= 1'b0;
-            if (dma_accept) begin
-                // 1 組目（下位32bit）を今すぐ FIFO へ、2 組目は保持
-                dma_fifo_data <= dma_out_data[31:0];
-                dma_fifo_wr   <= 1'b1;
-                dma_hold      <= dma_out_data[63:32];
-                dma_half      <= 1'b1;
-            end else if (dma_half && !fifo_full) begin
-                // 2 組目（上位32bit）を FIFO へ
-                dma_fifo_data <= dma_hold;
-                dma_fifo_wr   <= 1'b1;
-                dma_half      <= 1'b0;
+
+            if (reg_fm_mode) begin
+                // ---- FM 復調モード ----
+                //   DMA の 64bit には IQ が 2 組（各 I16+Q16）入っている。
+                //   復調器へ順に流し、復調器が出した音声を FIFO へ入れる。
+                if (fm_out_valid) begin
+                    dma_fifo_data <= {fm_out_data, fm_out_data};  // 左右同じ（モノラル）
+                    dma_fifo_wr   <= 1'b1;
+                end
+                // IQ の供給（2 組を 2 クロックに分ける）
+                if (dma_accept)          dma_half <= 1'b1;
+                else if (dma_half)       dma_half <= 1'b0;
+                if (dma_accept)          dma_hold <= dma_out_data[63:32];
+
+            end else begin
+                // ---- そのまま音として鳴らすモード（段11 段階2）----
+                if (dma_accept) begin
+                    // 1 組目（下位32bit）を今すぐ FIFO へ、2 組目は保持
+                    dma_fifo_data <= dma_out_data[31:0];
+                    dma_fifo_wr   <= 1'b1;
+                    dma_hold      <= dma_out_data[63:32];
+                    dma_half      <= 1'b1;
+                end else if (dma_half && !fifo_full) begin
+                    // 2 組目（上位32bit）を FIFO へ
+                    dma_fifo_data <= dma_hold;
+                    dma_fifo_wr   <= 1'b1;
+                    dma_half      <= 1'b0;
+                end
             end
         end
     end
+
+    // ---- FM 復調器（0xD0 bit2 = 1 のとき使う）----
+    //   IQ の並び: DMA 64bit = [63:48]=Q2 [47:32]=I2 [31:16]=Q1 [15:0]=I1
+    //   1 クロック目に 1 組目、2 クロック目に 2 組目を流す。
+    wire               fm_in_valid = reg_fm_mode & (dma_accept | dma_half);
+    wire signed [15:0] fm_in_i = dma_accept ? $signed(dma_out_data[15:0])  : $signed(dma_hold[15:0]);
+    wire signed [15:0] fm_in_q = dma_accept ? $signed(dma_out_data[31:16]) : $signed(dma_hold[31:16]);
+    /* DECIM = IQ の速さ ÷ 音声の速さ = 244140 / 48828 = 5
+     *   （sw/fmradio.c の IQ_RATE と必ず対応させること）*/
+    fm_demod #(.DECIM(5)) u_fm (
+        .clk(clk), .rst_n(rst_n),
+        .in_valid(fm_in_valid), .in_i(fm_in_i), .in_q(fm_in_q), .in_ready(),
+        .out_valid(fm_out_valid), .out_data(fm_out_data),
+        .volume(reg_fm_vol)
+    );
 
     // ---- 繰り返し再生 ----
     //   全部読み終えたら自動で先頭からやり直す。CPU の介入なしで鳴り続ける。

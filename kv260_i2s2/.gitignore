@@ -16,3 +16,9 @@ audio/*.raw
 audio/*.hex
 audio/*.wav
 audio/*.mp3
+
+# 段12: 受信した放送の録音と掃引結果
+#   放送内容そのものなので配布しない。掃引結果は場所ごとに違うので意味がない。
+#   どちらも rtl_fm / rtl_power で各自の環境で取り直せる。
+sw/*.raw
+sw/*.csv
