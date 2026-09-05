@@ -52,12 +52,21 @@ module tb_fm_demod;
             aud = $sin(6.28318530718 * F_AUD * t);
             // 位相を進める（周波数偏移ぶん）
             phase = phase + 6.28318530718 * (DEV * aud) / FS_IQ;
+
+            // ★in_ready に従うこと
+            //   出力段の 15kHz FIR は 1 標本の積和に 63 クロックかかる。
+            //   その間 in_ready が下がるので、無視して送ると計算がやり直しに
+            //   なり続けて出力が出なくなる。実機の DMA も同じ信号で待つ。
+            in_valid <= 1'b0;
             @(posedge clk);
-            in_valid <= 1;
+            while (!in_ready) @(posedge clk);
+
             in_i     <= $rtoi(8000.0 * $cos(phase));
             in_q     <= $rtoi(8000.0 * $sin(phase));
+            in_valid <= 1'b1;
+            @(posedge clk);
         end
-        @(posedge clk); in_valid <= 0;
+        in_valid <= 0;
         #1000;
 
         $display("出力標本数 = %0d", nout);

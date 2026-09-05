@@ -56,12 +56,20 @@ module tb_fm_demod_alias;
                 t   = n / FS_IQ;
                 aud = $sin(6.28318530718 * f_mod * t);
                 phase = phase + 6.28318530718 * (DEV * aud) / FS_IQ;
+
+                // in_ready に従う（出力段の 15kHz FIR が計算中は待つ）
+                //   FIR は 1 標本の積和に 63 クロックかかる。無視して送ると
+                //   計算がやり直しになり続け、出力が出なくなる。
+                in_valid <= 1'b0;
                 @(posedge clk);
-                in_valid <= 1;
+                while (!in_ready) @(posedge clk);
+
                 in_i     <= $rtoi(AMP * $cos(phase));
                 in_q     <= $rtoi(AMP * $sin(phase));
+                in_valid <= 1'b1;
+                @(posedge clk);
             end
-            @(posedge clk); in_valid <= 0;
+            in_valid <= 0;
             #2000;
             result = peak;
         end

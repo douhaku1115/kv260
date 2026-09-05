@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>              /* atan2/tan/log10（コンパイル時 -lm が要る） */
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -42,15 +43,28 @@
 #define REG_DIST     0x70
 #define REG_DMA_ADDR 0xB0
 #define REG_DMA_LEN  0xC0
-#define REG_DMA_CTRL 0xD0              /* bit0=開始 bit1=繰返 bit2=FM復調 [15:8]=FM音量 */
-#define REG_DMA_STAT 0xE0
+#define REG_DMA_CTRL 0xD0              /* bit0=開始 bit1=繰返 bit2=FM復調
+                                          bit3=ステレオ許可 [15:8]=FM音量 */
+#define REG_DMA_STAT 0xE0              /* bit2 = パイロットにロック中 */
+#define REG_PILOT    0x100             /* 19kHz パイロットの強さ */
+#define REG_PQUAD    0x110             /* PLL の直交成分（位相が合えば 0） */
+#define REG_DLEVEL   0x120             /* L−R の平均振幅 */
+#define REG_SLEVEL   0x130             /* L+R の平均振幅 */
 
-/* ★IQ のサンプリング速度 = 48828 × 5
- *   広く取り込むほど不要な雑音が復調器に入る。FM 放送は ±100kHz 程度なので、
- *   244140Hz（±122kHz）に絞ると RTL-SDR 内蔵のフィルタが帯域を制限してくれる。
- *   976560Hz（±488kHz）だと雑音を約5倍取り込むことになる。
+/* ★IQ のサンプリング速度 = 48828 × 20
+ *
+ *   一度 244140（48828×5）に下げたが、これは誤りだった。
+ *   PL の復調器（fm_demod.v）は sin(Δφ) ≒ Δφ の近似を使っており、
+ *     Δφ = 2π × 75000 / fs
+ *   なので fs を下げると Δφ が開く。244140Hz では 110°になり、
+ *   90°を超えて sin が減少に転じるため強く歪む。
+ *
+ *   「雑音を取り込みすぎる」問題は正しいが、対策は**レートを下げること
+ *   ではなく帯域を絞ること**。fm_demod.v の中で、間引かずに
+ *   4点移動平均×3段を掛けて ±122kHz に制限している。
+ *
  *   ※ 出力 48828Hz の整数倍にすること（端数があると間引きで歪む）*/
-#define IQ_RATE      244140            /* IQ のサンプリング速度（48828×5）*/
+#define IQ_RATE      976560            /* IQ のサンプリング速度（48828×20）*/
 #define SECONDS      20                /* 取り込む秒数 */
 #define DEFAULT_FREQ "84.2M"           /* NHK-FM 舞鶴 */
 
@@ -138,15 +152,55 @@ int main(int argc, char **argv)
     wr(REG_DIST,   0);
     wr(REG_CTRL,   1);
 
-    /* PL に FM 復調させる: bit0=開始 bit1=繰返 bit2=FM復調 [15:8]=FM音量 */
+    /* PL に FM 復調させる
+     *   bit0=開始 bit1=繰返 bit2=FM復調 bit3=ステレオ許可 [15:8]=FM音量
+     *
+     *   ★bit3 を立てないとモノラルのままになる。
+     *     PL は 19kHz パイロットを見て自動でステレオ/モノラルを切り替えるので、
+     *     モノラル放送や弱電界でも bit3 は立てたままでよい。
+     *     雑音がひどくて強制的にモノラルにしたいときだけ 0 にする。*/
     wr(REG_DMA_ADDR, BUF_PHYS);
     wr(REG_DMA_LEN,  (uint32_t)(got * 4));
-    wr(REG_DMA_CTRL, (0x40 << 8) | 0x7);
+    wr(REG_DMA_CTRL, (0x40 << 8) | 0xF);
 
-    printf("PL で FM 復調して再生中（繰り返し）\n");
+    printf("PL で FM ステレオ復調して再生中（繰り返し）\n");
     printf("停止: sudo devmem 0xA00000D0 32 0\n");
-    printf("FM音量の変更例: sudo devmem 0xA00000D0 32 0x8007\n");
-    printf("DMA_STAT = 0x%08X\n", rd(REG_DMA_STAT));
+    printf("FM音量の変更例: sudo devmem 0xA00000D0 32 0x800F\n");
+    printf("強制モノラル:   sudo devmem 0xA00000D0 32 0x4007\n");
+    printf("診断(L-Rを聞く): sudo devmem 0xA00000D0 32 0x401F\n");
+    printf("  → 音楽なら本物のL-R / ピーなら折り返し / サーッなら雑音\n");
+
+    /* パイロットの状態を見る。ロックまで約 40ms かかるので少し待つ。
+     *   強さはしきい値 400 と比べる。実機で小さすぎるようなら
+     *   stereo_pll.v の PILOT_TH を下げること。*/
+    usleep(200000);
+    printf("DMA_STAT = 0x%08X  (bit2=パイロットロック)\n", rd(REG_DMA_STAT));
+    printf("パイロット強度 = %d  (しきい値 400)\n", (int)rd(REG_PILOT));
+    printf("ステレオ判定: %s\n", (rd(REG_DMA_STAT) & 0x4) ? "ステレオ" : "モノラル");
+
+    /* ---- 切り分け用の計測を 2 秒おきに 5 回表示 ----
+     *   音を聞いても「位相が悪い」のか「L−R が無い」のか分からないので数字で見る。
+     *
+     *   位相誤差 = atan(PQUAD / PILOT)。38kHz 側ではその 2 倍が効き、
+     *   分離度の上限は 20*log10(1/tan(2*位相誤差)) [dB]。
+     *
+     *   D/S は L−R と L+R の比。ステレオの音楽なら 0.2〜0.8 くらいになる。
+     *   0.05 を切るなら L−R が取れていない。 */
+    for (int k = 0; k < 5; k++) {
+        int32_t quad  = (int32_t)rd(REG_PQUAD);
+        int32_t pilot = (int32_t)rd(REG_PILOT);
+        int32_t dlv   = (int32_t)rd(REG_DLEVEL);
+        int32_t slv   = (int32_t)rd(REG_SLEVEL);
+        double  perr  = (pilot != 0) ? atan2((double)quad, (double)pilot) : 0.0;
+        double  deg   = perr * 180.0 / 3.14159265358979;
+        double  t2    = tan(2.0 * perr);
+        double  lim   = (t2 != 0.0) ? 20.0 * log10(1.0 / fabs(t2)) : 99.0;
+        printf("  パイロット %5d  直交 %6d  位相誤差 %6.2f 度 (分離度上限 %.0f dB)"
+               "   S=%6d D=%6d  D/S=%.3f\n",
+               pilot, quad, deg, lim, slv, dlv,
+               (slv != 0) ? (double)dlv / (double)slv : 0.0);
+        sleep(2);
+    }
 
     munmap(buf, bytes);
     munmap((void *)regs, REG_SIZE);

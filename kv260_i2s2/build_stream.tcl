@@ -17,7 +17,9 @@ create_project $proj_name $proj_dir -part $part -force
 set_property board_part $board [current_project]
 
 # ---- ソース追加 ----
-add_files -norecurse [list $origin_dir/rtl/i2s_stream_axi.v $origin_dir/rtl/audio_fifo.v $origin_dir/rtl/audio_fx.v $origin_dir/rtl/fft512.v $origin_dir/rtl/axi_reader.v $origin_dir/rtl/fm_demod.v $origin_dir/rtl/twiddle_cos.hex $origin_dir/rtl/twiddle_sin.hex]
+#   ★.hex は必ずここに add_files すること。$readmemh は相対パスで探すので、
+#     プロジェクトに入れていないと合成時に「表が全部 x」になって無音になる。
+add_files -norecurse [list $origin_dir/rtl/i2s_stream_axi.v $origin_dir/rtl/audio_fifo.v $origin_dir/rtl/audio_fx.v $origin_dir/rtl/fft512.v $origin_dir/rtl/axi_reader.v $origin_dir/rtl/fm_demod_stereo.v $origin_dir/rtl/stereo_pll.v $origin_dir/rtl/audio_backend.v $origin_dir/rtl/twiddle_cos.hex $origin_dir/rtl/twiddle_sin.hex $origin_dir/rtl/fir15k.hex $origin_dir/rtl/nco_sin.hex]
 add_files -fileset constrs_1 -norecurse $origin_dir/constraints/pmod_i2s2.xdc
 update_compile_order -fileset sources_1
 

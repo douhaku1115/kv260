@@ -30,8 +30,18 @@
 //   0xB0 [RW] DMA_ADDR - 読み出し開始アドレス（DDR 物理アドレス）
 //   0xC0 [RW] DMA_LEN  - 読み出す長さ（バイト）
 //   0xD0 [W]  DMA_CTRL - bit0 に 1 を書くと開始
-//   0xE0 [R]  DMA_STAT - bit0=busy, bit1=done, [31:16]=読んだバイト数の上位
+//                        bit1:繰り返し bit2:FM復調 bit3:ステレオ許可(既定1)
+//                        bit4:診断 - L−R をそのまま左右に出す
+//                        [15:8]:FM復調後の音量
+//   0xE0 [R]  DMA_STAT - bit0=busy, bit1=done, bit2=パイロットにロック中,
+//                        [31:8]=読んだバイト数
 //   0xF0 [R]  DMA_DATA - 最後に読めたデータの下位32ビット（確認用）
+//   0x100 [R] PILOT    - 19kHz パイロットの強さ（ステレオ判定しきい値の調整用）
+//   -- ここから実機での切り分け用（音を聞いても分からないので数字で出す）--
+//   0x110 [R] PQUAD    - PLL の直交成分（符号付き）。位相が合っていれば 0 付近。
+//                        位相誤差 = atan(PQUAD / PILOT)、38kHz 側はその 2 倍
+//   0x120 [R] DLEVEL   - L−R の平均振幅
+//   0x130 [R] SLEVEL   - L+R の平均振幅（DLEVEL と比べる）
 //
 // 【PS 側の手順】
 //   1. CTRL に 1 を書いて再生開始
@@ -177,6 +187,8 @@ module i2s_stream_axi #(
     reg          reg_dma_loop;              // 0xD0 bit1: 1 なら繰り返し再生
     reg          reg_fm_mode;               // 0xD0 bit2: 1 なら DMA データを IQ とみなし FM 復調する
     reg [7:0]    reg_fm_vol;                // 0xD0 [15:8]: FM 復調後の音量（64で等倍）
+    reg          reg_stereo_en;             // 0xD0 bit3: 1 ならステレオ復調を許す
+    reg          reg_diag_d;                // 0xD0 bit4: 1 なら L−R を左右に出す（診断）
     reg          fifo_wr;                   // FIFOへの書き込み（1クロックだけ1）
     reg [DW-1:0] fifo_wr_data;
 
@@ -195,6 +207,8 @@ module i2s_stream_axi #(
             reg_dma_loop <= 1'b0;
             reg_fm_mode  <= 1'b0;
             reg_fm_vol   <= 8'd64;
+            reg_stereo_en <= 1'b1;          // 既定はステレオ許可
+            reg_diag_d   <= 1'b0;
             fifo_wr      <= 1'b0;
             fifo_wr_data <= {DW{1'b0}};
         end else begin
@@ -219,6 +233,8 @@ module i2s_stream_axi #(
                         dma_start    <= S_AXI_WDATA[0];       //   bit0: 開始
                         reg_dma_loop <= S_AXI_WDATA[1];       //   bit1: 繰り返し
                         reg_fm_mode  <= S_AXI_WDATA[2];       //   bit2: FM復調モード
+                        reg_stereo_en <= S_AXI_WDATA[3];      //   bit3: ステレオ許可
+                        reg_diag_d   <= S_AXI_WDATA[4];      //   bit4: L−R を左右に出す
                         reg_fm_vol   <= S_AXI_WDATA[15:8];    //   [15:8]: FM音量
                     end
                     default: ;
@@ -265,6 +281,11 @@ module i2s_stream_axi #(
     wire               dma_busy, dma_done;  // 段11 DMA の状態
     wire [31:0]        dma_read_cnt;
     reg  [31:0]        dma_last_data;       // 最後に読めたデータ(確認用)
+    wire               fm_locked;           // FM ステレオ: パイロットにロック中
+    wire signed [31:0] fm_pilot_level;      // FM ステレオ: パイロットの強さ
+    wire signed [31:0] fm_pilot_quad;       // FM ステレオ: PLL の直交成分
+    wire signed [31:0] fm_sum_level;        // FM ステレオ: L+R の平均振幅
+    wire signed [31:0] fm_diff_level;       // FM ステレオ: L−R の平均振幅
 
     always @(posedge clk) begin
         if (!rst_n)
@@ -285,9 +306,13 @@ module i2s_stream_axi #(
                 5'd10: axi_rdata <= {{16{fft_im[15]}}, fft_im}; // 0xA0 FFT虚部
                 5'd11: axi_rdata <= reg_dma_addr;         // 0xB0 DMA_ADDR
                 5'd12: axi_rdata <= reg_dma_len;          // 0xC0 DMA_LEN
-                // 0xE0 DMA_STAT: bit0=busy, bit1=done, [31:8]=読んだバイト数
-                5'd14: axi_rdata <= {dma_read_cnt[23:0], 6'b0, dma_done, dma_busy};
+                // 0xE0 DMA_STAT: bit0=busy, bit1=done, bit2=パイロットロック
+                5'd14: axi_rdata <= {dma_read_cnt[23:0], 5'b0, fm_locked, dma_done, dma_busy};
                 5'd15: axi_rdata <= dma_last_data;        // 0xF0 最後に読めたデータ(下位32bit)
+                5'd16: axi_rdata <= fm_pilot_level;       // 0x100 パイロットの強さ
+                5'd17: axi_rdata <= fm_pilot_quad;        // 0x110 PLL 直交成分
+                5'd18: axi_rdata <= fm_diff_level;        // 0x120 L−R の平均振幅
+                5'd19: axi_rdata <= fm_sum_level;         // 0x130 L+R の平均振幅
                 default: axi_rdata <= 32'b0;
             endcase
         end
@@ -432,13 +457,19 @@ module i2s_stream_axi #(
     //   これは PL 内の配線1本で完結し、CPU は関与しない。
     //   1 転送(64bit) を 2 クロックに分けて FIFO へ書く。
     //   FM モードでは 20 組の IQ から 1 標本しか出ないので、FIFO はまず詰まらない。
-    //   IQ を止めずに流し続ける（満杯のときだけ待つ）。
-    wire dma_ready  = !dma_half & !fifo_full;
+    //
+    //   ★FM モードでは復調器の都合でも待たせる。
+    //     fm_demod の出力段には 63 タップの FIR があり、1 標本ぶんの積和に
+    //     63 クロックかかる。DMA が IQ を連続で送ってくると間引き点の間隔が
+    //     20 クロックまで詰まり、計算が終わらないうちに次が来てしまう。
+    //     fm_in_ready を見て、計算中は新しい IQ を受け取らない。
+    wire               fm_in_ready;
+    wire dma_ready  = !dma_half & !fifo_full & (!reg_fm_mode | fm_in_ready);
     wire dma_accept = dma_out_valid & dma_ready;
 
     // FM 復調器の出力（下方でインスタンス化するが、ここで使うので先に宣言）
     wire               fm_out_valid;
-    wire signed [15:0] fm_out_data;
+    wire signed [15:0] fm_out_l, fm_out_r;
 
     always @(posedge clk) begin
         if (!rst_n)              dma_last_data <= 32'd0;
@@ -459,7 +490,10 @@ module i2s_stream_axi #(
                 //   DMA の 64bit には IQ が 2 組（各 I16+Q16）入っている。
                 //   復調器へ順に流し、復調器が出した音声を FIFO へ入れる。
                 if (fm_out_valid) begin
-                    dma_fifo_data <= {fm_out_data, fm_out_data};  // 左右同じ（モノラル）
+                    // ステレオ復調の結果をそのまま左右へ。
+                    // パイロットが無い（モノラル放送・弱電界）ときは
+                    // 復調器が自分で L=R に落とすので、ここでの分岐は要らない。
+                    dma_fifo_data <= {fm_out_l, fm_out_r};
                     dma_fifo_wr   <= 1'b1;
                 end
                 // IQ の供給（2 組を 2 クロックに分ける）
@@ -491,13 +525,24 @@ module i2s_stream_axi #(
     wire               fm_in_valid = reg_fm_mode & (dma_accept | dma_half);
     wire signed [15:0] fm_in_i = dma_accept ? $signed(dma_out_data[15:0])  : $signed(dma_hold[15:0]);
     wire signed [15:0] fm_in_q = dma_accept ? $signed(dma_out_data[31:16]) : $signed(dma_hold[31:16]);
-    /* DECIM = IQ の速さ ÷ 音声の速さ = 244140 / 48828 = 5
-     *   （sw/fmradio.c の IQ_RATE と必ず対応させること）*/
-    fm_demod #(.DECIM(5)) u_fm (
+    /* DECIM = IQ の速さ ÷ 音声の速さ = 976560 / 48828 = 20
+     *   （sw/fmradio.c の IQ_RATE と必ず対応させること）
+     *
+     *   ★IQ のレートを下げてはいけない。fm_demod.v は sin(Δφ) ≒ Δφ の近似を
+     *     使っており、244140Hz にすると Δφ が 110°まで開いて破綻する。
+     *     雑音対策の帯域制限は、レートを保ったまま fm_demod.v 内で行う。*/
+    //   ★ステレオ版に差し替え済み（旧 fm_demod.v はモノラル、そのまま残してある）
+    //     ステレオでも後段が 2 本になるだけで、IQ の受け取り方と in_ready の
+    //     意味は同じ。15kHz FIR は 2 チャンネルを同じ添字で同時に積和するので
+    //     所要クロックも 63 のまま変わらない。
+    fm_demod_stereo #(.DECIM(20)) u_fm (
         .clk(clk), .rst_n(rst_n),
-        .in_valid(fm_in_valid), .in_i(fm_in_i), .in_q(fm_in_q), .in_ready(),
-        .out_valid(fm_out_valid), .out_data(fm_out_data),
-        .volume(reg_fm_vol)
+        .in_valid(fm_in_valid), .in_i(fm_in_i), .in_q(fm_in_q), .in_ready(fm_in_ready),
+        .out_valid(fm_out_valid), .out_l(fm_out_l), .out_r(fm_out_r),
+        .volume(reg_fm_vol), .stereo_en(reg_stereo_en), .diag_d(reg_diag_d),
+        .pilot_locked(fm_locked), .pilot_level(fm_pilot_level),
+        .pilot_quad(fm_pilot_quad),
+        .sum_level(fm_sum_level), .diff_level(fm_diff_level)
     );
 
     // ---- 繰り返し再生 ----

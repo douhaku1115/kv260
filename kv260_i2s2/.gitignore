@@ -22,3 +22,8 @@ audio/*.mp3
 #   どちらも rtl_fm / rtl_power で各自の環境で取り直せる。
 sw/*.raw
 sw/*.csv
+
+# ビルド生成物
+#   ビットストリームは build_stream.tcl から再生成できるので置かない（1個 7.5MB）
+simbuild_stereo/
+*.bit
