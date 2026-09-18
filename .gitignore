@@ -3,3 +3,17 @@ vivado.log
 vivado_pid*.str
 __pycache__/
 *.pyc
+
+# ---- 段13 CNN(MNIST) ----
+# .gitignore は行末コメントを解釈しない。コメントは必ず独立した行に書く。
+# Vivado のプロジェクト一式（65MB）。create_cnn_project.tcl で再生成できる
+kv260_cnn/vivado/
+# xsim の作業場。run_sim.sh で再生成できる
+kv260_cnn/simbuild/
+# MNIST 本体（64MB）。train_mnist.py data で取得できる
+kv260_cnn/train/data/
+kv260_cnn/vivado_build.log
+kv260_cnn/vivado_build.jou
+# Vivado が作業中に吐くログ
+dfx_runtime.txt
+retry_open_fs.log
