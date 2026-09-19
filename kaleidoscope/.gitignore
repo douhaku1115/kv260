@@ -1,0 +1,30 @@
+# Vivado 生成物
+project_1/
+*.jou
+*.log
+*.backup.*
+*.str
+.Xil/
+xsim.dir/
+dfx_runtime.txt
+
+# シミュレーション生成物
+sim/build/
+sim/*.ppm
+sim/*.png
+sim/*.vvp
+
+# Vitis 生成物
+_ide/
+
+# 個人設定
+*.user
+
+# xsim の作業場 (sim/run_sim.sh で再生成できる)
+simbuild/
+
+# 参照実装のコピー (tools/make_ref_dump.py で再生成できる。原本は Dropbox 側)
+tools/ref_dump.html
+
+# 合成の生成物 (vivado.tcl で再生成できる。1つ40分)
+xsa/
