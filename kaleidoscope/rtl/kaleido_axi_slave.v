@@ -1,13 +1,13 @@
 // ============================================================
 //  kaleido_axi_slave — 万華鏡のパラメータを PS から受け取る AXI4-Lite スレーブ
 //
-//  ベースアドレス 0xA0000000、範囲 1KB。
+//  ベースアドレス 0xA0000000、範囲 2KB。
 //  レジスタは 0x10 刻みで並べる (kv260_i2s2 で 4 バイト刻みだと
 //  アドレスデコードが噛み合わず届かなかったことがあるため)。
 //
 //  【レジスタマップ】
-//    0x000  CTRL        bit0 = mirror2 (1 = 2枚鏡)
-//    0x010  KX          2^27 / (2 * 720 * focal)        画角
+//    0x000  CTRL        bit0 = mirror2 (1 = 2枚鏡)  bit1 = 文字を出す
+//    0x010  KX          2^26 / (2 * 720 * focal)        画角
 //    0x020  Z_MIRROR    Q16  のぞき穴 → 鏡の手前の端 (cm)
 //    0x030  REMAIN0     Q14  Z_CELL - Z_MIRROR (cm)
 //    0x040  INV_TUBE_R  Q16  1 / 筒の半径
@@ -24,6 +24,10 @@
 //    0x160  COMMIT      書くと、その時点の値を一括で映像側へ渡す
 //    0x170  FRAME_CNT   読み出し専用。PL が数えたフレーム数
 //
+//    0x400 + i*0x10   画面に出す文字 (i = 0〜63)。1 ワードに 4 文字。
+//                     下位バイトが左端。32 桁 x 8 行 = 256 文字。
+//                     ASCII 0x20〜0x7E。それ以外は空白として描かれる。
+//
 //  【クロックの渡し方】
 //    レジスタは AXI クロック領域にある。映像クロック領域へは
 //      PS が値を全部書く → COMMIT に書く → PL がトグルを立てる
@@ -34,7 +38,9 @@
 
 module kaleido_axi_slave #(
     parameter C_S_AXI_DATA_WIDTH = 32,
-    parameter C_S_AXI_ADDR_WIDTH = 10   // 1KB
+    parameter C_S_AXI_ADDR_WIDTH = 11,  // 2KB (0x400 以降に文字を置くため)
+    parameter TEXT_COLS = 32,
+    parameter TEXT_ROWS = 8
 )(
     input  wire                            S_AXI_ACLK,
     input  wire                            S_AXI_ARESETN,
@@ -78,7 +84,13 @@ module kaleido_axi_slave #(
     output reg  [17:0]                     v_vx0, v_vy0,
     output reg  [17:0]                     v_vx1, v_vy1,
     output reg  [17:0]                     v_vx2, v_vy2,
-    output reg                             v_mirror2
+    output reg                             v_mirror2,
+    output reg                             v_text_on,   // CTRL bit1
+
+    // 画面に出す文字。映像側から読む (書き込みは AXI 側、読み出しは映像側の
+    // 単純デュアルポート RAM。PS が書いた文字がそのまま画面に出る)
+    input  wire [10:0]                     text_addr,   // 文字番号 0〜TEXT_COLS*TEXT_ROWS-1
+    output reg  [7:0]                      text_ch
 );
 
     localparam NREG = 23;          // 0x000 〜 0x160
@@ -107,7 +119,7 @@ module kaleido_axi_slave #(
     initial begin
         for (j = 0; j < NREG; j = j + 1) regs[j] = 20'd0;
         regs[0]  = 20'd0;                        // CTRL       3枚鏡
-        regs[1]  = 20'd109655;                   // KX         focal 0.85
+        regs[1]  = 20'd54828;                    // KX         focal 0.85 (zoom=1.0)
         regs[2]  = 20'd19661;                    // Z_MIRROR   0.3 cm
         regs[3]  = 20'd194970;                   // REMAIN0    11.9 cm
         regs[4]  = 20'd29127;                    // INV_TUBE_R 1/2.25
@@ -150,16 +162,39 @@ module kaleido_axi_slave #(
     end
 
     wire       wr_en   = axi_wready && S_AXI_WVALID && axi_awready && S_AXI_AWVALID;
-    wire [5:0] wr_unit = axi_awaddr[9:4];      // 0x10 刻み
+    wire [6:0] wr_unit = axi_awaddr[10:4];     // 0x10 刻み。0〜127
+
+    // ---- 画面に出す文字の置き場 ----
+    //   0x400 + i*0x10 に 4 文字ずつ書く (i = 0〜TEXT_WORDS-1)
+    //   下位バイトが左端の文字。
+    localparam TEXT_CHARS = TEXT_COLS * TEXT_ROWS;      // 32*8 = 256
+    localparam TEXT_WORDS = TEXT_CHARS / 4;             // 64
+    localparam TEXT_BASE  = 7'd64;                      // 0x400 >> 4
+
+    (* ram_style = "block" *)
+    reg [7:0] text_ram [0:TEXT_CHARS-1];
+
+    integer t;
+    initial for (t = 0; t < TEXT_CHARS; t = t + 1) text_ram[t] = 8'h20;   // 空白
 
     always @(posedge S_AXI_ACLK) begin
         if (wr_en) begin
-            if (wr_unit == 6'd22)              // 0x160 COMMIT
+            if (wr_unit == 7'd22)              // 0x160 COMMIT
                 commit_tgl <= ~commit_tgl;
             else if (wr_unit < NREG-1)
                 regs[wr_unit] <= S_AXI_WDATA[19:0];
+            else if (wr_unit >= TEXT_BASE && wr_unit < TEXT_BASE + TEXT_WORDS) begin
+                text_ram[{wr_unit[5:0], 2'd0}]         <= S_AXI_WDATA[7:0];
+                text_ram[{wr_unit[5:0], 2'd0} + 3'd1]  <= S_AXI_WDATA[15:8];
+                text_ram[{wr_unit[5:0], 2'd0} + 3'd2]  <= S_AXI_WDATA[23:16];
+                text_ram[{wr_unit[5:0], 2'd0} + 3'd3]  <= S_AXI_WDATA[31:24];
+            end
         end
     end
+
+    // 映像クロック側から読む。書き込みは AXI クロック側。
+    // 文字は PS が静かに書いてから使うだけなので、普通の単純デュアルポートでよい。
+    always @(posedge clkv) text_ch <= text_ram[text_addr[7:0]];
 
     always @(posedge S_AXI_ACLK) begin
         if (!S_AXI_ARESETN) begin
@@ -205,11 +240,11 @@ module kaleido_axi_slave #(
         frame_cnt_a  <= frame_cnt_a0;
     end
 
-    wire [5:0] rd_unit = S_AXI_ARADDR[9:4];
+    wire [6:0] rd_unit = S_AXI_ARADDR[10:4];
 
     always @(posedge S_AXI_ACLK) begin
         if (~axi_rvalid && S_AXI_ARVALID) begin
-            if (rd_unit == 6'd23)
+            if (rd_unit == 7'd23)
                 axi_rdata <= frame_cnt_a;
             else if (rd_unit < NREG-1)
                 axi_rdata <= {12'd0, regs[rd_unit]};
@@ -238,7 +273,8 @@ module kaleido_axi_slave #(
 
     initial begin
         v_mirror2  = 1'b0;
-        v_kx       = 18'd109655;
+        v_text_on  = 1'b0;
+        v_kx       = 18'd54828;
         v_z_mirror = 18'd19661;
         v_remain0  = 20'd194970;
         v_inv_tr   = 18'd29127;
@@ -255,6 +291,7 @@ module kaleido_axi_slave #(
     always @(posedge clkv) begin
         if (load) begin
             v_mirror2  <= regs[0][0];
+            v_text_on  <= regs[0][1];
             v_kx       <= regs[1][17:0];
             v_z_mirror <= regs[2][17:0];
             v_remain0  <= regs[3];

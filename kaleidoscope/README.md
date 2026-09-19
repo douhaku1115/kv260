@@ -102,19 +102,22 @@ rtl/rtl_top.v           トップ。折り返し → セル読み → 減光 →
 rtl/scope_pipe.v        前段(視線を作る) + scope_stage x K + 後段(セル添字)
 rtl/scope_stage.v       1反射ぶん + 鏡の合わせ目。遅延 12 クロック
 rtl/divq.v              q = a/dn。逆数表+ニュートン。遅延 6 クロック
-rtl/cell_mem.v          セル画像 256x256 RGB565 (BRAM)
+rtl/cell_mem.v          セル画像 256x256 (BRAM)。奥層 RGB565 / 手前層 α付き32bit
+rtl/font_rom.v          画面に出す文字の字形 8x16 ASCII
 rtl/vga_iface.v         VGA タイミング生成 (miya4649)
 rtl/shift_register.v    遅延線
 rtl/cdc_synchronizer.v  クロック載せ替え
 rtl/recip_lut.hex       逆数表 (divq.v)          ┐
 rtl/loss_lut.hex        反射回数ぶんの減光        │ tools/gen_hex.py が生成
 rtl/seam_lut.hex        鏡の合わせ目の係数        ┘
+rtl/font_rom.hex        8x16 の字形 95文字             tools/gen_font.py
 rtl/cell_test.hex       テスト用のセル画像 (市松模様)   tools/gen_hex.py
 rtl/cell_real.hex       参照実装から取り出した本物      tools/cell_from_dump.py
-rtl/cell_init.hex       ★PL が焼き込むのはこれ。上のどちらかをコピーする
-rtl/kaleido_axi_slave.v AXI4-Lite スレーブ (0xA0000000、0x10 刻み)
+rtl/cell_back_init.hex  ★PL が焼き込む奥層             tools/cell_from_dump.py
+rtl/cell_front_init.hex ★PL が焼き込む手前層 (α付き)   tools/cell_from_dump.py
+rtl/kaleido_axi_slave.v AXI4-Lite スレーブ (0xA0000000、2KB、0x10 刻み)
 
-vitis_src/main.c        ベアメタル。DisplayPort の初期化だけ
+vitis_src/main.c        ベアメタル。DP 初期化 + 鏡の形の計算 + キー操作 + 画面の文字
 
 tools/ref_scope.py      参照実装を浮動小数点で書き写したもの（正解画像）
 tools/fx_scope.py       固定小数点モデル。Verilog はこれを写したもの
@@ -132,6 +135,8 @@ tools/make_ref_dump.py  参照実装のコピーに取り出し口を足す (原
 tools/dump_server.py    ブラウザから画像とデータを受け取って ref/dump/ に保存
 tools/cell_from_dump.py 取り出したセル画像を .hex にする
 tools/check_launch.py   Vitis の Debug 構成が指すファイルの日付を一覧
+tools/gen_font.py       Windows の Consolas から 8x16 の字形を起こす
+tools/run_synth_timed.sh 合成を時刻つきで走らせて実測を残す
 
 ref/dump/               参照実装から取り出した実物 (段5 の正解データ)
   cell_back.png         セルの奥層 1024x1024
@@ -196,6 +201,32 @@ SD を抜いてもフルブートする**。それを前提にした手順が下
 
 ---
 
+## 操作
+
+KV260 にはキーボードもマウスも標準では無い。既につながっている USB-UART を
+入力に使う。Tera Term（115200）でキーを打つと設定が変わる。
+**JIS 配列で Shift が要るキー（`<` `>` `+` `=`）は使わない。**
+
+| キー | 動き |
+|---|---|
+| `q` `w` | ポイント数 3〜12 |
+| `m` | ミラー 3枚 / 2枚 |
+| `a` `s` | 模様の大きさ 50〜250 |
+| `z` `x` | 回転の速さ 0〜100 |
+| `i` | 操作一覧をモニターに出す / 消す |
+| `0` | 初期設定に戻す |
+| `h` | 一覧をシリアルに出す |
+
+同じ一覧を HDMI モニタにも出す。画面の下中央 512x256 px の枠に
+32桁 x 8行。PS が AXI の 0x400 以降へ ASCII を書き、PL がフォント ROM
+（8x16 を 2 倍に拡大）で描く。枠の中は 1/4 に暗くして文字を読みやすくする。
+
+**はまった点**: 文字の点を枠で区切らないと、枠の外でも桁・行の添字が
+折り返して同じ一覧が画面いっぱいに並ぶ。枠の暗さと文字の両方を
+同じ「枠の中か」で区切ること。
+
+---
+
 ## 段階
 
 | 段 | 内容 | 状態 |
@@ -204,6 +235,20 @@ SD を抜いてもフルブートする**。それを前提にした手順が下
 | 2 | 折り返し（K=16、静止セル画像） | **実機で確認済み**（2026-09-18） |
 | 3 | 鏡の合わせ目 | **実機で確認済み**（段4 に同梱、2026-09-19） |
 | 4 | AXI でパラメータを渡して回す | **実機で確認済み**（2026-09-19）|
-| 5 | セル画像を PL で描く（ピース） | |
+| 5a | 本物のセル画像を焼き込む・2層合成と影 | **実機で確認済み**（2026-09-19） |
+| 5b | シリアルのキー操作・画面に操作一覧 | **実機で確認済み**（2026-09-19） |
+| 5c | セル画像を PL で描く（ピース9種のラスタライズ） | |
 | 6 | 物理演算を PS で回す | |
-| 7 | 操作（UART / 視線の傾き） | |
+| 7 | 仕上げ（視線の傾き / 遠くの暗さ / 色テーマ） | |
+
+### 合成にかかる時間（実測）
+
+| 工程 | 所要 |
+|---|---|
+| rtl_top の合成（他6個の IP と並列） | 4.5 分 |
+| 全体の合成 synth_1 | 0.9 分 |
+| 配置配線 + ビット生成 impl_1 | 15〜20 分 |
+| **合計** | **21〜26 分** |
+
+段5b 時点の消費: LUT 24125 (20.6%)、FF 19983 (8.5%)、BRAM 96.5 (67.0%)、
+DSP 611 (49.0%)。タイミング WNS +2.143ns、違反 0 / 51270 エンドポイント。

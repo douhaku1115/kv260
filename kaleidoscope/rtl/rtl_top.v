@@ -1,19 +1,27 @@
 // ============================================================
-//  rtl_top — 万華鏡 (段4)
+//  rtl_top — 万華鏡 (段5a: 奥層/手前層の2層合成)
 //
 //  画素クロック 74.25MHz の 1280x720@60 で、1画素ごとに
 //  「のぞき穴から出た光線が鏡で何回か反射してセル面のどこに届くか」
 //  を求め、その位置のセル画像の色を出す。
 //
+//  セル画像は2層ある。
+//    手前層 (z>=0.5)  α付き。位置 c でサンプル
+//    奥層   (z< 0.5)  不透明。位置 c + dir*CELL_GAP でサンプル (視差)
+//    影              手前層の α を少しずらして読み、奥層を暗くする
+//  この視差が立体感を作る。1枚に潰すと平板になり、参照実装との差が倍になる
+//  (実測: 平均差 8.9 → 16.5)。
+//
 //  経路と遅延 (count_h/count_v から video_color まで)
 //    scope_pipe   199 クロック  (setup 4 + 16段 x 12 + out 3)
 //    cell_mem       2 クロック
+//    影で奥層を暗くする  1 クロック
+//    α合成          1 クロック
 //    減光            1 クロック
 //    周辺減光+合わせ目 1 クロック
-//    ------------------------- 合計 203  → vga_iface の PIXEL_DELAY
+//    ------------------------- 合計 205  → vga_iface の PIXEL_DELAY
 //
 //  鏡の形・画角・セルの回転は kaleido_axi_slave から受け取る。
-//  PS が毎フレーム cos/sin を書き換えると模様が回る。
 // ============================================================
 
 module rtl_top
@@ -36,6 +44,11 @@ module rtl_top
    input wire signed [17:0] p_vx1, p_vy1,
    input wire signed [17:0] p_vx2, p_vy2,
    input wire               p_mirror2,
+   input wire               p_text_on,     // 画面に操作一覧を出す
+
+   // 画面に出す文字 (kaleido_axi_slave の中の RAM を引く)
+   output wire [10:0]       text_addr,
+   input wire [7:0]         text_ch,
 
    output wire        frame_start,   // フレーム先頭で 1 クロック (AXI スレーブへ)
 
@@ -49,11 +62,12 @@ module rtl_top
   localparam K         = 16;        // 反射段数
   localparam CELL_BITS = 8;         // セル画像 256x256
 
-  localparam signed [17:0] KSP  = 18'sd11651;   // sp を Q15 にする係数
-  localparam signed [17:0] KVIG = 18'sd9830;    // 0.3 Q15  周辺減光の強さ
+  localparam signed [17:0] KSP      = 18'sd11651;   // sp を Q15 にする係数
+  localparam signed [17:0] KVIG     = 18'sd9830;    // 0.3 Q15  周辺減光の強さ
+  localparam signed [17:0] CELL_GAP = 18'sd22938;   // 0.35 cm Q16  手前層 → 奥層
 
-  localparam SCOPE_LAT = 4 + K*12 + 3;              // = 199
-  localparam TOTAL_LAT = SCOPE_LAT + 2 + 1 + 1;     // = 203
+  localparam SCOPE_LAT = 4 + K*12 + 3;                  // = 199
+  localparam TOTAL_LAT = SCOPE_LAT + 2 + 1 + 1 + 1 + 1; // = 205
 
   // ---- リセット同期 ----
   wire reset, resetv;
@@ -79,7 +93,7 @@ module rtl_top
   assign frame_start = (count_h == 11'd0) && (count_v == 11'd0);
 
   // ============ 万華鏡の折り返し ============
-  wire [CELL_BITS-1:0] cell_ix, cell_iy;
+  wire [CELL_BITS-1:0] fx, fy, bx, by, sx, sy;
   wire [4:0]           nrefl;
   wire [15:0]          seam;
   wire                 black;
@@ -90,7 +104,7 @@ module rtl_top
     (.clk(clkv),
      .count_h(count_h), .count_v(count_v),
      .kx(p_kx), .z_mirror(p_z_mirror), .remain0(p_remain0), .inv_tube_r(p_inv_tr),
-     .cos_t(p_cos_t), .sin_t(p_sin_t),
+     .cos_t(p_cos_t), .sin_t(p_sin_t), .cell_gap(CELL_GAP),
      .nx0(p_nx0), .ny0(p_ny0), .wd0(p_wd0),
      .nx1(p_nx1), .ny1(p_ny1), .wd1(p_wd1),
      .nx2(p_nx2), .ny2(p_ny2), .wd2(p_wd2),
@@ -98,25 +112,157 @@ module rtl_top
      .vx1(p_vx1), .vy1(p_vy1),
      .vx2(p_vx2), .vy2(p_vy2),
      .mirror2(p_mirror2),
-     .out_ix(cell_ix), .out_iy(cell_iy),
+     .out_fx(fx), .out_fy(fy),
+     .out_bx(bx), .out_by(by),
+     .out_sx(sx), .out_sy(sy),
      .out_nrefl(nrefl), .out_seam(seam), .out_black(black));
 
   // ============ セル画像を引く (2 クロック) ============
-  wire [15:0] cell_rgb;
+  wire [15:0] back_d;
+  wire [31:0] front_d;    // 口A: {ablur, a, rgb565}
+  wire [31:0] shadow_d;   // 口B: 影用にずらした位置
 
-  cell_mem #(.CELL_BITS(CELL_BITS), .INIT_FILE("cell_init.hex"))
-  cell_i (.clk(clkv), .ix(cell_ix), .iy(cell_iy), .rgb565(cell_rgb));
+  cell_mem #(.CELL_BITS(CELL_BITS), .DATA_W(16), .INIT_FILE("cell_back_init.hex"))
+  cell_back_i (.clk(clkv), .ix(bx), .iy(by), .data(back_d),
+               .ix2({CELL_BITS{1'b0}}), .iy2({CELL_BITS{1'b0}}), .data2());
 
-  // nrefl / seam / black をセル読み出しに合わせて遅らせる
-  reg [4:0]  nr_d1, nr_d2;
-  reg [15:0] sm_d1, sm_d2;
-  reg        bk_d1, bk_d2, bk_d3;
+  cell_mem #(.CELL_BITS(CELL_BITS), .DATA_W(32), .INIT_FILE("cell_front_init.hex"))
+  cell_front_i (.clk(clkv), .ix(fx), .iy(fy), .data(front_d),
+                .ix2(sx), .iy2(sy), .data2(shadow_d));
+
+  // RGB565 → 8bit
+  function [7:0] r8; input [15:0] c; begin r8 = {c[15:11], c[15:13]}; end endfunction
+  function [7:0] g8; input [15:0] c; begin g8 = {c[10:5],  c[10:9]};  end endfunction
+  function [7:0] b8; input [15:0] c; begin b8 = {c[4:0],   c[4:2]};   end endfunction
+
+  wire [7:0] fa = front_d[23:16];     // 手前層の α
+  wire [7:0] sh = shadow_d[31:24];    // ずらした位置のぼかし α (影)
+
+  // ============ C1: 手前層の影で奥層を暗くする ============
+  //   B' = B * (1 - 0.5*sh/255) = B * (510-sh)/510 ≈ B*(510-sh) >> 9
+  wire [8:0] shk = 9'd510 - {1'b0, sh};
+
+  wire [7:0] rb = r8(back_d);
+  wire [7:0] gb = g8(back_d);
+  wire [7:0] bb = b8(back_d);
+  wire [16:0] rb_m = rb * shk;
+  wire [16:0] gb_m = gb * shk;
+  wire [16:0] bb_m = bb * shk;
+
+  reg [7:0] rb_s, gb_s, bb_s;      // 影を落とした奥層
+  reg [7:0] rf_s, gf_s, bf_s;      // 手前層 (プリマルチプライド済み)
+  reg [7:0] fa_s;
 
   always @(posedge clkv) begin
-    nr_d1 <= nrefl;  nr_d2 <= nr_d1;
-    sm_d1 <= seam;   sm_d2 <= sm_d1;
-    bk_d1 <= black;  bk_d2 <= bk_d1;  bk_d3 <= bk_d2;
+    rb_s <= rb_m[16:9];
+    gb_s <= gb_m[16:9];
+    bb_s <= bb_m[16:9];
+    rf_s <= r8(front_d[15:0]);
+    gf_s <= g8(front_d[15:0]);
+    bf_s <= b8(front_d[15:0]);
+    fa_s <= fa;
   end
+
+  // ============ C2: α合成 ============
+  //   col = F.rgb + B' * (1 - F.a)     手前層はプリマルチプライドα
+  wire [8:0]  inv_a = 9'd255 - {1'b0, fa_s};
+  wire [16:0] rb_c = rb_s * inv_a;
+  wire [16:0] gb_c = gb_s * inv_a;
+  wire [16:0] bb_c = bb_s * inv_a;
+  wire [8:0]  r_sum = {1'b0, rf_s} + rb_c[15:8];
+  wire [8:0]  g_sum = {1'b0, gf_s} + gb_c[15:8];
+  wire [8:0]  b_sum = {1'b0, bf_s} + bb_c[15:8];
+
+  reg [7:0] r_c, g_c, b_c;
+  always @(posedge clkv) begin
+    r_c <= r_sum[8] ? 8'hFF : r_sum[7:0];
+    g_c <= g_sum[8] ? 8'hFF : g_sum[7:0];
+    b_c <= b_sum[8] ? 8'hFF : b_sum[7:0];
+  end
+
+  // ============ nrefl / seam / black を合成の遅れに合わせる ============
+  //   scope_pipe の出力 (199) から、使うところまで遅らせる
+  reg [4:0]  nr_d [0:3];
+  reg [15:0] sm_d [0:3];
+  reg        bk_d [0:4];
+  integer d;
+  always @(posedge clkv) begin
+    nr_d[0] <= nrefl;  sm_d[0] <= seam;  bk_d[0] <= black;
+    for (d = 1; d < 4; d = d + 1) begin
+      nr_d[d] <= nr_d[d-1];
+      sm_d[d] <= sm_d[d-1];
+    end
+    for (d = 1; d < 5; d = d + 1) bk_d[d] <= bk_d[d-1];
+  end
+
+  // ============ 画面に出す文字 (操作一覧) ============
+  //   8x16 のフォントを 2 倍に拡大して 16x32 の枡に描く。
+  //   32 桁 x 8 行 = 512 x 256 px の枠を画面の下寄り中央に置く。
+  //
+  //   万華鏡の計算とは独立なので、count_h/count_v から直接 4 クロックで
+  //   「その画素が文字かどうか」の 1 ビットを作り、あとは
+  //   TOTAL_LAT-4 段の遅延線で色の最終段まで運ぶ。
+  //   座標そのもの (22bit) を遅らせるより桁違いに安い (SRL に入る)。
+  localparam TEXT_COLS = 32;
+  localparam TEXT_ROWS = 8;
+  localparam TEXT_X0   = 11'd384;                    // (1280 - 32*16) / 2
+  localparam TEXT_Y0   = 11'd416;
+  localparam TEXT_W    = TEXT_COLS * 16;             // 512
+  localparam TEXT_H    = TEXT_ROWS * 32;             // 256
+
+  wire [10:0] tx = count_h - TEXT_X0;
+  wire [10:0] ty = count_v - TEXT_Y0;
+  wire        in_box_w = (count_h >= TEXT_X0) && (tx < TEXT_W) &&
+                         (count_v >= TEXT_Y0) && (ty < TEXT_H);
+
+  reg        box_1;
+  reg [2:0]  fx_1;                 // 文字の中の横位置 0〜7
+  reg [3:0]  fy_1;                 // 文字の中の縦位置 0〜15
+  always @(posedge clkv) begin
+    box_1 <= in_box_w;
+    fx_1  <= tx[3:1];              // 2 倍拡大なので 1 ビット落とす
+    fy_1  <= ty[4:1];
+  end
+
+  assign text_addr = {3'd0, ty[7:5], 5'd0} + {6'd0, tx[8:4]};   // row*32 + col
+
+  reg [2:0] fx_2;
+  reg [3:0] fy_2;
+  reg       box_2;
+  always @(posedge clkv) begin
+    fx_2 <= fx_1;  fy_2 <= fy_1;  box_2 <= box_1;
+  end
+
+  wire [7:0] glyph;
+  font_rom #(.INIT_FILE("font_rom.hex"))
+  font_i (.clk(clkv), .ch(text_ch), .row(fy_2), .pixels(glyph));
+
+  reg [2:0] fx_3;
+  reg       box_3;
+  always @(posedge clkv) begin
+    fx_3 <= fx_2;  box_3 <= box_2;
+  end
+
+  reg txt_p, txt_box;
+  always @(posedge clkv) begin
+    txt_p   <= glyph[3'd7 - fx_3];
+    txt_box <= box_3;
+  end
+
+  // 色の最終段まで運ぶ (自分の 4 クロックぶんを差し引く)
+  localparam TXT_DELAY = TOTAL_LAT - 4;
+  reg [1:0] txtd [0:TXT_DELAY-1];
+  integer k;
+  always @(posedge clkv) begin
+    txtd[0] <= {txt_box, txt_p};
+    for (k = 1; k < TXT_DELAY; k = k + 1)
+      txtd[k] <= txtd[k-1];
+  end
+  //   枠の外でも tx/ty が折り返して文字が読めてしまうので、
+  //   文字の点も必ず「枠の中か」で区切る。片方だけ区切ると
+  //   同じ一覧が画面いっぱいに並ぶ (2026-09-19 のシミュレーションで確認)。
+  wire text_on_here = p_text_on & txtd[TXT_DELAY-1][1];
+  wire text_pixel   = text_on_here & txtd[TXT_DELAY-1][0];
 
   // ============ 周辺減光 (4 クロック) ============
   //   vq = 1 - 0.3 * dot(sp,sp)     sp は画面中心からの正規化座標
@@ -144,7 +290,7 @@ module rtl_top
     vq_v <= (vig[30:15] >= 16'd32768) ? 16'd0 : (16'd32768 - vig[30:15]);
 
   // vq を色の最終段まで遅らせる (自身の 4 クロックぶんを差し引く)
-  localparam VQ_DELAY = TOTAL_LAT - 2 - 4;                 // = 197
+  localparam VQ_DELAY = TOTAL_LAT - 2 - 4;                 // = 199
   reg [15:0] vqd [0:VQ_DELAY-1];
   integer i;
   always @(posedge clkv) begin
@@ -159,19 +305,14 @@ module rtl_top
   reg [8:0] loss_lut [0:31];
   initial $readmemh("loss_lut.hex", loss_lut);
 
-  wire [8:0] gain = loss_lut[nr_d2];
-
-  // RGB565 → 8bit
-  wire [7:0] r8 = {cell_rgb[15:11], cell_rgb[15:13]};
-  wire [7:0] g8 = {cell_rgb[10:5],  cell_rgb[10:9]};
-  wire [7:0] b8 = {cell_rgb[4:0],   cell_rgb[4:2]};
+  wire [8:0] gain = loss_lut[nr_d[3]];
 
   // 掛け算は必ず幅を持った wire に受けてから切り出す。
-  //   r_l <= (r8 * gain) >> 8;  と書くと代入先の 8bit で積が切り捨てられ、
+  //   r_l <= (r_c * gain) >> 8;  と書くと代入先の 8bit で積が切り捨てられ、
   //   シフト後にほぼ 0 になる (Verilog の式幅の規則)。
-  wire [16:0] r_m = r8 * gain;
-  wire [16:0] g_m = g8 * gain;
-  wire [16:0] b_m = b8 * gain;
+  wire [16:0] r_m = r_c * gain;
+  wire [16:0] g_m = g_c * gain;
+  wire [16:0] b_m = b_c * gain;
 
   reg [7:0] r_l, g_l, b_l;
   always @(posedge clkv) begin
@@ -181,7 +322,7 @@ module rtl_top
   end
 
   // ============ 周辺減光と合わせ目をかけて出力 ============
-  wire [31:0] vq_sm = vq * sm_d2;
+  wire [31:0] vq_sm = vq * sm_d[3];
   reg [15:0] vq2;
   always @(posedge clkv) vq2 <= vq_sm[30:15];
 
@@ -189,14 +330,22 @@ module rtl_top
   wire [23:0] g_v = g_l * vq2;
   wire [23:0] b_v = b_l * vq2;
 
+  wire [7:0] r_base = bk_d[4] ? 8'd3 : r_v[22:15];   // 筒の縁は暗い色
+  wire [7:0] g_base = bk_d[4] ? 8'd2 : g_v[22:15];
+  wire [7:0] b_base = bk_d[4] ? 8'd3 : b_v[22:15];
+
   reg [7:0] r_o, g_o, b_o;
   always @(posedge clkv) begin
-    if (bk_d3) begin
-      r_o <= 8'd3;  g_o <= 8'd2;  b_o <= 8'd3;   // 筒の縁
+    if (text_pixel) begin
+      r_o <= 8'hFF;  g_o <= 8'hFF;  b_o <= 8'hFF;          // 文字は白
+    end else if (text_on_here) begin
+      r_o <= {2'b00, r_base[7:2]};                          // 枠の中は暗くして読みやすく
+      g_o <= {2'b00, g_base[7:2]};
+      b_o <= {2'b00, b_base[7:2]};
     end else begin
-      r_o <= r_v[22:15];
-      g_o <= g_v[22:15];
-      b_o <= b_v[22:15];
+      r_o <= r_base;
+      g_o <= g_base;
+      b_o <= b_base;
     end
   end
 

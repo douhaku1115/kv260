@@ -27,6 +27,7 @@ echo "=== コンパイル ==="
     "$ROOT/rtl/scope_stage.v" \
     "$ROOT/rtl/scope_pipe.v" \
     "$ROOT/rtl/cell_mem.v" \
+    "$ROOT/rtl/font_rom.v" \
     "$ROOT/rtl/kaleido_axi_slave.v" \
     "$ROOT/rtl/rtl_top.v" \
     "$ROOT/sim/tb_scope.v"

@@ -30,6 +30,10 @@ module scope_pipe
     parameter D_F      = 15,
     parameter Q_F      = 14,
     parameter Q_W      = 20,
+    // 影のずらし量。参照実装の (0.012, -0.016) を添字に直したもの
+    //   round(0.012 * CELL_N/2) = +2,  round(-0.016 * CELL_N/2) = -2  (CELL_N=256)
+    parameter signed [7:0] SHADOW_X =  8'sd2,
+    parameter signed [7:0] SHADOW_Y = -8'sd2,
     parameter LUT_FILE = "recip_lut.hex",
     parameter SEAM_LUT_FILE = "seam_lut.hex"
     )
@@ -41,12 +45,13 @@ module scope_pipe
    input wire [10:0]         count_v,
 
    // パラメータ (PS が AXI で書く。段2 では rtl_top が定数を与える)
-   input wire signed [17:0]  kx,        // 2^27 / (2 * VGA_HEIGHT * focal)
+   input wire signed [17:0]  kx,        // 2^26 / (2 * VGA_HEIGHT * focal)
    input wire signed [17:0]  z_mirror,  // Q16  のぞき穴 → 鏡の手前の端 (cm)
    input wire [Q_W-1:0]      remain0,   // Q_F  Z_CELL - Z_MIRROR (cm)
    input wire signed [17:0]  inv_tube_r,// Q16  1 / TUBE_R
    input wire signed [17:0]  cos_t,     // Q15  セルの回転 (筒を回した見え方)
    input wire signed [17:0]  sin_t,     // Q15
+   input wire signed [17:0]  cell_gap,  // Q16  手前層 → 奥層 (cm)。視差を作る
    input wire signed [17:0]  nx0, ny0, wd0,
    input wire signed [17:0]  nx1, ny1, wd1,
    input wire signed [17:0]  nx2, ny2, wd2,
@@ -55,9 +60,10 @@ module scope_pipe
    input wire signed [17:0]  vx2, vy2,
    input wire                mirror2,
 
-   // 出力
-   output wire [CELL_BITS-1:0] out_ix,
-   output wire [CELL_BITS-1:0] out_iy,
+   // 出力: セル画像を引く添字を3つ出す
+   output wire [CELL_BITS-1:0] out_fx, out_fy,   // 手前層
+   output wire [CELL_BITS-1:0] out_bx, out_by,   // 奥層 (CELL_GAP 分ずれた位置)
+   output wire [CELL_BITS-1:0] out_sx, out_sy,   // 影 (手前層の α をずらして読む)
    output wire [4:0]           out_nrefl,
    output wire [15:0]          out_seam,
    output wire                 out_black
@@ -93,8 +99,13 @@ module scope_pipe
 
   // ============ setup S1: slope = sp / focal ============
   //   slope_q15 = hn * kx >> KX_SH,  kx = 2^(P_F+KX_SH) / (2*VGA_HEIGHT*focal)
-  //   kx を 18bit に収めるため KX_SH = 12 (kx = 2^27/1224 = 109655)
-  localparam KX_SH = 12;
+  //
+  //   KX_SH = 11 にしてある。12 だと zoom を小さく (広角に) したとき
+  //   kx = 2^27/(1440*0.85*zoom) が 18bit (131071) を超えて模様が壊れる。
+  //   境界は zoom = 0.837 で、実機でちょうどそこで崩れるのを確認した。
+  //   11 なら zoom 0.5 でも kx = 109655 で収まる。
+  //   slope の分解能は Q15 のままなので精度は落ちない。
+  localparam KX_SH = 11;
 
   wire signed [30:0] slx_f = hn_0 * kx;
   wire signed [30:0] sly_f = vn_0 * kx;
@@ -188,68 +199,109 @@ module scope_pipe
   wire signed [17:0] fpx = s_done[K] ? s_px[K] : s_px[K] + $signed(fdx[Q_F+17:Q_F]);
   wire signed [17:0] fpy = s_done[K] ? s_py[K] : s_py[K] + $signed(fdy[Q_F+17:Q_F]);
 
-  // ============ out O0: c = p / TUBE_R ============
-  wire signed [35:0] cx_f = fpx * inv_tube_r;
-  wire signed [35:0] cy_f = fpy * inv_tube_r;
+  // ============ out O0: セル上の位置を2つ作る ============
+  //   手前層  c  = p / TUBE_R
+  //   奥層    cB = (p + dir*CELL_GAP) / TUBE_R
+  //
+  //   光線を正規化していないので、参照実装の dir*sl*CELL_GAP は
+  //   そのまま我々の dir*CELL_GAP になる。この視差が2層の立体感を作る。
+  wire signed [35:0] gx = s_dx[K] * cell_gap;          // Q15 * Q16 = Q31
+  wire signed [35:0] gy = s_dy[K] * cell_gap;
+  wire signed [17:0] bpx = fpx + $signed(gx[33:16]);
+  wire signed [17:0] bpy = fpy + $signed(gy[33:16]);
 
-  reg signed [17:0] cx_o, cy_o;
+  wire signed [35:0] cxf_f = fpx * inv_tube_r;
+  wire signed [35:0] cyf_f = fpy * inv_tube_r;
+  wire signed [35:0] cxb_f = bpx * inv_tube_r;
+  wire signed [35:0] cyb_f = bpy * inv_tube_r;
+
+  reg signed [17:0] cxf_o, cyf_o, cxb_o, cyb_o;
   reg [4:0]         nr_o;
   reg [15:0]        sm_o;
   reg               bk_o;
 
   always @(posedge clk) begin
-    cx_o <= $signed(cx_f[33:16]);
-    cy_o <= $signed(cy_f[33:16]);
-    nr_o <= s_nr[K];
-    sm_o <= s_sm[K];
-    bk_o <= s_bk[K];
+    cxf_o <= $signed(cxf_f[33:16]);
+    cyf_o <= $signed(cyf_f[33:16]);
+    cxb_o <= $signed(cxb_f[33:16]);
+    cyb_o <= $signed(cyb_f[33:16]);
+    nr_o  <= s_nr[K];
+    sm_o  <= s_sm[K];
+    bk_o  <= s_bk[K];
   end
 
   // ============ out O1: セルを回す ============
   //   筒を回すと、鏡から見たセルの模様が回る。
   //   c' = rot(theta) * c   (cos/sin は PS が計算して AXI で渡す)
-  wire signed [35:0] rx0 = cx_o * cos_t;
-  wire signed [35:0] rx1 = cy_o * sin_t;
-  wire signed [35:0] ry0 = cx_o * sin_t;
-  wire signed [35:0] ry1 = cy_o * cos_t;
+  wire signed [35:0] fx0 = cxf_o * cos_t;
+  wire signed [35:0] fx1 = cyf_o * sin_t;
+  wire signed [35:0] fy0 = cxf_o * sin_t;
+  wire signed [35:0] fy1 = cyf_o * cos_t;
+  wire signed [35:0] bx0 = cxb_o * cos_t;
+  wire signed [35:0] bx1 = cyb_o * sin_t;
+  wire signed [35:0] by0 = cxb_o * sin_t;
+  wire signed [35:0] by1 = cyb_o * cos_t;
 
-  reg signed [17:0] cx_r, cy_r;
+  reg signed [17:0] cxf_r, cyf_r, cxb_r, cyb_r;
   reg [4:0]         nr_r;
   reg [15:0]        sm_r;
   reg               bk_r;
 
   always @(posedge clk) begin
-    cx_r <= $signed(rx0[32:15]) - $signed(rx1[32:15]);
-    cy_r <= $signed(ry0[32:15]) + $signed(ry1[32:15]);
-    nr_r <= nr_o;
-    sm_r <= sm_o;
-    bk_r <= bk_o;
+    cxf_r <= $signed(fx0[32:15]) - $signed(fx1[32:15]);
+    cyf_r <= $signed(fy0[32:15]) + $signed(fy1[32:15]);
+    cxb_r <= $signed(bx0[32:15]) - $signed(bx1[32:15]);
+    cyb_r <= $signed(by0[32:15]) + $signed(by1[32:15]);
+    nr_r  <= nr_o;
+    sm_r  <= sm_o;
+    bk_r  <= bk_o;
   end
 
   // ============ out O2: セル画像の添字 ============
   //   ix = (c + 1) / 2 * CELL_N    (c は Q P_F の [-1,1])
   localparam SH_IX = P_F + 1 - CELL_BITS;
 
-  wire signed [18:0] ux = cx_r + (19'sd1 <<< P_F);
-  wire signed [18:0] uy = cy_r + (19'sd1 <<< P_F);
+  //   影は手前層の α を SHADOW_X / SHADOW_Y だけずらして読む。
+  //   参照実装の (0.012, -0.016) を添字に直した値 (CELL_N=256 なら +2, -2)。
+  wire signed [18:0] uxf = cxf_r + (19'sd1 <<< P_F);
+  wire signed [18:0] uyf = cyf_r + (19'sd1 <<< P_F);
+  wire signed [18:0] uxb = cxb_r + (19'sd1 <<< P_F);
+  wire signed [18:0] uyb = cyb_r + (19'sd1 <<< P_F);
 
-  reg [CELL_BITS-1:0] ix_o, iy_o;
+  function [CELL_BITS-1:0] to_ix;
+    input signed [18:0] u;
+    begin
+      to_ix = (u < 0) ? {CELL_BITS{1'b0}} :
+              (u >= (19'sd1 <<< (P_F+1))) ? {CELL_BITS{1'b1}} : u[SH_IX +: CELL_BITS];
+    end
+  endfunction
+
+  wire [CELL_BITS-1:0] fx_w = to_ix(uxf);
+  wire [CELL_BITS-1:0] fy_w = to_ix(uyf);
+
+  reg [CELL_BITS-1:0] fx_o, fy_o, bx_o, by_o, sx_o, sy_o;
   reg [4:0]           nr_o2;
   reg [15:0]          sm_o2;
   reg                 bk_o2;
 
   always @(posedge clk) begin
-    ix_o <= (ux < 0) ? {CELL_BITS{1'b0}} :
-            (ux >= (19'sd1 <<< (P_F+1))) ? {CELL_BITS{1'b1}} : ux[SH_IX +: CELL_BITS];
-    iy_o <= (uy < 0) ? {CELL_BITS{1'b0}} :
-            (uy >= (19'sd1 <<< (P_F+1))) ? {CELL_BITS{1'b1}} : uy[SH_IX +: CELL_BITS];
+    fx_o <= fx_w;
+    fy_o <= fy_w;
+    bx_o <= to_ix(uxb);
+    by_o <= to_ix(uyb);
+    sx_o <= fx_w + SHADOW_X[CELL_BITS-1:0];   // 端は巻き込む。影なので支障ない
+    sy_o <= fy_w + SHADOW_Y[CELL_BITS-1:0];
     nr_o2 <= nr_r;
     sm_o2 <= sm_r;
     bk_o2 <= bk_r;
   end
 
-  assign out_ix    = ix_o;
-  assign out_iy    = iy_o;
+  assign out_fx    = fx_o;
+  assign out_fy    = fy_o;
+  assign out_bx    = bx_o;
+  assign out_by    = by_o;
+  assign out_sx    = sx_o;
+  assign out_sy    = sy_o;
   assign out_nrefl = nr_o2;
   assign out_seam  = sm_o2;
   assign out_black = bk_o2;
