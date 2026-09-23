@@ -122,13 +122,61 @@ module rtl_top
   wire [31:0] front_d;    // 口A: {ablur, a, rgb565}
   wire [31:0] shadow_d;   // 口B: 影用にずらした位置
 
-  cell_mem #(.CELL_BITS(CELL_BITS), .DATA_W(16), .INIT_FILE("cell_back_init.hex"))
+  // 奥層は油の地だけを焼き込んでおき、その上へ PL がピースを描く (段5c)。
+  // 口B を書き込みに使うので、影用の読み出しは奥層では使わない。
+  wire        pc_we;
+  wire [2*CELL_BITS-1:0] pc_addr;
+  wire [15:0] pc_wdata;
+
+  cell_mem #(.CELL_BITS(CELL_BITS), .DATA_W(16),
+             .INIT_FILE("cell_oil.hex"), .HAS_WRITE(1))
   cell_back_i (.clk(clkv), .ix(bx), .iy(by), .data(back_d),
-               .ix2({CELL_BITS{1'b0}}), .iy2({CELL_BITS{1'b0}}), .data2());
+               .ix2({CELL_BITS{1'b0}}), .iy2({CELL_BITS{1'b0}}), .data2(),
+               .we(pc_we), .waddr(pc_addr), .wdata(pc_wdata));
 
   cell_mem #(.CELL_BITS(CELL_BITS), .DATA_W(32), .INIT_FILE("cell_front_init.hex"))
   cell_front_i (.clk(clkv), .ix(fx), .iy(fy), .data(front_d),
-                .ix2(sx), .iy2(sy), .data2(shadow_d));
+                .ix2(sx), .iy2(sy), .data2(shadow_d),
+                .we(1'b0), .waddr({2*CELL_BITS{1'b0}}), .wdata(32'd0));
+
+  // ============ ピースを描く (段5c・最小版) ============
+  //   焼き込んだ表を頭から順に描いて止まる。動かすのは次の段。
+  wire        ps_busy, ps_start, ps_premul, ps_done;
+  wire [3:0]  ps_type;
+  wire [8:0]  ps_bw;
+  wire [17:0] ps_npix;
+  wire [7:0]  ps_x0, ps_y0, ps_cr, ps_cg, ps_cb;
+  wire signed [23:0] ps_vqx0, ps_vqy0, ps_qx0, ps_qy0;
+  wire signed [23:0] ps_sxv, ps_syv, ps_sxqx, ps_syqx, ps_sxqy, ps_syqy;
+  wire signed [23:0] ps_seed, ps_e, ps_rot, ps_time, ps_depth;
+
+  pdriver #(.NPIECE(64)) pdrv_i
+    (.clk(clkv), .resetn(~resetv), .seq_busy(ps_busy), .start(ps_start),
+     .p_type(ps_type), .p_bw(ps_bw), .p_npix(ps_npix),
+     .p_x0(ps_x0), .p_y0(ps_y0),
+     .p_vqx0(ps_vqx0), .p_vqy0(ps_vqy0), .p_qx0(ps_qx0), .p_qy0(ps_qy0),
+     .p_sx_vqx(ps_sxv), .p_sy_vqy(ps_syv),
+     .p_sx_qx(ps_sxqx), .p_sy_qx(ps_syqx),
+     .p_sx_qy(ps_sxqy), .p_sy_qy(ps_syqy),
+     .p_seed(ps_seed), .p_e(ps_e), .p_rot(ps_rot), .p_time(ps_time),
+     .p_cr(ps_cr), .p_cg(ps_cg), .p_cb(ps_cb),
+     .p_depth(ps_depth), .p_premul(ps_premul), .all_done(ps_done));
+
+  //  最小版では下の色を読まない (BRAM の口は 1 クロックに読みか書きの
+  //  どちらかだけ)。油の地の上に重ねるので、重なり合う所だけ後勝ちになる。
+  pshade_seq #(.CELLB(CELL_BITS)) pseq_i
+    (.clk(clkv), .resetn(~resetv), .start(ps_start),
+     .p_type(ps_type), .p_bw(ps_bw), .p_npix(ps_npix),
+     .p_x0(ps_x0), .p_y0(ps_y0),
+     .p_vqx0(ps_vqx0), .p_vqy0(ps_vqy0), .p_qx0(ps_qx0), .p_qy0(ps_qy0),
+     .p_sx_vqx(ps_sxv), .p_sy_vqy(ps_syv),
+     .p_sx_qx(ps_sxqx), .p_sy_qx(ps_syqx),
+     .p_sx_qy(ps_sxqy), .p_sy_qy(ps_syqy),
+     .p_seed(ps_seed), .p_e(ps_e), .p_rot(ps_rot), .p_time(ps_time),
+     .p_cr(ps_cr), .p_cg(ps_cg), .p_cb(ps_cb),
+     .p_depth(ps_depth), .p_premul(ps_premul), .busy(ps_busy),
+     .cell_we(pc_we), .cell_addr(pc_addr), .cell_wdata(pc_wdata),
+     .cell_rdata(16'd0), .cell_raddr());
 
   // RGB565 → 8bit
   function [7:0] r8; input [15:0] c; begin r8 = {c[15:11], c[15:13]}; end endfunction

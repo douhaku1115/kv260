@@ -19,7 +19,12 @@ module cell_mem
   #(
     parameter CELL_BITS = 8,
     parameter DATA_W    = 16,
-    parameter INIT_FILE = "cell_init.hex"
+    parameter INIT_FILE = "cell_init.hex",
+    // 1 = 口Bを「書き込み」にする (段5c で PL がピースを描く奥層)。
+    //     BRAM の 1 つの口は 1 クロックに読みか書きのどちらかしかできないので、
+    //     書き込みに使う口では読み出し (ix2/iy2) を諦める。
+    //     奥層はもともと口Bを使っていないので困らない。
+    parameter HAS_WRITE = 0
     )
   (
    input wire                  clk,
@@ -32,7 +37,12 @@ module cell_mem
    // 口B: 影用にずらした位置 (使わないなら ix2/iy2 を 0 に繋いでよい)
    input wire [CELL_BITS-1:0]  ix2,
    input wire [CELL_BITS-1:0]  iy2,
-   output wire [DATA_W-1:0]    data2
+   output wire [DATA_W-1:0]    data2,
+
+   // 口B を書き込みに使うとき (HAS_WRITE = 1)
+   input wire                  we,
+   input wire [2*CELL_BITS-1:0] waddr,
+   input wire [DATA_W-1:0]     wdata
    );
 
   (* ram_style = "block" *)
@@ -45,11 +55,21 @@ module cell_mem
   always @(posedge clk) begin
     a0 <= mem[{iy,  ix}];
     a1 <= a0;
-    b0 <= mem[{iy2, ix2}];
-    b1 <= b0;
   end
 
+  generate
+    if (HAS_WRITE) begin : wport
+      always @(posedge clk) if (we) mem[waddr] <= wdata;
+      assign data2 = {DATA_W{1'b0}};
+    end else begin : rport
+      always @(posedge clk) begin
+        b0 <= mem[{iy2, ix2}];
+        b1 <= b0;
+      end
+      assign data2 = b1;
+    end
+  endgenerate
+
   assign data  = a1;
-  assign data2 = b1;
 
 endmodule

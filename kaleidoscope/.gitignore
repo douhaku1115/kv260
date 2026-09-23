@@ -28,3 +28,9 @@ tools/ref_dump.html
 
 # 合成の生成物 (vivado.tcl で再生成できる。1つ40分)
 xsa/
+
+# ツールが吐く作業ファイル
+xvlog.pb
+xelab.pb
+xsim.log
+sim/kv_parts.json

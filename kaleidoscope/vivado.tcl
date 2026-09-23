@@ -24,6 +24,12 @@ set rtl_files [list \
   $script_dir/rtl/cell_mem.v \
   $script_dir/rtl/kaleido_axi_slave.v \
   $script_dir/rtl/font_rom.v \
+  $script_dir/rtl/pcordic.v \
+  $script_dir/rtl/ptrans.v \
+  $script_dir/rtl/pshade_lane.v \
+  $script_dir/rtl/ppixgen.v \
+  $script_dir/rtl/pshade_seq.v \
+  $script_dir/rtl/pdriver.v \
 ]
 # $readmemh が読む表。tools/gen_hex.py が作る
 set hex_files [list \
@@ -33,6 +39,15 @@ set hex_files [list \
   $script_dir/rtl/cell_back_init.hex \
   $script_dir/rtl/cell_front_init.hex \
   $script_dir/rtl/font_rom.hex \
+  $script_dir/rtl/log2_lut.hex \
+  $script_dir/rtl/exp2_lut.hex \
+  $script_dir/rtl/atan_lut.hex \
+  $script_dir/rtl/pprog.hex \
+  $script_dir/rtl/pprog_base.hex \
+  $script_dir/rtl/pprog_len.hex \
+  $script_dir/rtl/pprog_pre.hex \
+  $script_dir/rtl/pparts.hex \
+  $script_dir/rtl/cell_oil.hex \
 ]
 set pin_xdc_file    $script_dir/pins.xdc
 set timing_xdc_file $script_dir/timings.xdc
