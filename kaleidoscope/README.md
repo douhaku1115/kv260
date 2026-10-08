@@ -102,7 +102,8 @@ rtl/rtl_top.v           トップ。折り返し → セル読み → 減光 →
 rtl/scope_pipe.v        前段(視線を作る) + scope_stage x K + 後段(セル添字)
 rtl/scope_stage.v       1反射ぶん + 鏡の合わせ目。遅延 12 クロック
 rtl/divq.v              q = a/dn。逆数表+ニュートン。遅延 6 クロック
-rtl/cell_mem.v          セル画像 256x256 (BRAM)。奥層 RGB565 / 手前層 α付き32bit
+rtl/cell_mem.v          セル画像 256x256 (BRAM)。段5b まで使った版 (焼き込み可)
+rtl/cell_uram.v         ★セル画像 256x256 (URAM)。奥層 RGB565 / 手前層 α付き32bit
 rtl/font_rom.v          画面に出す文字の字形 8x16 ASCII
 rtl/vga_iface.v         VGA タイミング生成 (miya4649)
 rtl/shift_register.v    遅延線
@@ -113,8 +114,8 @@ rtl/seam_lut.hex        鏡の合わせ目の係数        ┘
 rtl/font_rom.hex        8x16 の字形 95文字             tools/gen_font.py
 rtl/cell_test.hex       テスト用のセル画像 (市松模様)   tools/gen_hex.py
 rtl/cell_real.hex       参照実装から取り出した本物      tools/cell_from_dump.py
-rtl/cell_back_init.hex  ★PL が焼き込む奥層             tools/cell_from_dump.py
-rtl/cell_front_init.hex ★PL が焼き込む手前層 (α付き)   tools/cell_from_dump.py
+rtl/cell_back_init.hex  奥層 (段5b まで焼き込んでいた)  tools/cell_from_dump.py
+rtl/cell_front_init.hex 手前層 α付き。cell_data.c の元  tools/cell_from_dump.py
 rtl/kaleido_axi_slave.v AXI4-Lite スレーブ (0xA0000000、2KB、0x10 刻み)
 
   ---- 段5c: ピースを PL で描く ----
@@ -132,9 +133,11 @@ rtl/log2_lut.hex        log2 の表 2048 点   ┐ tools/gen_pcore_hex.py
 rtl/exp2_lut.hex        exp2 の表 2048 点   │
 rtl/atan_lut.hex        CORDIC の角度表     ┘
 rtl/pparts.hex          焼き込むピース 64 個  ┐ tools/gen_pparts.py
-rtl/cell_oil.hex        油の地だけのセル画像  ┘
+rtl/cell_oil.hex        油の地だけ。cell_data.c の元 ┘
 
 vitis_src/main.c        ベアメタル。DP 初期化 + 鏡の形の計算 + キー操作 + 画面の文字
+vitis_src/cell_data.c   ★起動時に URAM へ流し込むセル画像 (生成物・384KB)
+vitis_src/cell_data.h   同上の宣言                     tools/gen_cell_c.py
 
 tools/ref_scope.py      参照実装を浮動小数点で書き写したもの（正解画像）
 tools/fx_scope.py       固定小数点モデル。Verilog はこれを写したもの
@@ -173,6 +176,7 @@ tools/tb_pixgen_check.py 座標生成の検証      │
 tools/tb_seq_check.py   並び替え器の検証     ┘
 tools/gen_font.py       Windows の Consolas から 8x16 の字形を起こす
 tools/run_synth_timed.sh 合成を時刻つきで走らせて実測を残す
+tools/gen_cell_c.py     セル画像の .hex → vitis_src/cell_data.c (段5d-1)
 
 ref/dump/               参照実装から取り出した実物 (段5 の正解データ)
   cell_back.png         セルの奥層 1024x1024
@@ -274,7 +278,8 @@ KV260 にはキーボードもマウスも標準では無い。既につなが�
 | 5a | 本物のセル画像を焼き込む・2層合成と影 | **実機で確認済み**（2026-09-19） |
 | 5b | シリアルのキー操作・画面に操作一覧 | **実機で確認済み**（2026-09-19） |
 | 5c | セル画像を PL で描く（ピース9種） | **実機で確認済み**（2026-09-24。最小版） |
-| 5d | 詰める・URAM・二重バッファ・AXI でピースを渡す | |
+| 5d-1 | セル画像を BRAM から URAM へ | **実機で確認済み**（2026-10-09。BRAM 94.1% → 28.8%） |
+| 5d-2 | 枠にピースを詰める・下の色に重ねる・二重バッファ・AXI でピースを渡す | |
 | 6 | 物理演算を PS で回す | |
 | 7 | 仕上げ（視線の傾き / 遠くの暗さ / 色テーマ） | |
 
@@ -293,7 +298,14 @@ DSP 611 (49.0%)。タイミング WNS +2.143ns、違反 0 / 51270 エンドポ�
 段5c (最小版) の消費: LUT 82204 (**70.2%**)、FF 53675 (22.9%)、
 BRAM 135.5 (**94.1%**)、URAM 0、DSP 751 (60.2%)。
 WNS **+0.241ns**、違反 0 / 100259。合成 **44分**。
-**BRAM が限界。セル画像を URAM へ移すのが次の必須作業。**
+**BRAM が限界だった。** これが段5d-1 の動機。
+
+段5d-1 (セルを URAM へ) の消費: LUT 82537 (70.5%)、FF 53753 (23.0%)、
+BRAM 41.5 (**28.8%**)、URAM **32 (50.0%)**、DSP 751 (60.2%)。
+WNS **+0.047ns**、違反 0 / 100378。合成 **54分**。
+**BRAM が 65 ポイント空いた。ただしタイミングの余裕はほぼゼロ。**
+URAM は BRAM より遅いので、次に何か足すときはセル読み出しに
+レジスタを 1 段入れる（`vga_iface` の `PIXEL_DELAY` を +1）ことを考える。
 
 ---
 
@@ -375,3 +387,84 @@ A = 不透明度   K = 粒の色に掛ける係数   W = 白を足す量
 - 枠にピースを詰めない
 - 下の色を読まずに上書き（BRAM の口は 1 クロックに読みか書きのどちらかだけ）
 - 二重バッファ無し
+
+---
+
+## 段5d-1 — セル画像を BRAM から URAM へ
+
+段5c で **BRAM が 94.1%** になり、これ以上何も積めなくなった。
+セル画像 2 枚（奥層 65536 x 16bit + 手前層 65536 x 32bit = 3.1Mb）が
+その大半を占めていたので、XCK26 に 18Mb ある URAM へ移した。
+
+結果: **BRAM 135.5 (94.1%) → 41.5 (28.8%)、URAM 0 → 32 (50.0%)**。
+LUT・FF・DSP は変わらない。絵も段5c と同じ（置き場所だけを変えたので）。
+
+### ★ URAM の決まり（2025.2 で実際に合成して確かめた。推測ではない）
+
+**1. 初期値を持てない。**
+`(* ram_style = "ultra" *)` を付けた配列に `$readmemh` があると
+
+```
+WARNING: [Synth 8-12183] ... ignored because a non-zero INIT value
+```
+
+が出て、**黙って BRAM に落ちる**（エラーにならないので気づきにくい）。
+URAM は電源投入時に必ず全 0 で、初期値を焼く仕組みが無い。
+
+**2. 語まるごとしか書けない。**
+
+```
+WARNING: [Synth 8-12186] ... ignored because invalid write mode
+```
+
+- 同じ口で「書きながら読む」形は駄目。`if (we) ... else ...` で分ける
+- `mem[w][sel*16 +: 16] <= d` のような部分選択は、**添字が定数でも駄目**
+- 語全体を書けば載る（実測: 16384 語 x 64bit → URAM 4 個 / BRAM 0）
+
+**3. 深さ 65536 は幅によらず URAM 16 個。**
+URAM1 個は 4096 語 x 72bit なので、深さ 65536 は 16 個を縦に繋ぐことになる。
+72bit に 4 画素詰めれば 1/4 で済むが、2 のせいで部分書き込みに読み直しが
+要るので今はやらない。
+
+**4. クロックが 1 本。** 両方の口が同じクロックで動く。
+
+### 中身をどう入れるか
+
+1 のせいで焼き込めない。起動時に **PS が AXI で流し込む**ことにした。
+
+| 番地 | 名前 | 動き |
+|---|---|---|
+| `0xA0000180` | `CELL_CTRL` | bit0 で奥層/手前層を選ぶ。書くと番地が 0 に戻る |
+| `0xA0000190` | `CELL_DATA` | 今の番地に 1 語入れ、番地が 1 進む |
+
+`vitis_src/main.c` の `LoadCells()` が 65536 語 x 2 枚を書く。**約 13ms**。
+AXI クロックから画素クロックへはトグルを 2 段同期で渡している。
+
+流し込むデータは `tools/gen_cell_c.py` が `.hex` から C の配列にする。
+
+```bash
+python tools/gen_cell_c.py     # → vitis_src/cell_data.c / .h
+```
+
+`cell_data.c` は 1.2MB のソースで、ELF が **+384KB** になる。git には入れず、
+上のコマンドで作る（元の `.hex` は git にある）。Vitis 側では
+`UserConfig.cmake` の `USER_COMPILE_SOURCES` に `"cell_data.c"` を足すこと。
+
+**段5d-2 で手前層も PL が描くようになれば、この配列は要らなくなる。**
+
+### 口の多重化
+
+セルは 2 口あるが、URAM が初期値を持てないので流し込み用の口が要る。
+片方を時期で切り替えた。
+
+| セル | 口A（常時） | 口B |
+|---|---|---|
+| 奥層 | 折り返しが読む | 起動時=流し込み / 以後=ピース描画の書き込み |
+| 手前層 | 折り返しが読む | 起動時=流し込み / 以後=影の読み出し |
+
+### タイミング
+
+**WNS +0.047ns**（段5c は +0.241ns）。違反 0 だが余裕はほぼ無い。
+URAM は BRAM より読み出しが遅いので、次に何か足して落ちたら
+セル読み出しにレジスタを 1 段入れる（`rtl_top.v` の `TOTAL_LAT` を +1 すれば
+`vga_iface` の `PIXEL_DELAY` も追従する）。

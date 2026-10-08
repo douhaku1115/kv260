@@ -7,6 +7,7 @@
 #include "xavbuf.h"
 #include "xavbuf_clk.h"
 #include "xuartps_hw.h"
+#include "cell_data.h"      /* セル画像 (URAM は初期値を持てないので PS が入れる) */
 #include "xdppsu.h"
 #ifndef SDT
 #include "xscugic.h"
@@ -41,6 +42,9 @@
 #define KAL_VERT(v,i) (KAL_BASE + 0x100 + ((v)*2 + (i))*0x10)   /* x,y */
 #define KAL_COMMIT    (KAL_BASE + 0x160)
 #define KAL_FRAME_CNT (KAL_BASE + 0x170)
+/* セル画像の流し込み。URAM は初期値を持てないので起動時にここから入れる */
+#define KAL_CELL_CTRL (KAL_BASE + 0x180)   /* bit0: 0=奥層 1=手前層。書くと番地が0に戻る */
+#define KAL_CELL_DATA (KAL_BASE + 0x190)   /* 書くと今の番地に入り、番地が1進む */
 /* 画面に出す文字。1 ワードに 4 文字、下位バイトが左。32桁 x 8行 = 64 ワード */
 #define KAL_TEXT(i)   (KAL_BASE + 0x400 + (i)*0x10)
 #define TXT_COLS      32
@@ -80,6 +84,7 @@ static void ShowSettings(void);
 static void ShowHelp(void);
 static void HandleKey(int c);
 static void UpdateText(void);
+static void LoadCells(void);
 
 int main(void)
 {
@@ -101,6 +106,14 @@ int main(void)
        （2026-09-18 実機で確認。ログが "Running." まで進まなかった）。
        動作実績のある kv260_pong も割り込みを一切設定していない。
        モニタの抜き差しに追従しなくなるが、表示には影響しない。 */
+    /* ========== セル画像を PL へ流し込む ==========
+     * セル画像は URAM に置いてある。URAM は初期値を持てない
+     * (ram_style="ultra" に $readmemh があると BRAM に落ちる。2025.2 で実測) ので、
+     * ここで 65536 語ずつ 2 枚入れる。約 13ms、起動時の 1 回だけ。
+     * 奥層は油の地だけで、この上に PL がピースを描く。
+     * 将来 PL が 2 枚とも毎フレーム描くようになれば、ここは要らなくなる。 */
+    LoadCells();
+
     /* ========== 万華鏡のパラメータを書く ========== */
     KalSetGeometry();
     UpdateText();                /* 操作一覧をモニターに出す (i キーで消せる) */
@@ -267,6 +280,28 @@ static void HandleKey(int c)
     if (geom) KalSetGeometry();   /* 鏡の法線・頂点・画角を書き直して COMMIT */
     UpdateText();                 /* 画面の一覧にも新しい値を出す。CTRL を最後に書く */
     ShowSettings();
+}
+
+/* ========== セル画像を PL へ流し込む ==========
+ * URAM は初期値を持てないので、起動時にここで入れる。
+ * CELL_CTRL にどちらのセルかを書くと番地が 0 に戻り、あとは
+ * CELL_DATA に 65536 回書くだけでよい (番地は PL 側で進む)。
+ */
+static void LoadCells(void)
+{
+    int i;
+    u32 t0 = Xil_In32(KAL_FRAME_CNT);
+
+    Xil_Out32(KAL_CELL_CTRL, 0);                 /* 奥層。番地を 0 に戻す */
+    for (i = 0; i < CELL_N; i++)
+        Xil_Out32(KAL_CELL_DATA, cell_back[i]);
+
+    Xil_Out32(KAL_CELL_CTRL, 1);                 /* 手前層 */
+    for (i = 0; i < CELL_N; i++)
+        Xil_Out32(KAL_CELL_DATA, cell_front[i]);
+
+    xil_printf("セル画像を入れた (%d 語 x 2、%u フレームぶん)\r\n",
+               CELL_N, (unsigned)(Xil_In32(KAL_FRAME_CNT) - t0));
 }
 
 /* ========== 操作一覧をモニターに出す ==========

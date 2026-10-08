@@ -22,6 +22,7 @@ set rtl_files [list \
   $script_dir/rtl/scope_stage.v \
   $script_dir/rtl/scope_pipe.v \
   $script_dir/rtl/cell_mem.v \
+  $script_dir/rtl/cell_uram.v \
   $script_dir/rtl/kaleido_axi_slave.v \
   $script_dir/rtl/font_rom.v \
   $script_dir/rtl/pcordic.v \
@@ -36,8 +37,6 @@ set hex_files [list \
   $script_dir/rtl/recip_lut.hex \
   $script_dir/rtl/loss_lut.hex \
   $script_dir/rtl/seam_lut.hex \
-  $script_dir/rtl/cell_back_init.hex \
-  $script_dir/rtl/cell_front_init.hex \
   $script_dir/rtl/font_rom.hex \
   $script_dir/rtl/log2_lut.hex \
   $script_dir/rtl/exp2_lut.hex \
@@ -47,7 +46,6 @@ set hex_files [list \
   $script_dir/rtl/pprog_len.hex \
   $script_dir/rtl/pprog_pre.hex \
   $script_dir/rtl/pparts.hex \
-  $script_dir/rtl/cell_oil.hex \
 ]
 set pin_xdc_file    $script_dir/pins.xdc
 set timing_xdc_file $script_dir/timings.xdc
@@ -159,6 +157,10 @@ foreach sig {kx z_mirror remain0 inv_tr cos_t sin_t nx0 ny0 wd0 nx1 ny1 wd1 nx2 
 # 画面に出す文字: rtl_top がアドレスを出し、AXI スレーブの中の RAM が返す
 connect_bd_net [get_bd_pins ${rtl_top_instance}/text_addr] [get_bd_pins ${axi_slave_instance}/text_addr]
 connect_bd_net [get_bd_pins ${axi_slave_instance}/text_ch] [get_bd_pins ${rtl_top_instance}/text_ch]
+# セル画像への流し込み (URAM は初期値を持てないので起動時に PS が入れる)
+foreach sig {cf_we cf_sel cf_addr cf_data} {
+  connect_bd_net [get_bd_pins ${axi_slave_instance}/v_$sig] [get_bd_pins ${rtl_top_instance}/p_$sig]
+}
 
 # ---- アドレス割当: 0xA0000000 (2KB。0x400 以降に文字を置くため) ----
 assign_bd_address -target_address_space [get_bd_addr_spaces ${ps_name}/Data]     [get_bd_addr_segs ${axi_slave_instance}/S_AXI/reg0]     -range 2K -offset 0xA0000000

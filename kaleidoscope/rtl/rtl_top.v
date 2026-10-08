@@ -46,6 +46,12 @@ module rtl_top
    input wire               p_mirror2,
    input wire               p_text_on,     // 画面に操作一覧を出す
 
+   // セル画像への流し込み (URAM は初期値を持てないので起動時に PS が入れる)
+   input wire               p_cf_we,
+   input wire               p_cf_sel,       // 0=奥層 1=手前層
+   input wire [15:0]        p_cf_addr,
+   input wire [31:0]        p_cf_data,
+
    // 画面に出す文字 (kaleido_axi_slave の中の RAM を引く)
    output wire [10:0]       text_addr,
    input wire [7:0]         text_ch,
@@ -122,22 +128,35 @@ module rtl_top
   wire [31:0] front_d;    // 口A: {ablur, a, rgb565}
   wire [31:0] shadow_d;   // 口B: 影用にずらした位置
 
-  // 奥層は油の地だけを焼き込んでおき、その上へ PL がピースを描く (段5c)。
-  // 口B を書き込みに使うので、影用の読み出しは奥層では使わない。
+  // セル画像 2 枚は URAM に置く (段5d)。BRAM が 94% まで来て二重バッファが
+  // 入らなくなったため。URAM へ移すと BRAM が 86 個空く。
+  //   URAM は初期値を持てないので、中身は起動時に PS が AXI で入れる
+  //   (0x180 CELL_CTRL / 0x190 CELL_DATA)。
+  //   奥層はそのあと PL がピースを描き足す。
   wire        pc_we;
   wire [2*CELL_BITS-1:0] pc_addr;
   wire [15:0] pc_wdata;
 
-  cell_mem #(.CELL_BITS(CELL_BITS), .DATA_W(16),
-             .INIT_FILE("cell_oil.hex"), .HAS_WRITE(1))
-  cell_back_i (.clk(clkv), .ix(bx), .iy(by), .data(back_d),
-               .ix2({CELL_BITS{1'b0}}), .iy2({CELL_BITS{1'b0}}), .data2(),
-               .we(pc_we), .waddr(pc_addr), .wdata(pc_wdata));
+  // 奥層の口B: 起動時は PS からの流し込み、そのあとはピース描画の書き込み
+  wire        bw_we    = p_cf_we ? (p_cf_sel == 1'b0) : pc_we;
+  wire [15:0] bw_addr  = p_cf_we ? p_cf_addr : {{(16-2*CELL_BITS){1'b0}}, pc_addr};
+  wire [15:0] bw_data  = p_cf_we ? p_cf_data[15:0] : pc_wdata;
 
-  cell_mem #(.CELL_BITS(CELL_BITS), .DATA_W(32), .INIT_FILE("cell_front_init.hex"))
-  cell_front_i (.clk(clkv), .ix(fx), .iy(fy), .data(front_d),
-                .ix2(sx), .iy2(sy), .data2(shadow_d),
-                .we(1'b0), .waddr({2*CELL_BITS{1'b0}}), .wdata(32'd0));
+  cell_uram #(.DATA_W(16), .AW(2*CELL_BITS))
+  cell_back_i (.clk(clkv),
+               .a_addr({by, bx}), .a_dout(back_d),
+               .b_addr(bw_addr[2*CELL_BITS-1:0]), .b_we(bw_we), .b_din(bw_data),
+               .b_dout());
+
+  // 手前層の口B: 起動時は流し込み、そのあとは影用の読み出し
+  wire        fw_we   = p_cf_we && (p_cf_sel == 1'b1);
+  wire [15:0] fb_addr = p_cf_we ? p_cf_addr : {{(16-2*CELL_BITS){1'b0}}, {sy, sx}};
+
+  cell_uram #(.DATA_W(32), .AW(2*CELL_BITS))
+  cell_front_i (.clk(clkv),
+                .a_addr({fy, fx}), .a_dout(front_d),
+                .b_addr(fb_addr[2*CELL_BITS-1:0]), .b_we(fw_we), .b_din(p_cf_data),
+                .b_dout(shadow_d));
 
   // ============ ピースを描く (段5c・最小版) ============
   //   焼き込んだ表を頭から順に描いて止まる。動かすのは次の段。

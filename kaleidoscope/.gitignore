@@ -34,3 +34,7 @@ xvlog.pb
 xelab.pb
 xsim.log
 sim/kv_parts.json
+
+# セル画像の C 配列 (python tools/gen_cell_c.py で再生成できる。1.2MB)
+vitis_src/cell_data.c
+vitis_src/cell_data.h
