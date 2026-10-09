@@ -120,6 +120,66 @@ def schedule(parts, instr, pre, lanes, pslots):
     return clocks, used, total, groups
 
 
+
+def schedule_slotwise(parts, instr, pre, lanes, pslots, swclk=1):
+    """実装寄りのモデル。ピースの切り替えはスロット境界でしかできない。
+
+    1 スロット = lanes 画素。8 レーンが同時に同じスロットを処理するので、
+    1 つのスロットに 2 つのピースを混ぜると、ピースごとの定数
+    (seed/e/rot・色・奥行きの暗さ) の選択がレーンごとに必要になる。
+    それを避けるため **ピースの画素数をスロット単位に切り上げる**。
+    端数は lane_valid を落として捨てる (平均 lanes/2 画素/ピース)。
+
+    swclk = ppixgen を次のピースに切り替えるのにかかるクロック。
+    """
+    slots_per_warp = WARP
+    by_type = {}
+    for p in parts:
+        by_type.setdefault(int(p["type"]), []).append(p)
+
+    clocks = 0
+    used = 0          # 実際に絵になる画素
+    total = 0         # 走査したい画素
+    groups = 0
+
+    for typ, plist in by_type.items():
+        key = [k for k, v in K.KEY_TO_TYPE.items() if v == typ][0]
+        n_instr = instr[key] + pre[key]
+
+        fill_slots = 0     # いま詰めている枠のスロット数
+        npiece = 0
+        used_in = 0
+        for p in plist:
+            px = bbox_pixels(p)
+            total += px
+            need = (px + lanes - 1) // lanes      # ★ スロット単位に切り上げ
+            real = px
+            while need > 0:
+                if npiece >= pslots or fill_slots >= slots_per_warp:
+                    clocks += n_instr * WARP + swclk * max(0, npiece - 1)
+                    groups += 1
+                    used += used_in
+                    fill_slots, npiece, used_in = 0, 0, 0
+                take = min(need, slots_per_warp - fill_slots)
+                fill_slots += take
+                need -= take
+                # この枠に乗った実画素 (最後の端数だけ lanes に満たない)
+                got = min(real, take * lanes)
+                used_in += got
+                real -= got
+                npiece += 1
+                if need > 0:
+                    clocks += n_instr * WARP + swclk * max(0, npiece - 1)
+                    groups += 1
+                    used += used_in
+                    fill_slots, npiece, used_in = 0, 0, 0
+        if fill_slots:
+            clocks += n_instr * WARP + swclk * max(0, npiece - 1)
+            groups += 1
+            used += used_in
+
+    return clocks, used, total, groups
+
 def main():
     import pasm
     pre = measure_preload()
@@ -141,6 +201,19 @@ def main():
         for pslots in (1, 4, 16):
             for lanes in (8, 12, 16):
                 cl, used, total, groups = schedule(parts, instr, pre, lanes, pslots)
+                waste = 100.0 * (1.0 - used / float(groups * lanes * WARP))
+                f = cl / frame
+                hz = 60.0 / max(1, math.ceil(f))
+                print("   %2d 個まで   %2d    %8.2f M   %5.2f 本   %4.1f%%   %4.1f Hz"
+                      % (pslots, lanes, cl / 1e6, f, waste, hz))
+
+
+        print("\n  ---- 実装寄り (ピースの切り替えはスロット境界のみ) ----")
+        print("  枠に混ぜる   レーン  総クロック   フレーム   無駄    実効Hz")
+        for pslots in (1, 2, 4, 8):
+            for lanes in (8,):
+                cl, used, total, groups = schedule_slotwise(
+                    parts, instr, pre, lanes, pslots)
                 waste = 100.0 * (1.0 - used / float(groups * lanes * WARP))
                 f = cl / frame
                 hz = 60.0 / max(1, math.ceil(f))

@@ -160,7 +160,7 @@ module rtl_top
 
   // ============ ピースを描く (段5c・最小版) ============
   //   焼き込んだ表を頭から順に描いて止まる。動かすのは次の段。
-  wire        ps_busy, ps_start, ps_premul, ps_done;
+  wire        ps_busy, ps_valid, ps_take, ps_premul, ps_done;
   wire [3:0]  ps_type;
   wire [8:0]  ps_bw;
   wire [17:0] ps_npix;
@@ -170,7 +170,7 @@ module rtl_top
   wire signed [23:0] ps_seed, ps_e, ps_rot, ps_time, ps_depth;
 
   pdriver #(.NPIECE(64)) pdrv_i
-    (.clk(clkv), .resetn(~resetv), .seq_busy(ps_busy), .start(ps_start),
+    (.clk(clkv), .resetn(~resetv), .p_take(ps_take), .p_valid(ps_valid),
      .p_type(ps_type), .p_bw(ps_bw), .p_npix(ps_npix),
      .p_x0(ps_x0), .p_y0(ps_y0),
      .p_vqx0(ps_vqx0), .p_vqy0(ps_vqy0), .p_qx0(ps_qx0), .p_qy0(ps_qy0),
@@ -184,7 +184,7 @@ module rtl_top
   //  最小版では下の色を読まない (BRAM の口は 1 クロックに読みか書きの
   //  どちらかだけ)。油の地の上に重ねるので、重なり合う所だけ後勝ちになる。
   pshade_seq #(.CELLB(CELL_BITS)) pseq_i
-    (.clk(clkv), .resetn(~resetv), .start(ps_start),
+    (.clk(clkv), .resetn(~resetv), .p_valid(ps_valid), .p_take(ps_take),
      .p_type(ps_type), .p_bw(ps_bw), .p_npix(ps_npix),
      .p_x0(ps_x0), .p_y0(ps_y0),
      .p_vqx0(ps_vqx0), .p_vqy0(ps_vqy0), .p_qx0(ps_qx0), .p_qy0(ps_qy0),

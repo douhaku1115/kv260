@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
-"""並び替え器が描いたピース 1 個を、Python の正解と突き合わせる。
+"""並び替え器が描いたピースを、Python の正解と突き合わせる。
 
 これが合えば「座標を作る → 演算器で陰影を出す → セルへ重ねる」の
 一本の流れが通ったことになる。合成に進んでよい合図。
 
-  使い方:  python tools/tb_seq_check.py [種類]
+段5d-2 から **1 つの枠に同じ種類のピースを 4 個まで詰める**ようになった。
+個数を 2 つめの引数で渡すと、同じ種類をその数だけ重ならない位置に並べ、
+seed と rot をすべて違う値にして流す。ピースごとの定数
+(seed/e/rot・色・奥行きの暗さ) が枠の中で正しく切り替わるかは
+**これでしか確かめられない**。1 個だけだと切り替えが起きないので通ってしまう。
+
+  使い方:  python tools/tb_seq_check.py [種類] [個数] [半径]
+           python tools/tb_seq_check.py glitter 4
 """
 import math
 import os
@@ -28,6 +35,7 @@ FRAC = 17
 ONE = float(1 << FRAC)
 LANES = 8
 CELL = 256
+WORDS = 24
 
 
 def fx(v):
@@ -72,22 +80,60 @@ def build_case(key, px, py, r, rot, seed, z):
            fx(seed), fx(e), fx(rot), fx(0.0),
            int(col[0] * 255 + .5), int(col[1] * 255 + .5), int(col[2] * 255 + .5),
            fx(depth), premul]
+    assert len(cfg) == WORDS
     meta = dict(x0=x0, y0=y0, w=w, h=h, typ=typ, key=key, px=px, py=py, r=r,
                 rot=rot, seed=seed, z=z, col=col, premul=premul, depth=depth)
     return cfg, meta
 
 
-def want_image(m):
-    """Python 側で同じピースを 1 個描く (黒地の上に重ねる)"""
+def make_cases(key, count, r=None):
+    """同じ種類を count 個、重ならない位置に並べる。
+
+    ★ seed / rot / z をすべて違う値にすること。同じにすると、
+      枠の中でピースごとの定数が入れ替わらなくても絵が合ってしまい、
+      バンクの選択を間違えていても気づけない。
+
+    ★ r を小さくしないと詰まらない。1 枠は LANES*WARP = 192 画素で、
+      r=0.12 だと 1 個で枠を何十個も使ってしまう。実物のラメは
+      112 画素 (r は 0.016 ぐらい) なので、既定は 0.015 にしてある。
+      大きいピースで枠をまたぐ場合を見たいときは r を渡す。
+    """
+    if count == 1 and r is None:
+        return [build_case(key, px=0.1, py=-0.05, r=0.18, rot=0.7, seed=0.37, z=0.7)]
+    if r is None:
+        r = 0.015
+
+    # 格子に置く。間隔は r の何倍も開いているので重ならない
+    spots = [(-0.35, -0.35), (0.35, -0.35), (-0.35, 0.35), (0.35, 0.35),
+             (0.0, -0.7), (0.0, 0.7), (-0.7, 0.0), (0.7, 0.0),
+             (-0.35, 0.0), (0.35, 0.0), (0.0, -0.35), (0.0, 0.35)]
+    out = []
+    for i in range(count):
+        px, py = spots[i % len(spots)]
+        # ★ z は 0〜1 に収める。1 を超えると奥行きの暗さが 1 を超え、
+        #   参照実装にも無い値になる (テストの不備で壊れて見える)
+        z = 0.15 + 0.75 * (i / float(max(1, count - 1)))
+        out.append(build_case(key, px=px, py=py, r=r,
+                              rot=0.3 + 0.41 * i,       # 全部違う
+                              seed=0.11 + 0.17 * i,     # 全部違う
+                              z=z))                     # 奥行きの暗さも違う
+    return out
+
+
+def want_image(metas):
+    """Python 側で同じピースを描く (黒地の上に重ねる)"""
     n = CELL
     buf = np.zeros((n, n, 4))
-    p = {"type": m["typ"], "key": m["key"], "x": m["px"], "y": m["py"],
-         "r": m["r"] / (0.85 + 0.3 * m["z"]),     # draw_parts が掛け戻すので割っておく
-         "z": m["z"], "rot": m["rot"], "seed": m["seed"], "col": m["col"]}
+    ps = []
+    for m in metas:
+        ps.append({"type": m["typ"], "key": m["key"], "x": m["px"], "y": m["py"],
+                   # draw_parts が (0.85+0.3z) を掛け戻すので割っておく
+                   "r": m["r"] / (0.85 + 0.3 * m["z"]),
+                   "z": m["z"], "rot": m["rot"], "seed": m["seed"], "col": m["col"]})
     orig = RC.shade_piece
     RC.shade_piece = K.shade_piece
     try:
-        RC.draw_parts(buf, [p], n, 0.0)
+        RC.draw_parts(buf, ps, n, 0.0)
     finally:
         RC.shade_piece = orig
     return np.clip(buf[..., :3], 0, 1)
@@ -95,14 +141,17 @@ def want_image(m):
 
 def main():
     key = sys.argv[1] if len(sys.argv) > 1 else "glass"
-    cfg, m = build_case(key, px=0.1, py=-0.05, r=0.18, rot=0.7, seed=0.37, z=0.7)
+    count = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+    rad = float(sys.argv[3]) if len(sys.argv) > 3 else None
+    cases = make_cases(key, count, rad)
+    metas = [m for _, m in cases]
 
     os.makedirs(WORK, exist_ok=True)
     with open(os.path.join(WORK, "seq_in.hex"), "w") as f:
-        for v in cfg:
-            f.write("%06x\n" % (v & 0xFFFFFF))
-        for _ in range(32 - len(cfg)):
-            f.write("000000\n")
+        f.write("%06x\n" % count)                 # 0 番地 = 個数
+        for cfg, _ in cases:
+            for v in cfg:
+                f.write("%06x\n" % (v & 0xFFFFFF))
     for h in ("pprog.hex", "pprog_base.hex", "pprog_len.hex", "pprog_pre.hex",
               "log2_lut.hex", "exp2_lut.hex", "atan_lut.hex"):
         with open(os.path.join(ROOT, "rtl", h)) as a, open(os.path.join(WORK, h), "w") as b:
@@ -127,7 +176,7 @@ def main():
         os.remove(out)
     r = sh([os.path.join(VIV, "xsim.bat"), "snap_seq", "-runall"])
     for ln in (r.stdout or "").split("\n"):
-        if "クロック" in ln or "seq_out" in ln:
+        if "PROBE" in ln or "クロック" in ln:
             print("  " + ln.strip())
 
     got = np.zeros((CELL, CELL, 3))
@@ -139,13 +188,13 @@ def main():
         got[y, x] = [((c >> 11) & 31) / 31.0, ((c >> 5) & 63) / 63.0, (c & 31) / 31.0]
         npx += 1
 
-    want = want_image(m)
+    want = want_image(metas)
     d = np.abs(got - want)
-    print("  種類 %s   枠 %dx%d   書いた画素 %d" % (key, m["w"], m["h"], npx))
+    print("  種類 %s x %d 個   枠 %dx%d   書いた画素 %d"
+          % (key, count, metas[0]["w"], metas[0]["h"], npx))
     print("  平均の差 %.2f / 255   最大 %.2f / 255" % (d.mean() * 255, d.max() * 255))
 
     sheet = np.concatenate([got, want, np.clip(d * 6, 0, 1)], axis=1)
-    sub = sheet[max(m["y0"] - 4, 0):m["y0"] + m["h"] + 4]
     Image.fromarray((np.clip(sheet, 0, 1) * 255).astype(np.uint8)).save("sim/seq_cmp.png")
     print("  sim/seq_cmp.png  左=RTL 中=正解 右=差(6倍)")
 

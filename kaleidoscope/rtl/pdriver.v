@@ -7,6 +7,17 @@
 //  本番ではここが AXI のピース表になり、物理演算の結果を毎フレーム受けて
 //  描き直す。いまは「PL がピースを描いて HDMI に出る」ことだけを確かめる。
 //
+//  【渡し方】(段5d-2 で変えた)
+//    p_valid を立てて入口にピースを乗せておく。並び替え器が取り込むと
+//    p_take が 1 クロック返ってくるので、その次の拍から次のピースを出す。
+//    **前は start/busy の握手だったが、1 つの枠に 4 個詰めるには
+//    「枠を流し終える前に次のピースを渡す」必要があるので、こちらに変えた。**
+//
+//  【表は種類ごとにまとまっていること】
+//    1 つの枠には同じ種類のピースしか入れられない (プログラムが違う)。
+//    tools/gen_pparts.py が種類ごとにまとめ、種類の中は z 順に並べてある。
+//    並んでいないと詰まらず、ただ遅くなる (壊れはしない)。
+//
 //  1 個あたり 24 語 x 24bit。並びは tools/gen_pparts.py と揃えてある。
 // ============================================================
 
@@ -21,9 +32,9 @@ module pdriver
   (
    input  wire                  clk,
    input  wire                  resetn,
-   input  wire                  seq_busy,
+   input  wire                  p_take,     // 並び替え器が 1 個取り込んだ
 
-   output reg                   start,
+   output wire                  p_valid,    // 入口にピースが乗っている
    output wire [3:0]            p_type,
    output wire [CB-1:0]         p_bw,
    output wire [2*CB-1:0]       p_npix,
@@ -44,13 +55,16 @@ module pdriver
   initial $readmemh("pparts.hex", tab);
 
   reg [15:0] idx;              // いま何個目か
-  reg [2:0]  st;
-  reg        done;
+  reg [11:0] warm;             // 起動後しばらく待つ (映像側が落ち着いてから)
+  reg        warm_done;
 
-  localparam D_WAIT = 3'd0, D_GO = 3'd1, D_BUSY = 3'd2,
-             D_END = 3'd3, D_WAIT2 = 3'd4;
+  wire done = (idx >= NPIECE);
 
-  wire [15:0] base = idx * WORDS;
+  assign p_valid  = warm_done && !done;
+  assign all_done = done;
+
+  // 表の端を越えないようにする (越えると合成で範囲外の読みになる)
+  wire [15:0] base = done ? 16'd0 : (idx * WORDS);
 
   // 表の 24 語をそのまま並び替え器の入り口へつなぐ
   assign p_type   = tab[base +  0][3:0];
@@ -78,38 +92,15 @@ module pdriver
   assign p_depth  = tab[base + 22];
   assign p_premul = tab[base + 23][0];
 
-  assign all_done = done;
-
-  // 起動後しばらく待ってから流す (映像側が落ち着いてから)
-  reg [11:0] warm;
-
   always @(posedge clk) begin
-    start <= 1'b0;
     if (!resetn) begin
-      idx <= 16'd0; st <= D_WAIT; done <= 1'b0; warm <= 12'd0;
-    end else case (st)
-      D_WAIT: begin
-        if (warm == 12'hFFF) st <= D_GO;
-        else warm <= warm + 12'd1;
-      end
-      D_GO: if (!seq_busy) begin
-        start <= 1'b1;
-        st    <= D_BUSY;
-      end
-      D_BUSY: if (seq_busy) begin
-        st <= D_WAIT2;
-      end
-      D_WAIT2: if (!seq_busy) begin
-        if (idx + 1 == NPIECE) begin
-          done <= 1'b1;
-          st   <= D_END;
-        end else begin
-          idx <= idx + 16'd1;
-          st  <= D_GO;
-        end
-      end
-      default: ;                 // D_END: もう何もしない
-    endcase
+      idx <= 16'd0; warm <= 12'd0; warm_done <= 1'b0;
+    end else if (!warm_done) begin
+      if (warm == 12'hFFF) warm_done <= 1'b1;
+      else warm <= warm + 12'd1;
+    end else if (p_take && !done) begin
+      idx <= idx + 16'd1;
+    end
   end
 
 endmodule

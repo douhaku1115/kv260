@@ -51,11 +51,15 @@ def _ss(x, a, b):
 class Core:
     """1画素ぶんのプログラムを実行する。配列でまとめて回すので絵がそのまま出る"""
 
-    def __init__(self, env):
+    def __init__(self, env, track=False):
         self.r = dict(env)
         self.out = {}
         self.n = 0
         self.units = {}
+        # track=True のとき、命令ごとに「書いた値の絶対値の最大」を覚える。
+        # 固定小数点 S6.17 の範囲 (±64) に入るかを check_range() が見る
+        self.track = track
+        self.peak = {}
 
     def _v(self, x):
         return self.r[x] if isinstance(x, str) and x in self.r else float(x)
@@ -73,6 +77,14 @@ class Core:
             if u:
                 self.units[u] = self.units.get(u, 0) + 1
             self.exec1(op, f)
+            if self.track and f and not op.startswith("OUT"):
+                dsts = (f[0], f[1]) if op in ("ATLEN", "SINCOS") else (f[0],)
+                for d in dsts:
+                    if d in self.r:
+                        m = float(np.abs(self.r[d]).max())
+                        k = "%-6s %s" % (op, d)
+                        if m > self.peak.get(k, -1.0):
+                            self.peak[k] = m
         return self
 
     def exec1(self, op, f):
@@ -202,6 +214,14 @@ OUTK   Kc
 OUTW   Wc
 """
 
+# ★ ph (きらめきの位相) は seed*60 + rot*4 で、そのまま足すと最大 85 になり
+#   S6.17 (±64) をあふれる。既定の構成で**ラメの 14.6% が壊れていた**
+#   (2026-10-09 に check_range() で見つけた。実機でも起きていた)。
+#   seed*60 (最大 60、ぎりぎり入る) を先に 2π で折り返してから rot*4 を
+#   足すことで最大 31.4 に収めている。3 命令増えるが、全体のクロックは
+#   0.74% しか増えない。
+#   time を使うときは PS 側で 2π/0.9 未満に折り返して渡すこと
+#   (sr = seed*0.6+0.3 が最大 0.9 なので、tt の上限が 6.28 になる)。
 PROGS["glitter"] = """
 ATLEN  an, l6, qx, qy
 MULI   sgm, an, %(INV_B6)r
@@ -216,8 +236,11 @@ MADDI  lo, e2, -1, 0.85
 MADDI  hi, e2,  1, 0.85
 SSTEP  s, v, lo, hi
 MADDI  cov, s, -1, 1
-MULI   ph, rot, 4
-MADDC  ph, seed, 60, ph
+MULI   ph, seed, 60
+MULI   pw, ph, %(INV_PI2)r
+FLOOR  pw, pw
+MADDC  ph, pw, %(NPI2)r, ph
+MADDC  ph, rot, 4, ph
 MADDI  sr, seed, 0.6, 0.3
 MUL    tt, sr, time
 ADD    ph, ph, tt
@@ -475,7 +498,7 @@ OUTW   Wc
 SUBST = dict(LX=float(LX), LY=float(LY), LZ=float(LZ),
              NLX=float(-LX), NLY=float(-LY), NLZ=float(-LZ),
              PI2=PI2, INV_PI2=1.0 / PI2, PI3=PI / 3.0,
-             B6=PI2 / 6.0, INV_B6=6.0 / PI2)
+             B6=PI2 / 6.0, INV_B6=6.0 / PI2, NPI2=-PI2)
 
 
 def program(key):
@@ -526,6 +549,75 @@ def check(key, n=200):
     return c.n, c.units, da, dc
 
 
+# ============================================================
+#  固定小数点の範囲を確かめる (S6.17 = ±64)
+# ============================================================
+
+def check_range(key, n=24, lim=64.0, steps=5):
+    """命令の結果が S6.17 (±64) に収まるか、パラメータを振って調べる。
+
+    ★ check() は seed=0.37 / rot=0.9 / z=0.7 / t=3.3 の **1 点しか試さない**。
+      そのため「ある seed と rot の組み合わせだけであふれる」ものを見逃す。
+      実際ラメは ph = rot*4 + seed*60 が最大 85 になり、**既定の構成で
+      14.6% のラメがあふれて実機でも壊れていた** (2026-10-09 に発見)。
+
+    返り値: {"命令 行き先": 絶対値の最大} のうち lim を超えたものと、全体の最大。
+    """
+    typ = K.KEY_TO_TYPE[key]
+    pad = 2.6 if key == "glitter" else 1.2
+    g = np.linspace(-pad, pad, n)
+    vqx, vqy = np.meshgrid(g, g)
+
+    worst = {}
+    allpeak = {}
+    for si in range(steps):
+        seed = si / float(steps - 1)                 # 0 〜 1
+        for ri in range(steps):
+            rot = 2.0 * math.pi * ri / float(steps - 1)   # 0 〜 2π
+            for zi in range(steps):
+                z = zi / float(steps - 1)            # 0 〜 1
+                e = 0.1 + (0.025 - 0.1) * z
+                ca, sa = math.cos(rot), math.sin(rot)
+                qx = ca * vqx - sa * vqy
+                qy = sa * vqx + ca * vqy
+                env = dict(qx=qx, qy=qy, vqx=vqx, vqy=vqy,
+                           seed=np.full_like(qx, seed), z=np.full_like(qx, z),
+                           e=np.full_like(qx, e), rot=np.full_like(qx, rot),
+                           time=np.zeros_like(qx))
+                c = Core(env, track=True).run(program(key))
+                for k, m in c.peak.items():
+                    if m > allpeak.get(k, -1.0):
+                        allpeak[k] = m
+                    if m >= lim and m > worst.get(k, -1.0):
+                        worst[k] = m
+    return worst, allpeak
+
+
+def range_main():
+    order = ["glass", "rod", "hexprism", "blob", "crescent",
+             "bead", "stone", "glitter", "bubble"]
+    print("固定小数点 S6.17 の範囲 (±64) に入るか")
+    print("  seed 0〜1、rot 0〜2π、z 0〜1 を 5 段階ずつ、time は 0")
+    print("  (time を使う種類は PS 側で折り返して渡すこと)")
+    print("")
+    ng = 0
+    for key in order:
+        worst, allpeak = check_range(key)
+        mx = max(allpeak.values())
+        mxk = [k for k, v in allpeak.items() if v == mx][0]
+        if worst:
+            ng += 1
+            print("  %-9s ★あふれ %d 箇所" % (key, len(worst)))
+            for k, v in sorted(worst.items(), key=lambda kv: -kv[1]):
+                print("              %s  最大 %.2f" % (k, v))
+        else:
+            print("  %-9s OK  いちばん大きいのは %s の %.2f" % (key, mxk, mx))
+    print("")
+    print("  %s" % ("★ あふれる種類が %d つある" % ng if ng
+                    else "全部 ±64 に収まる"))
+
+
+
 def main():
     order = ["glass", "rod", "hexprism", "blob", "crescent", "bead", "stone", "glitter", "bubble"]
     names = {p[0]: p[1] for p in __import__("piece_table").KV_PIECES}
@@ -571,3 +663,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    print()
+    range_main()

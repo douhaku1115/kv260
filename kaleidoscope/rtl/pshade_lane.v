@@ -52,6 +52,11 @@ module pshade_lane
    //   seed / z / e / rot / time は 1 つのピースの中では変わらない。
    //   レジスタファイルへ画素ごとに書くと、それだけで 4 命令ぶん損をする。
    //   r4〜r8 の読み出しをここへ振り向けて、書き込みを無くす。
+   //
+   //   ★ 段5d-2 から、1 つの枠に 4 個までのピースが混ざる。
+   //     並び替え器が「いま発行しているスロットのピース」に合わせて
+   //     切り替えて渡してくるので、**スロットごとに変わる値**になった。
+   //     下の pick() は ra_r (1 段遅れ) で引くので、ここも 1 段遅らせる。
    input  wire signed [W-1:0]   pc_seed,   // r4
    input  wire signed [W-1:0]   pc_z,      // r5
    input  wire signed [W-1:0]   pc_e,      // r6
@@ -100,25 +105,47 @@ module pshade_lane
     ra_r <= ra;  rb_r <= rb;  rc_r <= rc;
   end
 
+  // ★ ピースごとの定数も 1 段遅らせる。
+  //   枠に 4 個混ざるようになって、これがスロットごとに変わる値になった。
+  //   遅らせないと 1 スロット前のピースの seed/e/rot を読み、
+  //   枠の継ぎ目にあたるピースだけ形が崩れる (他は合うので気づきにくい)。
+  reg signed [W-1:0] pcs_r, pcz_r, pce_r, pcr_r, pct_r;
+  always @(posedge clk) begin
+    pcs_r <= pc_seed;
+    pcz_r <= pc_z;
+    pce_r <= pc_e;
+    pcr_r <= pc_rot;
+    pct_r <= pc_time;
+  end
+
   // r4〜r8 はピースごとの定数。レジスタファイルの値を捨ててこちらを使う
+  //
+  //  ★★ 定数は必ず**引数で**渡すこと。関数の中から外の信号を直に参照して
+  //    `assign va = pick(ra_r, va_r);` と書くと、継続代入の感度リストには
+  //    **引数しか入らない**。定数が変わっても va が作り直されず、
+  //    1 つ前のスロットのピースの値のまま計算が進む。
+  //    段5c までは定数が全スロットで同じだったので露出しなかった。
+  //    枠に 4 個詰めた段5d-2 で、2 個目以降のピースだけ形が崩れて見つけた
+  //    (ra_r=4・pcs_r=正しい値 なのに va=前のピースの値 という矛盾が出る)。
   function signed [W-1:0] pick;
     input [RBITS-1:0]    n;
     input signed [W-1:0] rf;
+    input signed [W-1:0] c4, c5, c6, c7, c8;
     begin
       case (n)
-        5'd4:    pick = pc_seed;
-        5'd5:    pick = pc_z;
-        5'd6:    pick = pc_e;
-        5'd7:    pick = pc_rot;
-        5'd8:    pick = pc_time;
+        5'd4:    pick = c4;
+        5'd5:    pick = c5;
+        5'd6:    pick = c6;
+        5'd7:    pick = c7;
+        5'd8:    pick = c8;
         default: pick = rf;
       endcase
     end
   endfunction
 
-  wire signed [W-1:0] va = pick(ra_r, va_r);
-  wire signed [W-1:0] vb = pick(rb_r, vb_r);
-  wire signed [W-1:0] vc = pick(rc_r, vc_r);
+  wire signed [W-1:0] va = pick(ra_r, va_r, pcs_r, pcz_r, pce_r, pcr_r, pct_r);
+  wire signed [W-1:0] vb = pick(rb_r, vb_r, pcs_r, pcz_r, pce_r, pcr_r, pct_r);
+  wire signed [W-1:0] vc = pick(rc_r, vc_r, pcs_r, pcz_r, pce_r, pcr_r, pct_r);
 
   // ============ 段1: 発行を 1 段そろえる ============
   reg                v1;

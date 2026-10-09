@@ -1,9 +1,8 @@
 // ============================================================
-//  pshade_seq — ピース描画の並び替え器（最小版）
+//  pshade_seq — ピース描画の並び替え器
 //
-//  PS が AXI でピースを 1 個書いて start を立てると、PL が枠の中を走査して
-//  その 1 個をセル画像へ描く。段5c を実機で見るための最小構成で、
-//  本番で要る「枠に 4 個まで詰める」「二重バッファ」「URAM」は入っていない。
+//  ピース表から 1 個ずつ取り、枠の中を走査してセル画像へ描く。
+//  **1 つの枠に同じ種類のピースを 4 個まで詰める**（段5d-2）。
 //
 //  【PS がやること・PL がやること】
 //    枠の大きさ・座標の増分・1/r・sin/cos は **PS が計算して渡す**。
@@ -11,17 +10,42 @@
 //    0.3ms 程度で、A53 には軽い。
 //
 //  【1 枠の流れ】
+//    TAKE  入口のピースを自分のレジスタへ取り込み、次のピースを要求する
 //    PRE   毎画素の初期値をレーンのレジスタへ書く (種類ごとに 2〜4 個)
 //          1 スロットぶんを続けて書いてから座標を 1 つ進める
+//          いまのピースが尽きたら、同じ種類の次のピースを同じ枠に混ぜる
 //    EXEC  プログラムを 1 命令ずつ、WARP 画素ぶん続けて発行する
 //    DRAIN パイプラインが空くまで待つ
 //    BLEND 出てきた A/K/W から色を作ってセルへ重ねる (1 画素ずつ)
 //
-//  【最小版で割り切ったところ】
-//    ・枠にピースを詰めない → 小さいピースで枠が余る（実測 8〜12% の無駄）
+//  【なぜ詰めるのか】(tools/pshade_sched.py で実測)
+//    1 枠は LANES*WARP = 192 画素ぶんある。ラメは 1 個 112 画素しかないので、
+//    詰めないと枠の 42% が空で回る。全体では無駄 19.3%、上限構成では
+//    2.14 フレーム = 20Hz にしかならない。
+//
+//      枠に混ぜる   既定 271 個        上限 625 個
+//        1 個       0.67 本 / 19.3%   2.17 本 / 12.3% → 20Hz
+//        2 個       0.54 本 /  4.5%   1.88 本 /  2.3% → 30Hz
+//        4 個       0.52 本 /  1.6%   1.84 本 /  0.7% → 30Hz
+//        8 個       変わらず           変わらず
+//
+//    4 個で頭打ちなので 4 個にした。
+//
+//  【ピースの切り替えはスロット境界だけ】
+//    1 スロット = LANES 画素を 8 レーンが同時に処理する。1 つのスロットに
+//    2 個のピースを混ぜると、ピースごとの定数 (seed/e/rot・色・奥行きの
+//    暗さ) の選択が**レーンごと**に要る。それを避けるため、ピースの
+//    画素数をスロット単位に切り上げる。端数 (平均 4 画素/ピース) は
+//    lane_valid を落として捨てる。上の表はこの端数を含めて測ったもの。
+//
+//  【ピースごとの定数は 4 個ぶんのバンクに持つ】
+//    枠に 4 個混ざるので、スロットごとに「どのピースか」を 2bit で覚え
+//    (cPS)、発行する拍にバンクから選んでレーンへ渡す。
+//    レーン側 (pshade_lane.v) は pick() を 1 段遅らせて受ける。
+//
+//  【まだ割り切っているところ】
+//    ・二重バッファ無し → 描き換え中の絵が映る (ちらつく)
 //    ・合成が 1 画素ずつ → 1 枠あたり LANES*WARP クロック余計にかかる
-//    ・二重バッファなし → 描き換え中の絵が映る（ちらつく）
-//    どれも本番で直す。まず「PL がピースを描いて HDMI に出る」ことを確かめる。
 // ============================================================
 
 module pshade_seq
@@ -33,14 +57,19 @@ module pshade_seq
     parameter LAT   = 22,
     parameter CB    = 9,        // 枠の中の座標
     parameter AB    = 16,       // セルの番地 (256x256 = 65536)
-    parameter CELLB = 8         // セルの一辺のビット数 (256)
+    parameter CELLB = 8,        // セルの一辺のビット数 (256)
+    parameter PMIX  = 4         // 1 つの枠に混ぜられるピースの数
     )
   (
    input  wire                  clk,
    input  wire                  resetn,
 
-   // ---- PS から (AXI スレーブ経由) ----
-   input  wire                  start,      // 1 クロック。ピースを 1 個描く
+   // ---- ピースの供給元から (pdriver / AXI のピース表) ----
+   //   p_valid が立っている間、入口には「次に描くピース」が乗っている。
+   //   こちらが取り込んだ拍に p_take を 1 クロック返すので、
+   //   供給元はその次の拍から**さらに次のピース**を出すこと。
+   input  wire                  p_valid,
+   output reg                   p_take,
    input  wire [3:0]            p_type,
    input  wire [CB-1:0]         p_bw,
    input  wire [2*CB-1:0]       p_npix,
@@ -79,6 +108,26 @@ module pshade_seq
   reg [3:0] pre_mask [0:15];
   initial $readmemh("pprog_pre.hex", pre_mask);
 
+  // ============ いま走査しているピース ============
+  //  入口の値は p_take のあと「次のピース」に変わってしまうので、
+  //  取り込んで自分で持つ。ppixgen と枠の左上の座標はこちらを使う。
+  reg [CB-1:0]       cp_bw;
+  reg [2*CB-1:0]     cp_npix;
+  reg [CELLB-1:0]    cp_x0, cp_y0;
+  reg signed [W-1:0] cp_vqx0, cp_vqy0, cp_qx0, cp_qy0;
+  reg signed [W-1:0] cp_sx_vqx, cp_sy_vqy, cp_sx_qx, cp_sy_qx, cp_sx_qy, cp_sy_qy;
+
+  // ============ ピースごとの定数バンク (枠に混ざる 4 個ぶん) ============
+  reg signed [W-1:0] pb_seed [0:PMIX-1];
+  reg signed [W-1:0] pb_e    [0:PMIX-1];
+  reg signed [W-1:0] pb_rot  [0:PMIX-1];
+  reg signed [W-1:0] pb_time [0:PMIX-1];
+  reg [7:0]          pb_cr   [0:PMIX-1];
+  reg [7:0]          pb_cg   [0:PMIX-1];
+  reg [7:0]          pb_cb   [0:PMIX-1];
+  reg signed [W-1:0] pb_depth[0:PMIX-1];
+  reg [PMIX-1:0]     pb_premul;
+
   // ============ 座標を作る ============
   wire [LANES-1:0]      lv;
   wire [LANES*W-1:0]    lvqx, lvqy, lqx, lqy;
@@ -89,10 +138,10 @@ module pshade_seq
   wire                  pg_load, pg_step;
 
   ppixgen #(.W(W), .LANES(LANES), .CB(CB)) pix_i
-    (.clk(clk), .load(pg_load), .bw(p_bw), .npix(p_npix),
-     .vqx0(p_vqx0), .vqy0(p_vqy0), .qx0(p_qx0), .qy0(p_qy0),
-     .sx_vqx(p_sx_vqx), .sy_vqy(p_sy_vqy),
-     .sx_qx(p_sx_qx), .sy_qx(p_sy_qx), .sx_qy(p_sx_qy), .sy_qy(p_sy_qy),
+    (.clk(clk), .load(pg_load), .bw(cp_bw), .npix(cp_npix),
+     .vqx0(cp_vqx0), .vqy0(cp_vqy0), .qx0(cp_qx0), .qy0(cp_qy0),
+     .sx_vqx(cp_sx_vqx), .sy_vqy(cp_sy_vqy),
+     .sx_qx(cp_sx_qx), .sy_qx(cp_sy_qx), .sx_qy(cp_sx_qy), .sy_qy(cp_sy_qy),
      .step(pg_step),
      .lane_valid(lv), .lane_vqx(lvqx), .lane_vqy(lvqy),
      .lane_qx(lqx), .lane_qy(lqy), .lane_x(lx), .lane_y(ly), .done());
@@ -104,6 +153,8 @@ module pshade_seq
   reg signed [W-1:0]   l_imm0, l_imm1;
   reg [4:0]            l_slot;
   reg signed [W-1:0]   l_pre [0:LANES-1];
+  // いま発行しているスロットのピースの定数 (バンクから選んで渡す)
+  reg signed [W-1:0]   l_seed, l_e, l_rot, l_time;
 
   wire signed [W-1:0]  o_val  [0:LANES-1];
   wire [LANES-1:0]     o_we;
@@ -138,8 +189,8 @@ module pshade_seq
          .rd(l_rd), .ra(l_ra), .rb(l_rb), .rc(l_rc),
          .imm0(l_imm0), .imm1(l_imm1), .slot(l_slot),
          .preload(l_preload), .pre_val(l_pre[g]),
-         .pc_seed(p_seed), .pc_z(24'sd0), .pc_e(p_e),
-         .pc_rot(p_rot), .pc_time(p_time),
+         .pc_seed(l_seed), .pc_z(24'sd0), .pc_e(l_e),
+         .pc_rot(l_rot), .pc_time(l_time),
          .out_val(o_val[g]), .out_we(o_we[g]),
          .out_rd(o_rd[g]), .out_slot(o_slot[g]));
     end
@@ -153,6 +204,9 @@ module pshade_seq
   reg signed [W-1:0] cW [0:LANES*WARP-1];
   reg [AB-1:0]       cAD [0:LANES*WARP-1];
   reg [LANES*WARP-1:0] cVD;
+  // スロットごとに「どのピースか」。合成と命令発行の両方で引く。
+  // bi_d2 が WARP を少し超えるところまで引くので 32 個とっておく
+  reg [1:0]          cPS [0:31];
 
   integer gi;
   always @(posedge clk) begin
@@ -166,18 +220,21 @@ module pshade_seq
   end
 
   // ============ 本体の状態機械 ============
-  localparam S_IDLE  = 3'd0, S_LOAD = 3'd1, S_PRE = 3'd2,
-             S_EXEC  = 3'd3, S_DRAIN = 3'd4, S_BLEND = 3'd5, S_NEXT = 3'd6;
+  localparam S_IDLE  = 4'd0, S_TAKE  = 4'd1, S_LOADX = 4'd2, S_LOAD = 4'd3,
+             S_PRE   = 4'd4, S_EXEC  = 4'd5, S_DRAIN = 4'd6, S_BLEND = 4'd7,
+             S_NEXT  = 4'd8;
 
-  reg [2:0]  st;
+  reg [3:0]  st;
   reg [15:0] pc, pc_end;
   reg [4:0]  slot;
   reg [1:0]  pre_i;         // いま何番目のレジスタを入れているか
   reg [3:0]  pmask;
+  reg [3:0]  r_type;        // この枠で流すプログラムの種類
   reg [7:0]  drain;
   reg [8:0]  bi;            // 合成の進み (0〜LANES*WARP-1)
-  reg [2*CB-1:0] emitted;   // この枠までに配った画素数
-  reg        last_group;
+  reg [1:0]  npiece;        // バンクの何番を使っているか (枠をまたいで回る)
+  reg [2:0]  nmix;          // この枠に詰めたピースの数
+  reg        cur_done;      // いまのピースを配り終えた
 
   assign busy = (st != S_IDLE);
 
@@ -207,63 +264,129 @@ module pshade_seq
   wire [4:0] pre_reg = nth_set(m, pre_i);
   wire [2:0] pre_n = {2'b0, m[0]} + {2'b0, m[1]} + {2'b0, m[2]} + {2'b0, m[3]};
 
+  // このスロットに配る画素があるか。無ければ、いまのピースは配り終えた
+  wire have_pix = |lv;
+
   // 座標を進めるのは「このスロットの最後の初期値を入れる拍」。組み合わせで出す
-  assign pg_step = (st == S_PRE) && ({1'b0, pre_i} + 3'd1 >= pre_n);
-  assign pg_load = (st == S_IDLE) && start;
+  assign pg_step = (st == S_PRE) && have_pix && ({1'b0, pre_i} + 3'd1 >= pre_n);
+  // ppixgen の読み込みは取り込みの次の拍 (cp_* が確定してから)
+  assign pg_load = (st == S_LOADX);
+
+  // 次のピースを同じ枠に混ぜられるか
+  wire can_mix = p_valid && (p_type == r_type) && (nmix + 1 < PMIX);
 
   integer j;
   always @(posedge clk) begin
     l_issue   <= 1'b0;
     l_preload <= 1'b0;
+    p_take    <= 1'b0;
     // cell_we は下の合成のブロックだけが駆動する (2 箇所から書くと多重駆動になる)
 
     if (!resetn) begin
       st <= S_IDLE;
     end else case (st)
 
-      S_IDLE: if (start) begin
+      // ---- 新しい種類のピースから始める ----
+      S_IDLE: if (p_valid) begin
+        r_type  <= p_type;
         pmask   <= pre_mask[p_type];
         pc      <= prog_base[p_type];
         pc_end  <= prog_base[p_type] + prog_len[p_type];
-        emitted <= {(2*CB){1'b0}};
-        st      <= S_LOAD;
+        npiece  <= 2'd0;
+        nmix    <= 3'd0;
+        st      <= S_TAKE;
       end
+
+      // ---- 入口のピースを取り込み、次を要求する ----
+      //   ここで取り込まないと、p_take のあと入口が変わって
+      //   枠の左上の座標 (cAD の元) が次のピースのものになってしまう
+      S_TAKE: begin
+        cp_bw     <= p_bw;
+        cp_npix   <= p_npix;
+        cp_x0     <= p_x0;
+        cp_y0     <= p_y0;
+        cp_vqx0   <= p_vqx0;
+        cp_vqy0   <= p_vqy0;
+        cp_qx0    <= p_qx0;
+        cp_qy0    <= p_qy0;
+        cp_sx_vqx <= p_sx_vqx;
+        cp_sy_vqy <= p_sy_vqy;
+        cp_sx_qx  <= p_sx_qx;
+        cp_sy_qx  <= p_sy_qx;
+        cp_sx_qy  <= p_sx_qy;
+        cp_sy_qy  <= p_sy_qy;
+        // ピースごとの定数はバンクへ
+        pb_seed [npiece] <= p_seed;
+        pb_e    [npiece] <= p_e;
+        pb_rot  [npiece] <= p_rot;
+        pb_time [npiece] <= p_time;
+        pb_cr   [npiece] <= p_cr;
+        pb_cg   [npiece] <= p_cg;
+        pb_cb   [npiece] <= p_cb;
+        pb_depth[npiece] <= p_depth;
+        pb_premul[npiece] <= p_premul;
+        p_take   <= 1'b1;
+        cur_done <= 1'b0;
+        st       <= S_LOADX;
+      end
+
+      // pg_load をこの拍に出す (cp_* はもう確定している)
+      S_LOADX: st <= S_LOAD;
 
       // ppixgen が値を出すまで 1 クロック置く
       S_LOAD: begin
-        slot  <= 5'd0;
         pre_i <= 2'd0;
-        cVD   <= {(LANES*WARP){1'b0}};
-        st    <= S_PRE;
+        // ★ 新しい枠のときだけ slot を 0 に戻し、有効ビットを落とす。
+        //   ピースを混ぜて戻ってきたとき (nmix > 0) に 0 に戻すと、
+        //   いままで埋めたスロットを上書きしてしまう。
+        //   cVD も同じで、落とすと前のピースのぶんが消える。
+        if (nmix == 3'd0) begin
+          slot <= 5'd0;
+          cVD  <= {(LANES*WARP){1'b0}};
+        end
+        st <= S_PRE;
       end
 
       // ---- 毎画素の初期値を入れる ----
       //   1 スロットぶん (2〜4 個) 入れてから座標を 1 つ進める
       S_PRE: begin
-        l_preload <= 1'b1;
-        l_rd      <= pre_reg;
-        l_slot    <= slot;
-        for (j = 0; j < LANES; j = j + 1)
-          l_pre[j] <= (pre_reg == 5'd0) ? qxw[j] :
-                      (pre_reg == 5'd1) ? qyw[j] :
-                      (pre_reg == 5'd2) ? vqxw[j] : vqyw[j];
-
-        if (pre_i + 1 < pre_n) begin
-          pre_i <= pre_i + 2'd1;
-        end else begin
-          // このスロットの画素の番地と有効かどうかを控える
-          for (j = 0; j < LANES; j = j + 1) begin
-            cAD[{slot, j[2:0]}] <=
-              {(p_y0 + lyw[j][CELLB-1:0]), (p_x0 + lxw[j][CELLB-1:0])};
-            cVD[{slot, j[2:0]}] <= lv[j];
-          end
-          pre_i   <= 2'd0;
-          emitted <= emitted + LANES;
-          if (slot == WARP - 1) begin
-            slot <= 5'd0;
-            st   <= S_EXEC;
+        if (!have_pix) begin
+          // このピースは配り終えた。同じ種類の次のピースを同じ枠に混ぜる
+          cur_done <= 1'b1;
+          if (can_mix) begin
+            npiece <= npiece + 2'd1;      // バンクの次の場所へ (枠をまたいで回る)
+            nmix   <= nmix + 3'd1;
+            st     <= S_TAKE;
           end else begin
-            slot <= slot + 5'd1;
+            slot <= 5'd0;
+            st   <= S_EXEC;               // 枠を途中で打ち切って流す
+          end
+        end else begin
+          l_preload <= 1'b1;
+          l_rd      <= pre_reg;
+          l_slot    <= slot;
+          for (j = 0; j < LANES; j = j + 1)
+            l_pre[j] <= (pre_reg == 5'd0) ? qxw[j] :
+                        (pre_reg == 5'd1) ? qyw[j] :
+                        (pre_reg == 5'd2) ? vqxw[j] : vqyw[j];
+
+          if (pre_i + 1 < pre_n) begin
+            pre_i <= pre_i + 2'd1;
+          end else begin
+            // このスロットの画素の番地・有効かどうか・どのピースかを控える
+            for (j = 0; j < LANES; j = j + 1) begin
+              cAD[{slot, j[2:0]}] <=
+                {(cp_y0 + lyw[j][CELLB-1:0]), (cp_x0 + lxw[j][CELLB-1:0])};
+              cVD[{slot, j[2:0]}] <= lv[j];
+            end
+            cPS[slot] <= npiece;
+            pre_i     <= 2'd0;
+            if (slot == WARP - 1) begin
+              slot <= 5'd0;
+              st   <= S_EXEC;
+            end else begin
+              slot <= slot + 5'd1;
+            end
           end
         end
       end
@@ -279,6 +402,12 @@ module pshade_seq
         l_rc    <= ins[4:0];
         l_imm1  <= ins[23:0];
         l_slot  <= slot;
+        // このスロットのピースの定数をバンクから選んで渡す。
+        // レーン側は pick() を 1 段遅らせて受ける (pshade_lane.v)
+        l_seed  <= pb_seed[cPS[slot]];
+        l_e     <= pb_e   [cPS[slot]];
+        l_rot   <= pb_rot [cPS[slot]];
+        l_time  <= pb_time[cPS[slot]];
         if (slot == WARP - 1) begin
           slot <= 5'd0;
           if (pc + 1 == pc_end) begin
@@ -311,14 +440,16 @@ module pshade_seq
       end
 
       S_NEXT: begin
-        if (emitted >= p_npix) begin
-          st <= S_IDLE;                       // このピースは描き終えた
+        pc <= prog_base[r_type];
+        if (!cur_done) begin
+          // いまのピースがまだ残っている。新しい枠で続ける。
+          // ppixgen は進んだ状態のままなので読み込み直さない
+          nmix <= 3'd0;
+          st   <= S_LOAD;
         end else begin
-          pc   <= prog_base[p_type];
-          slot <= 5'd0;
-          pre_i <= 2'd0;
-          cVD  <= {(LANES*WARP){1'b0}};
-          st   <= S_PRE;                      // 次の枠へ
+          // このピースは描き終えた。次のピースは種類が違うかもしれないので
+          // S_IDLE へ戻ってプログラムを引き直す (p_valid が無ければそこで待つ)
+          st <= S_IDLE;
         end
       end
 
@@ -335,19 +466,26 @@ module pshade_seq
   // 1 つ前 (bi_d1) の番地を出す。ここがずれると下の絵と混ざる位置が狂う
   assign cell_raddr = cAD[bi_d1];
 
-
   wire signed [W-1:0] bA = cA[bi_d2];
   wire signed [W-1:0] bK = cK[bi_d2];
   wire signed [W-1:0] bW = cW[bi_d2];
+
+  // この画素がどのピースのものか。色と奥行きの暗さをバンクから選ぶ
+  wire [1:0]          bsel    = cPS[bi_d2[8:3]];
+  wire [7:0]          b_cr    = pb_cr[bsel];
+  wire [7:0]          b_cg    = pb_cg[bsel];
+  wire [7:0]          b_cb    = pb_cb[bsel];
+  wire signed [W-1:0] b_depth = pb_depth[bsel];
+  wire                b_premul = pb_premul[bsel];
 
   // ---- 色を作る ----
   //   参照実装は (色*K + W) に奥行きの暗さを掛けてから 1.0 で切る。
   //   ★ 先に 255 で切ってから暗さを掛けると、白飛びすべき画素が暗くなる。
   //     青が 255 のはずの所が 206 になって見つけた。順番を守ること。
   //   積は必ず幅を持った wire に受けてから切り出す。
-  wire signed [W+10-1:0] kr_m = $signed({1'b0, p_cr}) * bK;
-  wire signed [W+10-1:0] kg_m = $signed({1'b0, p_cg}) * bK;
-  wire signed [W+10-1:0] kb_m = $signed({1'b0, p_cb}) * bK;
+  wire signed [W+10-1:0] kr_m = $signed({1'b0, b_cr}) * bK;
+  wire signed [W+10-1:0] kg_m = $signed({1'b0, b_cg}) * bK;
+  wire signed [W+10-1:0] kb_m = $signed({1'b0, b_cb}) * bK;
   wire signed [W+10-1:0] tr_q = (kr_m + ($signed(bW) <<< 8)) >>> FRAC;   // 255 超あり
   wire signed [W+10-1:0] tg_q = (kg_m + ($signed(bW) <<< 8)) >>> FRAC;
   wire signed [W+10-1:0] tb_q = (kb_m + ($signed(bW) <<< 8)) >>> FRAC;
@@ -356,9 +494,9 @@ module pshade_seq
   //   参照実装 (WebGL) が 1.0 に切るのは「色 x α」を書き込むときで、
   //   色そのものではない。先に色を切ると、飽和する画素だけ暗くなる
   //   (青が 331 になる画素で 195.5 のはずが 150.6 になって見つけた)。
-  wire signed [W+28-1:0] dr_m = tr_q * $signed({1'b0, p_depth});
-  wire signed [W+28-1:0] dg_m = tg_q * $signed({1'b0, p_depth});
-  wire signed [W+28-1:0] db_m = tb_q * $signed({1'b0, p_depth});
+  wire signed [W+28-1:0] dr_m = tr_q * $signed({1'b0, b_depth});
+  wire signed [W+28-1:0] dg_m = tg_q * $signed({1'b0, b_depth});
+  wire signed [W+28-1:0] db_m = tb_q * $signed({1'b0, b_depth});
   wire signed [W+28-1:0] dr_q = dr_m >>> FRAC;
   wire signed [W+28-1:0] dg_q = dg_m >>> FRAC;
   wire signed [W+28-1:0] db_q = db_m >>> FRAC;
@@ -372,9 +510,9 @@ module pshade_seq
   wire [8:0] ia = 9'd256 - al;
 
   // 手前の色に α を掛ける (ラメと気泡は掛けない。α を織り込んだ色が出てくる)
-  wire [20:0] pr = p_premul ? dr * 9'd256 : dr * al;
-  wire [20:0] pg = p_premul ? dg * 9'd256 : dg * al;
-  wire [20:0] pb = p_premul ? db * 9'd256 : db * al;
+  wire [20:0] pr = b_premul ? dr * 9'd256 : dr * al;
+  wire [20:0] pg = b_premul ? dg * 9'd256 : dg * al;
+  wire [20:0] pb = b_premul ? db * 9'd256 : db * al;
 
   // 下の色 (RGB565 から戻す)
   wire [7:0] br_ = {cell_rdata[15:11], cell_rdata[15:13]};

@@ -87,6 +87,23 @@ def piece_words(p):
             fx(depth), premul]
 
 
+def order_by_type_then_z(lst):
+    """種類でまとめ、種類の中は z 順。種類の順序は「平均 z が奥のものから」。
+
+    枠に詰めるために同じ種類を隣り合わせる。奥行きの前後は種類の中で保つ。
+    tools/order_test.py が、この並びと参照実装の z 順との差を測る。
+    """
+    groups = {}
+    for p in lst:
+        groups.setdefault(int(p["type"]), []).append(p)
+    keys = sorted(groups,
+                  key=lambda t: sum(q["z"] for q in groups[t]) / len(groups[t]))
+    out = []
+    for t in keys:
+        out.extend(sorted(groups[t], key=lambda p: p["z"]))
+    return out
+
+
 def main():
     want = int(sys.argv[1]) if len(sys.argv) > 1 else 64
     rng = random.Random(3)
@@ -105,14 +122,27 @@ def main():
     #   既定の内訳をそのまま縮めて want 個にする
     parts = K.make_parts(rng, False)
     rng.shuffle(parts)
-    out, used = [], []
+    sel = []
     for p in parts:
-        if len(out) >= want:
+        if len(sel) >= want:
             break
-        w = piece_words(p)
-        if w:
-            out.append(w)
-            used.append(p)
+        if piece_words(p):
+            sel.append(p)
+
+    # ★ 種類ごとにまとめ、種類の中は z 順にする。
+    #   並び替え器は 1 つの枠に同じ種類を 4 個まで詰める (プログラムが
+    #   種類ごとに違うので、違う種類は同じ枠に入れられない)。
+    #   表がばらばらだと詰まらず、ただ遅くなる。
+    #
+    #   参照実装 renderCell() は z だけでソートして奥から描く。種類で
+    #   まとめると重なりの順序が変わるが、**種類の中を z 順に保てば**
+    #   差は平均 0.285/255 しかない (tools/order_test.py で実測。
+    #   参照実装との差はもともと 9.34/255 あるので埋もれる)。
+    #   種類の中を順不同にすると 1.789/255 で 6 倍悪くなるので、
+    #   z 順は守ること。
+    sel = order_by_type_then_z(sel)
+    out = [piece_words(p) for p in sel]
+    used = sel
     with open(os.path.join(ROOT, "rtl", "pparts.hex"), "w") as f:
         for wlist in out:
             for v in wlist:
