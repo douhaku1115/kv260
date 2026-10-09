@@ -50,9 +50,18 @@ module tb_seq;
 
   // セル画像の代わり。最初は 0 (黒)
   reg [15:0] cmem [0:CELL*CELL-1];
-  reg [15:0] cell_rdata;
   integer ci;
-  initial for (ci = 0; ci < CELL*CELL; ci = ci + 1) cmem[ci] = 16'h0000;
+  // 下地。tools/tb_seq_check.py が seq_bg.hex を置く
+  //   ・無ければ全部 0 (黒地)
+  //   ・油の地を入れると「下の色に重ねる」(段5d-3) を確かめられる
+  initial begin
+    for (ci = 0; ci < CELL*CELL; ci = ci + 1) cmem[ci] = 16'h0000;
+    $readmemh("seq_bg.hex", cmem);
+  end
+
+  // ★ 読み出し遅延は **2 拍**。cell_uram の口B が b_q0 → b_q1 と
+  //   2 段持っているので、ここも 2 段にしないと実機と合わない。
+  reg [15:0] cell_rd0, cell_rdata;
 
   integer nwe = 0, ngroup = 0, ntake = 0;
   // 枠ごとに「何個のピースを混ぜたか」を数える。詰められているかの確かめ
@@ -101,7 +110,8 @@ module tb_seq;
   end
 
   always @(posedge clk) begin
-    cell_rdata <= cmem[cell_raddr];
+    cell_rd0   <= cmem[cell_raddr];
+    cell_rdata <= cell_rd0;
     if (cell_we) begin
       cmem[cell_addr] <= cell_wdata;
       nwe = nwe + 1;

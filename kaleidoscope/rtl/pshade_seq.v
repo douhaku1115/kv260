@@ -232,6 +232,7 @@ module pshade_seq
   reg [3:0]  r_type;        // この枠で流すプログラムの種類
   reg [7:0]  drain;
   reg [8:0]  bi;            // 合成の進み (0〜LANES*WARP-1)
+  reg [8:0]  bgi;           // 下の色の先読みの進み (S_EXEC 中・段5d-3)
   reg [1:0]  npiece;        // バンクの何番を使っているか (枠をまたいで回る)
   reg [2:0]  nmix;          // この枠に詰めたピースの数
   reg        cur_done;      // いまのピースを配り終えた
@@ -359,6 +360,7 @@ module pshade_seq
             st     <= S_TAKE;
           end else begin
             slot <= 5'd0;
+            bgi  <= 9'd0;                 // 下の色の先読みを頭から
             st   <= S_EXEC;               // 枠を途中で打ち切って流す
           end
         end else begin
@@ -383,6 +385,7 @@ module pshade_seq
             pre_i     <= 2'd0;
             if (slot == WARP - 1) begin
               slot <= 5'd0;
+              bgi  <= 9'd0;               // 下の色の先読みを頭から
               st   <= S_EXEC;
             end else begin
               slot <= slot + 5'd1;
@@ -392,7 +395,10 @@ module pshade_seq
       end
 
       // ---- プログラムを流す ----
+      //   このあいだに下の色を 192 画素ぶん先読みして cBG へ溜める
+      //   (読み出し遅延 2 拍ぶん余分に回す)
       S_EXEC: begin
+        if (bgi < LANES*WARP + 2) bgi <= bgi + 9'd1;
         l_issue <= 1'b1;
         l_op    <= ins[63:58];
         l_rd    <= ins[57:53];
@@ -462,9 +468,40 @@ module pshade_seq
   reg [8:0] bi_d1, bi_d2;
   always @(posedge clk) begin bi_d1 <= bi; bi_d2 <= bi_d1; end
 
-  // 背景の読み出し。メモリの遅延が 1 拍なので、使う拍 (bi_d2) の
-  // 1 つ前 (bi_d1) の番地を出す。ここがずれると下の絵と混ざる位置が狂う
-  assign cell_raddr = cAD[bi_d1];
+  // ---- 下の色は S_EXEC 中に先読みして溜めておく (段5d-3) ----
+  //
+  //  ★ URAM は同じ拍で読むか書くかのどちらかしかできない。合成 (S_BLEND) は
+  //    192 画素を連続して**書く**ので、同じ口で読みながら書けない。
+  //    S_BLEND を 2 拍に 1 画素にすれば読めるが、上限構成が
+  //    1.84 本 → 2.24 本になり **30Hz から 20Hz に落ちる**
+  //    (段5d-2 の改善が吹き飛ぶ)。
+  //
+  //  そこで **S_EXEC 中に 192 画素ぶんを先に読んでレジスタへ溜める**。
+  //  S_EXEC は命令数 x WARP 拍あり、いちばん短い三日月でも 432 拍なので
+  //  192+2 拍の読みが紛れ込む。**クロックは 1 拍も増えない。**
+  //  代わりに 192 x 16bit = 3072 FF を使う。
+  //
+  //  ★ 読み出し遅延は **2 拍**。cell_uram の口B は b_q0 → b_q1 と
+  //    2 段持っている (URAM は出力段を持たせた方が速い)。
+  //    1 拍だと思って繋ぐと下の絵が 1 画素ずれる。
+  //
+  //  【割り切り】同じ枠の中で 2 つのピースが重なると、後のピースは
+  //    先のピースの書き込みを見ない (先読みなので)。段5d-2 の時点でも
+  //    読みと書きが 1 拍ずれていて同じ制約があった。重なる画素だけの話。
+  reg [15:0] cBG [0:LANES*WARP-1];
+  reg [8:0]  bgi_d1, bgi_d2;
+
+  always @(posedge clk) begin
+    bgi_d1 <= bgi;
+    bgi_d2 <= bgi_d1;
+    if (st == S_EXEC && bgi_d2 < LANES*WARP) cBG[bgi_d2] <= cell_rdata;
+  end
+
+  // 読む番地。S_EXEC 以外の拍に出しても害はない (rtl_top が
+  // 書き込みのない拍だけ URAM に渡す)
+  assign cell_raddr = (bgi < LANES*WARP) ? cAD[bgi[7:0]] : {AB{1'b0}};
+
+  wire [15:0] bg_px = cBG[bi_d2];
 
   wire signed [W-1:0] bA = cA[bi_d2];
   wire signed [W-1:0] bK = cK[bi_d2];
@@ -515,9 +552,9 @@ module pshade_seq
   wire [20:0] pb = b_premul ? db * 9'd256 : db * al;
 
   // 下の色 (RGB565 から戻す)
-  wire [7:0] br_ = {cell_rdata[15:11], cell_rdata[15:13]};
-  wire [7:0] bg_ = {cell_rdata[10:5],  cell_rdata[10:9]};
-  wire [7:0] bb_ = {cell_rdata[4:0],   cell_rdata[4:2]};
+  wire [7:0] br_ = {bg_px[15:11], bg_px[15:13]};
+  wire [7:0] bg_ = {bg_px[10:5],  bg_px[10:9]};
+  wire [7:0] bb_ = {bg_px[4:0],   bg_px[4:2]};
 
   // 重ねてから 255 相当 (65280) で切る。ここが参照実装の切る場所と同じ
   wire [21:0] mr_w = pr + br_ * ia;

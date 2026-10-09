@@ -10,7 +10,12 @@ seed と rot をすべて違う値にして流す。ピースごとの定数
 (seed/e/rot・色・奥行きの暗さ) が枠の中で正しく切り替わるかは
 **これでしか確かめられない**。1 個だけだと切り替えが起きないので通ってしまう。
 
-  使い方:  python tools/tb_seq_check.py [種類] [個数] [半径]
+段5d-3 から**下の色を読んで重ねる**ようになった。4 つめの引数に oil を
+渡すと、油の地 (rtl/cell_oil.hex) を下地にして流す。黒地だと α の効きが
+分からないので、**重ねる実装を確かめるには oil が要る**。
+
+  使い方:  python tools/tb_seq_check.py [種類] [個数] [半径] [oil]
+           python tools/tb_seq_check.py glass 4 0.015 oil
            python tools/tb_seq_check.py glitter 4
 """
 import math
@@ -120,8 +125,41 @@ def make_cases(key, count, r=None):
     return out
 
 
-def want_image(metas):
-    """Python 側で同じピースを描く (黒地の上に重ねる)"""
+def rgb565(a):
+    """RTL がセルに書くのと同じ RGB565 に落として 8bit へ戻す"""
+    r = np.clip(a[..., 0], 0, 1)
+    g = np.clip(a[..., 1], 0, 1)
+    b = np.clip(a[..., 2], 0, 1)
+    ri = (r * 31 + 0.5).astype(int)
+    gi = (g * 63 + 0.5).astype(int)
+    bi = (b * 31 + 0.5).astype(int)
+    return (ri << 11) | (gi << 5) | bi
+
+
+def from565(v):
+    """RGB565 を 8bit へ戻す (pshade_seq.v の br_/bg_/bb_ と同じ式)"""
+    r = ((v >> 11) & 31)
+    g = ((v >> 5) & 63)
+    b = (v & 31)
+    r8 = (r << 3) | (r >> 2)
+    g8 = (g << 2) | (g >> 4)
+    b8 = (b << 3) | (b >> 2)
+    return np.stack([r8, g8, b8], axis=-1) / 255.0
+
+
+def oil_background():
+    """油の地を RGB565 に量子化したもの (RTL の下地と同じ値)"""
+    bg = RC.oil_bg(CELL, 0.0)
+    return rgb565(bg[..., :3])
+
+
+def want_image(metas, bg565=None):
+    """Python 側で同じピースを描く。
+
+    bg565 を渡すと、その下地 (RGB565 の 16bit 配列) の上に重ねる。
+    ★ 下地は RTL と同じ量子化を通した値を使うこと。float のままだと
+      RGB565 の丸めのぶんだけ差が出て、重ねる実装の良否が見えない。
+    """
     n = CELL
     buf = np.zeros((n, n, 4))
     ps = []
@@ -136,13 +174,19 @@ def want_image(metas):
         RC.draw_parts(buf, ps, n, 0.0)
     finally:
         RC.shade_piece = orig
-    return np.clip(buf[..., :3], 0, 1)
+    if bg565 is None:
+        return np.clip(buf[..., :3], 0, 1)
+    # プリマルチプライド済みの色を、下地に α で重ねる
+    under = from565(bg565)
+    a = np.clip(buf[..., 3:4], 0, 1)
+    return np.clip(buf[..., :3] + under * (1.0 - a), 0, 1)
 
 
 def main():
     key = sys.argv[1] if len(sys.argv) > 1 else "glass"
     count = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     rad = float(sys.argv[3]) if len(sys.argv) > 3 else None
+    use_oil = "oil" in sys.argv[1:]
     cases = make_cases(key, count, rad)
     metas = [m for _, m in cases]
 
@@ -152,6 +196,17 @@ def main():
         for cfg, _ in cases:
             for v in cfg:
                 f.write("%06x\n" % (v & 0xFFFFFF))
+
+    # 下地。oil を渡したら油の地、渡さなければ黒地
+    #   ★ 黒地だと α の効きが見えないので、重ねる実装 (段5d-3) を
+    #     確かめるには oil が要る
+    bg565 = oil_background() if use_oil else None
+    with open(os.path.join(WORK, "seq_bg.hex"), "w") as f:
+        if bg565 is None:
+            f.write("0000\n")                     # 先頭 1 語だけ。残りは 0
+        else:
+            for v in bg565.reshape(-1):
+                f.write("%04x\n" % v)
     for h in ("pprog.hex", "pprog_base.hex", "pprog_len.hex", "pprog_pre.hex",
               "log2_lut.hex", "exp2_lut.hex", "atan_lut.hex"):
         with open(os.path.join(ROOT, "rtl", h)) as a, open(os.path.join(WORK, h), "w") as b:
@@ -188,11 +243,20 @@ def main():
         got[y, x] = [((c >> 11) & 31) / 31.0, ((c >> 5) & 63) / 63.0, (c & 31) / 31.0]
         npx += 1
 
-    want = want_image(metas)
+    want = want_image(metas, bg565)
     d = np.abs(got - want)
-    print("  種類 %s x %d 個   枠 %dx%d   書いた画素 %d"
-          % (key, count, metas[0]["w"], metas[0]["h"], npx))
-    print("  平均の差 %.2f / 255   最大 %.2f / 255" % (d.mean() * 255, d.max() * 255))
+    # 枠の中だけの差も出す。下地は書き換えないので、全画素だと薄まる
+    inbox = np.zeros((CELL, CELL), dtype=bool)
+    for m in metas:
+        inbox[m["y0"]:m["y0"] + m["h"], m["x0"]:m["x0"] + m["w"]] = True
+    db = d.max(axis=2)[inbox]
+    print("  種類 %s x %d 個   枠 %dx%d   下地 %s   出力した画素 %d"
+          % (key, count, metas[0]["w"], metas[0]["h"],
+             "油の地" if use_oil else "黒", npx))
+    print("  枠の中: 平均 %.2f / 255   最大 %.2f / 255"
+          % (db.mean() * 255, db.max() * 255))
+    print("  全画素: 平均 %.2f / 255   最大 %.2f / 255"
+          % (d.mean() * 255, d.max() * 255))
 
     sheet = np.concatenate([got, want, np.clip(d * 6, 0, 1)], axis=1)
     Image.fromarray((np.clip(sheet, 0, 1) * 255).astype(np.uint8)).save("sim/seq_cmp.png")

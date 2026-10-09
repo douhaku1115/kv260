@@ -136,17 +136,26 @@ module rtl_top
   wire        pc_we;
   wire [2*CELL_BITS-1:0] pc_addr;
   wire [15:0] pc_wdata;
+  wire [15:0] pc_raddr;     // 下の色を読む番地 (段5d-3)
+  wire [15:0] pc_rdata;
 
-  // 奥層の口B: 起動時は PS からの流し込み、そのあとはピース描画の書き込み
+  // 奥層の口B は 3 通りに使い回す。URAM は同じ拍で読むか書くかの
+  // どちらかしかできないので、**時期で分ける**。
+  //   起動時          PS からの流し込み        (p_cf_we)
+  //   S_BLEND 中      ピース描画の書き込み     (pc_we)
+  //   それ以外の拍    下の色の先読み           (pc_raddr)
+  // 並び替え器は S_EXEC 中にだけ先読みするので、書き込みとかち合わない。
   wire        bw_we    = p_cf_we ? (p_cf_sel == 1'b0) : pc_we;
-  wire [15:0] bw_addr  = p_cf_we ? p_cf_addr : {{(16-2*CELL_BITS){1'b0}}, pc_addr};
+  wire [15:0] bw_addr  = p_cf_we ? p_cf_addr
+                       : (pc_we ? {{(16-2*CELL_BITS){1'b0}}, pc_addr}
+                                : pc_raddr);
   wire [15:0] bw_data  = p_cf_we ? p_cf_data[15:0] : pc_wdata;
 
   cell_uram #(.DATA_W(16), .AW(2*CELL_BITS))
   cell_back_i (.clk(clkv),
                .a_addr({by, bx}), .a_dout(back_d),
                .b_addr(bw_addr[2*CELL_BITS-1:0]), .b_we(bw_we), .b_din(bw_data),
-               .b_dout());
+               .b_dout(pc_rdata));
 
   // 手前層の口B: 起動時は流し込み、そのあとは影用の読み出し
   wire        fw_we   = p_cf_we && (p_cf_sel == 1'b1);
@@ -181,8 +190,10 @@ module rtl_top
      .p_cr(ps_cr), .p_cg(ps_cg), .p_cb(ps_cb),
      .p_depth(ps_depth), .p_premul(ps_premul), .all_done(ps_done));
 
-  //  最小版では下の色を読まない (BRAM の口は 1 クロックに読みか書きの
-  //  どちらかだけ)。油の地の上に重ねるので、重なり合う所だけ後勝ちになる。
+  //  段5d-3 から下の色を読んで α で重ねる。URAM の口は 1 クロックに
+  //  読みか書きのどちらかだけなので、並び替え器は **S_EXEC 中に 192 画素を
+  //  先読みしてレジスタに溜め**、S_BLEND では書き込みだけをする。
+  //  S_BLEND を 2 拍に 1 画素にすると上限構成が 30Hz → 20Hz に落ちるため。
   pshade_seq #(.CELLB(CELL_BITS)) pseq_i
     (.clk(clkv), .resetn(~resetv), .p_valid(ps_valid), .p_take(ps_take),
      .p_type(ps_type), .p_bw(ps_bw), .p_npix(ps_npix),
@@ -195,7 +206,7 @@ module rtl_top
      .p_cr(ps_cr), .p_cg(ps_cg), .p_cb(ps_cb),
      .p_depth(ps_depth), .p_premul(ps_premul), .busy(ps_busy),
      .cell_we(pc_we), .cell_addr(pc_addr), .cell_wdata(pc_wdata),
-     .cell_rdata(16'd0), .cell_raddr());
+     .cell_rdata(pc_rdata), .cell_raddr(pc_raddr));
 
   // RGB565 → 8bit
   function [7:0] r8; input [15:0] c; begin r8 = {c[15:11], c[15:13]}; end endfunction
