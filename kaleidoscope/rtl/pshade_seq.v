@@ -435,10 +435,11 @@ module pshade_seq
       end
 
       // ---- セルへ重ねる (1 画素ずつ) ----
-      // 読み出しが 1 拍、番地の遅れが 2 拍あるので、数えるのは
-      // LANES*WARP より 3 多く回す。そうしないと枠ごとに末尾が落ちる
+      // 番地の遅れ (bi → bi_d1 → bi_d2) が 2 拍、合成が 2 段 (段5d-4 で
+      // 1 段足した) あるので、LANES*WARP より多めに回す。
+      // 足りないと枠ごとに末尾の画素が落ちる
       S_BLEND: begin
-        if (bi == LANES*WARP + 6) begin
+        if (bi == LANES*WARP + 7) begin
           st <= S_NEXT;
         end else begin
           bi <= bi + 9'd1;
@@ -527,13 +528,55 @@ module pshade_seq
   wire signed [W+10-1:0] tg_q = (kg_m + ($signed(bW) <<< 8)) >>> FRAC;
   wire signed [W+10-1:0] tb_q = (kb_m + ($signed(bW) <<< 8)) >>> FRAC;
 
-  // 奥行きの暗さを掛ける。★ ここではまだ 255 で切らない。
-  //   参照実装 (WebGL) が 1.0 に切るのは「色 x α」を書き込むときで、
-  //   色そのものではない。先に色を切ると、飽和する画素だけ暗くなる
-  //   (青が 331 になる画素で 195.5 のはずが 150.6 になって見つけた)。
-  wire signed [W+28-1:0] dr_m = tr_q * $signed({1'b0, b_depth});
-  wire signed [W+28-1:0] dg_m = tg_q * $signed({1'b0, b_depth});
-  wire signed [W+28-1:0] db_m = tb_q * $signed({1'b0, b_depth});
+  // α。0〜1 を 0〜256 に
+  wire [8:0] al = (bA < 0) ? 9'd0 : (bA > (1 <<< FRAC)) ? 9'd256 : bA[FRAC:FRAC-8];
+
+  // ============ ここで 1 段切る (段5d-4) ============
+  //
+  //  ★ 切らないと「配列の読み (LUTRAM) → 粒の色 x K → + W → x 奥行き →
+  //    x α → + 下の色 x (1-α) → 丸め」が **1 本のパス**になる。
+  //    段5d-3 の実測で最悪パスは
+  //      bi_d2 → cell_wdata   論理段数 32 (DSP 15 + CARRY8 6)、遅延 13.142ns
+  //    となり、WNS が +0.045ns しか残らなかった。
+  //
+  //  合成ログの
+  //    RAM Pipeline Warning: Read Address Register Found For RAM cBG_reg.
+  //    We will not be able to pipeline it.
+  //  もこれが理由。読む番地がレジスタなので Vivado が勝手に段を入れられない。
+  //
+  //  **「粒の色 x K + W」まで作ったところでレジスタに受ける。**
+  //  掛け算 3 段が 2 段と 1 段に分かれ、配列の読みも別の段になる。
+  //  S_BLEND が 1 拍伸びるだけで、枠あたり 192 拍は変わらない。
+  reg signed [W+10-1:0] tr_1, tg_1, tb_1;   // (粒の色 x K + W)
+  reg signed [W-1:0]    dep_1;              // 奥行きの暗さ
+  reg [8:0]             al_1;               // α (0〜256)
+  reg                   pre_1;              // α をすでに掛けた色か
+  reg [15:0]            bgp_1;              // 下の色 (RGB565)
+  reg [AB-1:0]          bad_1;              // 書き込み先
+  reg                   act_1;              // この画素を書くか
+
+  always @(posedge clk) begin
+    tr_1  <= tr_q;
+    tg_1  <= tg_q;
+    tb_1  <= tb_q;
+    dep_1 <= b_depth;
+    al_1  <= al;
+    pre_1 <= b_premul;
+    bgp_1 <= bg_px;
+    bad_1 <= cAD[bi_d2];
+    act_1 <= (st == S_BLEND) && (bi_d2 < LANES*WARP) && cVD[bi_d2];
+  end
+
+  wire [8:0] ia_1 = 9'd256 - al_1;
+
+  // ---- 合成 段2: 奥行きの暗さを掛けて、下の色に重ねる ----
+  //   ★ ここではまだ 255 で切らない。
+  //     参照実装 (WebGL) が 1.0 に切るのは「色 x α」を書き込むときで、
+  //     色そのものではない。先に色を切ると、飽和する画素だけ暗くなる
+  //     (青が 331 になる画素で 195.5 のはずが 150.6 になって見つけた)。
+  wire signed [W+28-1:0] dr_m = tr_1 * $signed({1'b0, dep_1});
+  wire signed [W+28-1:0] dg_m = tg_1 * $signed({1'b0, dep_1});
+  wire signed [W+28-1:0] db_m = tb_1 * $signed({1'b0, dep_1});
   wire signed [W+28-1:0] dr_q = dr_m >>> FRAC;
   wire signed [W+28-1:0] dg_q = dg_m >>> FRAC;
   wire signed [W+28-1:0] db_q = db_m >>> FRAC;
@@ -542,32 +585,28 @@ module pshade_seq
   wire [11:0] dg = (dg_q < 0) ? 12'd0 : (dg_q > 4095) ? 12'd4095 : dg_q[11:0];
   wire [11:0] db = (db_q < 0) ? 12'd0 : (db_q > 4095) ? 12'd4095 : db_q[11:0];
 
-  // α。0〜1 を 0〜256 に
-  wire [8:0] al = (bA < 0) ? 9'd0 : (bA > (1 <<< FRAC)) ? 9'd256 : bA[FRAC:FRAC-8];
-  wire [8:0] ia = 9'd256 - al;
-
   // 手前の色に α を掛ける (ラメと気泡は掛けない。α を織り込んだ色が出てくる)
-  wire [20:0] pr = b_premul ? dr * 9'd256 : dr * al;
-  wire [20:0] pg = b_premul ? dg * 9'd256 : dg * al;
-  wire [20:0] pb = b_premul ? db * 9'd256 : db * al;
+  wire [20:0] pr = pre_1 ? dr * 9'd256 : dr * al_1;
+  wire [20:0] pg = pre_1 ? dg * 9'd256 : dg * al_1;
+  wire [20:0] pb = pre_1 ? db * 9'd256 : db * al_1;
 
   // 下の色 (RGB565 から戻す)
-  wire [7:0] br_ = {bg_px[15:11], bg_px[15:13]};
-  wire [7:0] bg_ = {bg_px[10:5],  bg_px[10:9]};
-  wire [7:0] bb_ = {bg_px[4:0],   bg_px[4:2]};
+  wire [7:0] br_ = {bgp_1[15:11], bgp_1[15:13]};
+  wire [7:0] bg_ = {bgp_1[10:5],  bgp_1[10:9]};
+  wire [7:0] bb_ = {bgp_1[4:0],   bgp_1[4:2]};
 
   // 重ねてから 255 相当 (65280) で切る。ここが参照実装の切る場所と同じ
-  wire [21:0] mr_w = pr + br_ * ia;
-  wire [21:0] mg_w = pg + bg_ * ia;
-  wire [21:0] mb_w = pb + bb_ * ia;
+  wire [21:0] mr_w = pr + br_ * ia_1;
+  wire [21:0] mg_w = pg + bg_ * ia_1;
+  wire [21:0] mb_w = pb + bb_ * ia_1;
   wire [16:0] mr = (mr_w > 22'd65535) ? 17'd65535 : mr_w[16:0];
   wire [16:0] mg = (mg_w > 22'd65535) ? 17'd65535 : mg_w[16:0];
   wire [16:0] mb = (mb_w > 22'd65535) ? 17'd65535 : mb_w[16:0];
 
   always @(posedge clk) begin
-    cell_addr  <= cAD[bi_d2];
+    cell_addr  <= bad_1;
     cell_wdata <= {mr[15:11], mg[15:10], mb[15:11]};
-    cell_we    <= (st == S_BLEND) && (bi_d2 < LANES*WARP) && cVD[bi_d2];
+    cell_we    <= act_1;
   end
 
 endmodule
