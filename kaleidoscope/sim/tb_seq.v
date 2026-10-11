@@ -21,7 +21,10 @@ module tb_seq;
   localparam AB = 16;
   localparam CELL = 256;
   localparam WORDS = 24;        // 1 個あたりの語数
-  localparam MAXP = 64;         // 入れられる個数
+  // ★ 入れられる個数。足りないと tab の範囲外を読んで全部 x になり、
+  //   pc も r_npix も x のまま状態機械が止まる (段5d-5 で踏んだ)。
+  //   既定の構成は 271 個なので余裕をみて 320。
+  localparam MAXP = 320;
 
   reg clk = 1'b0;
   always #5 clk = ~clk;
@@ -44,24 +47,32 @@ module tb_seq;
   always @(posedge clk) if (resetn && p_take) idx <= idx + 16'd1;
 
   wire               busy;
-  wire               cell_we;
+  wire               cell_we, cell_front;
   wire [AB-1:0]      cell_addr, cell_raddr;
-  wire [15:0]        cell_wdata;
+  wire [31:0]        cell_wdata;
 
-  // セル画像の代わり。最初は 0 (黒)
-  reg [15:0] cmem [0:CELL*CELL-1];
+  // セル画像の代わり。奥層 (16bit RGB565) と
+  // 手前層 (32bit {ablur,a,rgb565}) の 2 枚。段5d-5 から両方へ描く
+  reg [15:0] cmem  [0:CELL*CELL-1];
+  reg [31:0] cmemf [0:CELL*CELL-1];
   integer ci;
   // 下地。tools/tb_seq_check.py が seq_bg.hex を置く
-  //   ・無ければ全部 0 (黒地)
+  //   ・無ければ全部 0 (黒地 / 透明)
   //   ・油の地を入れると「下の色に重ねる」(段5d-3) を確かめられる
+  //   手前層は必ず透明 (全 0) から始まる。URAM も電源投入時は全 0
   initial begin
-    for (ci = 0; ci < CELL*CELL; ci = ci + 1) cmem[ci] = 16'h0000;
+    for (ci = 0; ci < CELL*CELL; ci = ci + 1) begin
+      cmem[ci]  = 16'h0000;
+      cmemf[ci] = 32'h00000000;
+    end
     $readmemh("seq_bg.hex", cmem);
   end
 
   // ★ 読み出し遅延は **2 拍**。cell_uram の口B が b_q0 → b_q1 と
   //   2 段持っているので、ここも 2 段にしないと実機と合わない。
+  //   下の色は両層から同じ番地を読んでおき、並び替え器が選り分ける
   reg [15:0] cell_rd0, cell_rdata;
+  reg [31:0] cellf_rd0, cellf_rdata;
 
   integer nwe = 0, ngroup = 0, ntake = 0;
   // 枠ごとに「何個のピースを混ぜたか」を数える。詰められているかの確かめ
@@ -110,10 +121,13 @@ module tb_seq;
   end
 
   always @(posedge clk) begin
-    cell_rd0   <= cmem[cell_raddr];
-    cell_rdata <= cell_rd0;
+    cell_rd0    <= cmem [cell_raddr];
+    cell_rdata  <= cell_rd0;
+    cellf_rd0   <= cmemf[cell_raddr];
+    cellf_rdata <= cellf_rd0;
     if (cell_we) begin
-      cmem[cell_addr] <= cell_wdata;
+      if (cell_front) cmemf[cell_addr] <= cell_wdata;
+      else            cmem [cell_addr] <= cell_wdata[15:0];
       nwe = nwe + 1;
     end
   end
@@ -137,9 +151,12 @@ module tb_seq;
      .p_cb    (tab[base + 21][7:0]),
      .p_depth ($signed(tab[base + 22])),
      .p_premul(tab[base + 23][0]),
+     .p_front (tab[base + 23][1]),
      .busy(busy),
-     .cell_we(cell_we), .cell_addr(cell_addr), .cell_wdata(cell_wdata),
-     .cell_rdata(cell_rdata), .cell_raddr(cell_raddr));
+     .cell_we(cell_we), .cell_front(cell_front),
+     .cell_addr(cell_addr), .cell_wdata(cell_wdata),
+     .cell_rdata_back(cell_rdata), .cell_rdata_front(cellf_rdata),
+     .cell_raddr(cell_raddr));
 
   integer fd, i, cycles;
 
@@ -150,15 +167,33 @@ module tb_seq;
 
     // 全部のピースを取り込み、描き終わるまで回す
     cycles = 0;
-    while (((idx < NP) || busy) && cycles < 3000000) begin
+    // 271 個を丸ごと流すと 1200 万クロックほどかかる (tools/tb_full_check.py)。
+    // 足りないと途中で打ち切られ、描かれていないぶんが差として出る
+    while (((idx < NP) || busy) && cycles < 20000000) begin
       @(posedge clk);
       cycles = cycles + 1;
     end
     repeat (8) @(negedge clk);
 
+    // 打ち切られたときは、止まった場所が分かるように状態を吐く
+    // ★ Verilog の文字列は複数行に分けられない (C のような暗黙の連結がない)
+    if (idx < NP || busy) begin
+      $display("STUCK idx=%0d/%0d st=%0d slot=%0d pre_i=%0d bi=%0d bgi=%0d",
+               idx, NP, dut.st, dut.slot, dut.pre_i, dut.bi, dut.bgi);
+      $display("STUCK nmix=%0d npiece=%0d cur_done=%b have_pix=%b lv=%b",
+               dut.nmix, dut.npiece, dut.cur_done, dut.have_pix, dut.lv);
+      $display("STUCK r_npix=%0d r_bw=%0d pc=%0d pc_end=%0d p_valid=%b",
+               dut.pix_i.r_npix, dut.pix_i.r_bw, dut.pc, dut.pc_end, p_valid);
+    end
+
     fd = $fopen("seq_out.txt", "w");
     for (i = 0; i < CELL*CELL; i = i + 1)
       if (cmem[i] != 16'h0000) $fwrite(fd, "%0d %04x\n", i, cmem[i]);
+    $fclose(fd);
+    // 手前層 {ablur, a, rgb565}
+    fd = $fopen("seq_outf.txt", "w");
+    for (i = 0; i < CELL*CELL; i = i + 1)
+      if (cmemf[i] != 32'h00000000) $fwrite(fd, "%0d %08x\n", i, cmemf[i]);
     $fclose(fd);
     $display("PROBE ピース %0d 個  取り込み %0d 回  書き込み %0d 画素  枠 %0d 個",
              NP, ntake, nwe, ngroup);
@@ -176,7 +211,7 @@ module tb_seq;
   end
 
   initial begin
-    #40000000;
+    #400000000;
     $display("時間切れ");
     $finish;
   end

@@ -14,8 +14,13 @@ seed と rot をすべて違う値にして流す。ピースごとの定数
 渡すと、油の地 (rtl/cell_oil.hex) を下地にして流す。黒地だと α の効きが
 分からないので、**重ねる実装を確かめるには oil が要る**。
 
-  使い方:  python tools/tb_seq_check.py [種類] [個数] [半径] [oil]
+段5d-5 から**手前層も PL で描く**。`front` を渡すと z >= 0.5 にして
+手前層へ描かせ、32bit {ablur, a, rgb565} を突き合わせる。
+手前層は α も重ねるので、**奥層とは別の経路を通る**。
+
+  使い方:  python tools/tb_seq_check.py [種類] [個数] [半径] [oil] [front]
            python tools/tb_seq_check.py glass 4 0.015 oil
+           python tools/tb_seq_check.py glass 4 0.015 front
            python tools/tb_seq_check.py glitter 4
 """
 import math
@@ -79,19 +84,22 @@ def build_case(key, px, py, r, rot, seed, z):
     col = K.hexcol(K.COLORS[key][0])
     premul = 1 if key in ("glitter", "bubble") else 0
 
+    # 23 語目: bit0 = premul、bit1 = 手前層か (段5d-5)
+    front = 1 if z >= 0.5 else 0
     cfg = [typ, w, w * h, x0, y0,
            fx(vqx0), fx(vqy0), fx(qx0), fx(qy0),
            fx(s), fx(s), fx(ca * s), fx(-sa * s), fx(sa * s), fx(ca * s),
            fx(seed), fx(e), fx(rot), fx(0.0),
            int(col[0] * 255 + .5), int(col[1] * 255 + .5), int(col[2] * 255 + .5),
-           fx(depth), premul]
+           fx(depth), premul | (front << 1)]
     assert len(cfg) == WORDS
     meta = dict(x0=x0, y0=y0, w=w, h=h, typ=typ, key=key, px=px, py=py, r=r,
-                rot=rot, seed=seed, z=z, col=col, premul=premul, depth=depth)
+                rot=rot, seed=seed, z=z, col=col, premul=premul, depth=depth,
+                front=front)
     return cfg, meta
 
 
-def make_cases(key, count, r=None):
+def make_cases(key, count, r=None, front=False):
     """同じ種類を count 個、重ならない位置に並べる。
 
     ★ seed / rot / z をすべて違う値にすること。同じにすると、
@@ -104,7 +112,8 @@ def make_cases(key, count, r=None):
       大きいピースで枠をまたぐ場合を見たいときは r を渡す。
     """
     if count == 1 and r is None:
-        return [build_case(key, px=0.1, py=-0.05, r=0.18, rot=0.7, seed=0.37, z=0.7)]
+        return [build_case(key, px=0.1, py=-0.05, r=0.18, rot=0.7, seed=0.37,
+                           z=0.7 if not front else 0.7)]
     if r is None:
         r = 0.015
 
@@ -117,7 +126,9 @@ def make_cases(key, count, r=None):
         px, py = spots[i % len(spots)]
         # ★ z は 0〜1 に収める。1 を超えると奥行きの暗さが 1 を超え、
         #   参照実装にも無い値になる (テストの不備で壊れて見える)
-        z = 0.15 + 0.75 * (i / float(max(1, count - 1)))
+        # front のときは z >= 0.5 にして手前層へ行かせる
+        z = ((0.52 + 0.43 * (i / float(max(1, count - 1)))) if front
+             else 0.15 + 0.30 * (i / float(max(1, count - 1))))
         out.append(build_case(key, px=px, py=py, r=r,
                               rot=0.3 + 0.41 * i,       # 全部違う
                               seed=0.11 + 0.17 * i,     # 全部違う
@@ -151,6 +162,24 @@ def oil_background():
     """油の地を RGB565 に量子化したもの (RTL の下地と同じ値)"""
     bg = RC.oil_bg(CELL, 0.0)
     return rgb565(bg[..., :3])
+
+
+def front_alpha(metas):
+    """手前層の α の正解。draw_parts が buf[...,3] に累積したもの"""
+    n = CELL
+    buf = np.zeros((n, n, 4))
+    ps = []
+    for m in metas:
+        ps.append({"type": m["typ"], "key": m["key"], "x": m["px"], "y": m["py"],
+                   "r": m["r"] / (0.85 + 0.3 * m["z"]),
+                   "z": m["z"], "rot": m["rot"], "seed": m["seed"], "col": m["col"]})
+    orig = RC.shade_piece
+    RC.shade_piece = K.shade_piece
+    try:
+        RC.draw_parts(buf, ps, n, 0.0)
+    finally:
+        RC.shade_piece = orig
+    return np.clip(buf[..., 3], 0, 1)
 
 
 def want_image(metas, bg565=None):
@@ -187,7 +216,8 @@ def main():
     count = int(sys.argv[2]) if len(sys.argv) > 2 else 1
     rad = float(sys.argv[3]) if len(sys.argv) > 3 else None
     use_oil = "oil" in sys.argv[1:]
-    cases = make_cases(key, count, rad)
+    use_front = "front" in sys.argv[1:]
+    cases = make_cases(key, count, rad, use_front)
     metas = [m for _, m in cases]
 
     os.makedirs(WORK, exist_ok=True)
@@ -235,15 +265,25 @@ def main():
             print("  " + ln.strip())
 
     got = np.zeros((CELL, CELL, 3))
+    got_a = np.zeros((CELL, CELL))
     npx = 0
-    for ln in open(out):
+    src = os.path.join(WORK, "seq_outf.txt") if use_front else out
+    for ln in open(src):
         a, v = ln.split()
         i, c = int(a), int(v, 16)
         y, x = i >> 8, i & 0xFF
         got[y, x] = [((c >> 11) & 31) / 31.0, ((c >> 5) & 63) / 63.0, (c & 31) / 31.0]
+        if use_front:
+            got_a[y, x] = ((c >> 16) & 255) / 255.0
         npx += 1
 
-    want = want_image(metas, bg565)
+    if use_front:
+        # 手前層は透明から始まり、色はプリマルチプライドのまま置かれる。
+        # 下地は無いので want_image に下地を渡さない
+        want = want_image(metas, None)
+        want_a = front_alpha(metas)
+    else:
+        want = want_image(metas, bg565)
     d = np.abs(got - want)
     # 枠の中だけの差も出す。下地は書き換えないので、全画素だと薄まる
     inbox = np.zeros((CELL, CELL), dtype=bool)
@@ -255,6 +295,10 @@ def main():
              "油の地" if use_oil else "黒", npx))
     print("  枠の中: 平均 %.2f / 255   最大 %.2f / 255"
           % (db.mean() * 255, db.max() * 255))
+    if use_front:
+        da = np.abs(got_a - want_a)[inbox]
+        print("  α の差: 平均 %.2f / 255   最大 %.2f / 255"
+              % (da.mean() * 255, da.max() * 255))
     print("  全画素: 平均 %.2f / 255   最大 %.2f / 255"
           % (d.mean() * 255, d.max() * 255))
 

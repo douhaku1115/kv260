@@ -47,6 +47,8 @@ module rtl_top
    input wire               p_text_on,     // 画面に操作一覧を出す
 
    // セル画像への流し込み (URAM は初期値を持てないので起動時に PS が入れる)
+   input wire               p_draw_req,   // 描画開始 (段5d-6)。
+                                          // PS がセルを入れ終えてから 1 回来る
    input wire               p_cf_we,
    input wire               p_cf_sel,       // 0=奥層 1=手前層
    input wire [15:0]        p_cf_addr,
@@ -123,53 +125,79 @@ module rtl_top
      .out_sx(sx), .out_sy(sy),
      .out_nrefl(nrefl), .out_seam(seam), .out_black(black));
 
+  // ピース描画の状態 (セルの口の振り分けで使うので先に宣言する)
+  wire        ps_busy, ps_valid, ps_take, ps_premul, ps_front, ps_done;
+
   // ============ セル画像を引く (2 クロック) ============
   wire [15:0] back_d;
   wire [31:0] front_d;    // 口A: {ablur, a, rgb565}
-  wire [31:0] shadow_d;   // 口B: 影用にずらした位置
+  wire [31:0] shadow_d;   // 口B: 影用にずらした位置 (描画中は 0)
 
   // セル画像 2 枚は URAM に置く (段5d)。BRAM が 94% まで来て二重バッファが
   // 入らなくなったため。URAM へ移すと BRAM が 86 個空く。
   //   URAM は初期値を持てないので、中身は起動時に PS が AXI で入れる
   //   (0x180 CELL_CTRL / 0x190 CELL_DATA)。
   //   奥層はそのあと PL がピースを描き足す。
-  wire        pc_we;
+  wire        pc_we, pc_front;
   wire [2*CELL_BITS-1:0] pc_addr;
-  wire [15:0] pc_wdata;
+  wire [31:0] pc_wdata;
   wire [15:0] pc_raddr;     // 下の色を読む番地 (段5d-3)
-  wire [15:0] pc_rdata;
+
+  // 並び替え器の読み書きを、層で振り分ける (段5d-5)
+  wire pc_we_back  = pc_we && !pc_front;
+  wire pc_we_front = pc_we &&  pc_front;
 
   // 奥層の口B は 3 通りに使い回す。URAM は同じ拍で読むか書くかの
   // どちらかしかできないので、**時期で分ける**。
   //   起動時          PS からの流し込み        (p_cf_we)
-  //   S_BLEND 中      ピース描画の書き込み     (pc_we)
+  //   S_BLEND 中      ピース描画の書き込み     (pc_we_back)
   //   それ以外の拍    下の色の先読み           (pc_raddr)
   // 並び替え器は S_EXEC 中にだけ先読みするので、書き込みとかち合わない。
-  wire        bw_we    = p_cf_we ? (p_cf_sel == 1'b0) : pc_we;
+  wire        bw_we    = p_cf_we ? (p_cf_sel == 1'b0) : pc_we_back;
   wire [15:0] bw_addr  = p_cf_we ? p_cf_addr
-                       : (pc_we ? {{(16-2*CELL_BITS){1'b0}}, pc_addr}
-                                : pc_raddr);
-  wire [15:0] bw_data  = p_cf_we ? p_cf_data[15:0] : pc_wdata;
+                       : (pc_we_back ? {{(16-2*CELL_BITS){1'b0}}, pc_addr}
+                                     : pc_raddr);
+  wire [15:0] bw_data  = p_cf_we ? p_cf_data[15:0] : pc_wdata[15:0];
+  wire [15:0] back_b_dout;
 
   cell_uram #(.DATA_W(16), .AW(2*CELL_BITS))
   cell_back_i (.clk(clkv),
                .a_addr({by, bx}), .a_dout(back_d),
                .b_addr(bw_addr[2*CELL_BITS-1:0]), .b_we(bw_we), .b_din(bw_data),
-               .b_dout(pc_rdata));
+               .b_dout(back_b_dout));
 
-  // 手前層の口B: 起動時は流し込み、そのあとは影用の読み出し
-  wire        fw_we   = p_cf_we && (p_cf_sel == 1'b1);
-  wire [15:0] fb_addr = p_cf_we ? p_cf_addr : {{(16-2*CELL_BITS){1'b0}}, {sy, sx}};
+  // 手前層の口B は 4 通り (段5d-5 で描画の読み書きが加わった)。
+  //   起動時          PS からの流し込み
+  //   S_BLEND 中      ピース描画の書き込み
+  //   S_EXEC 中       下の色の先読み
+  //   描いていない間  影用の読み出し
+  //
+  //  ★ **描いている間は影が止まる。** 影は毎画素引いているので、
+  //    描画の読み書きと必ずかち合う。いまは起動時に 1 回描いて止まるので、
+  //    その数フレームだけ影が出ない。毎フレーム描くようにするときは
+  //    二重バッファと一緒に解く (描く面と映す面を分ければかち合わない)。
+  wire        fw_we   = p_cf_we ? (p_cf_sel == 1'b1) : pc_we_front;
+  wire [15:0] fb_addr = p_cf_we   ? p_cf_addr
+                      : pc_we_front ? {{(16-2*CELL_BITS){1'b0}}, pc_addr}
+                      : ps_busy     ? pc_raddr
+                                    : {{(16-2*CELL_BITS){1'b0}}, {sy, sx}};
+  wire [31:0] fw_data = p_cf_we ? p_cf_data : pc_wdata;
+  wire [31:0] front_b_dout;
 
   cell_uram #(.DATA_W(32), .AW(2*CELL_BITS))
   cell_front_i (.clk(clkv),
                 .a_addr({fy, fx}), .a_dout(front_d),
-                .b_addr(fb_addr[2*CELL_BITS-1:0]), .b_we(fw_we), .b_din(p_cf_data),
-                .b_dout(shadow_d));
+                .b_addr(fb_addr[2*CELL_BITS-1:0]), .b_we(fw_we), .b_din(fw_data),
+                .b_dout(front_b_dout));
+
+  // 影。描いている間は壊れた値が出るので 0 にして消す
+  assign shadow_d = ps_busy ? 32'd0 : front_b_dout;
+
+  // 下の色は両方の層から読んでおき、どちらを使うかは並び替え器が選ぶ
+  // (1 つの枠に奥層と手前層が混ざることがあるため)
 
   // ============ ピースを描く (段5c・最小版) ============
   //   焼き込んだ表を頭から順に描いて止まる。動かすのは次の段。
-  wire        ps_busy, ps_valid, ps_take, ps_premul, ps_done;
   wire [3:0]  ps_type;
   wire [8:0]  ps_bw;
   wire [17:0] ps_npix;
@@ -178,8 +206,9 @@ module rtl_top
   wire signed [23:0] ps_sxv, ps_syv, ps_sxqx, ps_syqx, ps_sxqy, ps_syqy;
   wire signed [23:0] ps_seed, ps_e, ps_rot, ps_time, ps_depth;
 
-  pdriver #(.NPIECE(64)) pdrv_i
-    (.clk(clkv), .resetn(~resetv), .p_take(ps_take), .p_valid(ps_valid),
+  pdriver #(.NPIECE(271)) pdrv_i
+    (.clk(clkv), .resetn(~resetv), .p_take(ps_take), .draw_req(p_draw_req),
+     .p_valid(ps_valid),
      .p_type(ps_type), .p_bw(ps_bw), .p_npix(ps_npix),
      .p_x0(ps_x0), .p_y0(ps_y0),
      .p_vqx0(ps_vqx0), .p_vqy0(ps_vqy0), .p_qx0(ps_qx0), .p_qy0(ps_qy0),
@@ -188,7 +217,8 @@ module rtl_top
      .p_sx_qy(ps_sxqy), .p_sy_qy(ps_syqy),
      .p_seed(ps_seed), .p_e(ps_e), .p_rot(ps_rot), .p_time(ps_time),
      .p_cr(ps_cr), .p_cg(ps_cg), .p_cb(ps_cb),
-     .p_depth(ps_depth), .p_premul(ps_premul), .all_done(ps_done));
+     .p_depth(ps_depth), .p_premul(ps_premul), .p_front(ps_front),
+     .all_done(ps_done));
 
   //  段5d-3 から下の色を読んで α で重ねる。URAM の口は 1 クロックに
   //  読みか書きのどちらかだけなので、並び替え器は **S_EXEC 中に 192 画素を
@@ -204,9 +234,12 @@ module rtl_top
      .p_sx_qy(ps_sxqy), .p_sy_qy(ps_syqy),
      .p_seed(ps_seed), .p_e(ps_e), .p_rot(ps_rot), .p_time(ps_time),
      .p_cr(ps_cr), .p_cg(ps_cg), .p_cb(ps_cb),
-     .p_depth(ps_depth), .p_premul(ps_premul), .busy(ps_busy),
-     .cell_we(pc_we), .cell_addr(pc_addr), .cell_wdata(pc_wdata),
-     .cell_rdata(pc_rdata), .cell_raddr(pc_raddr));
+     .p_depth(ps_depth), .p_premul(ps_premul), .p_front(ps_front),
+     .busy(ps_busy),
+     .cell_we(pc_we), .cell_front(pc_front),
+     .cell_addr(pc_addr), .cell_wdata(pc_wdata),
+     .cell_rdata_back(back_b_dout), .cell_rdata_front(front_b_dout),
+     .cell_raddr(pc_raddr));
 
   // RGB565 → 8bit
   function [7:0] r8; input [15:0] c; begin r8 = {c[15:11], c[15:13]}; end endfunction

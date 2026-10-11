@@ -45,6 +45,7 @@
 /* セル画像の流し込み。URAM は初期値を持てないので起動時にここから入れる */
 #define KAL_CELL_CTRL (KAL_BASE + 0x180)   /* bit0: 0=奥層 1=手前層。書くと番地が0に戻る */
 #define KAL_CELL_DATA (KAL_BASE + 0x190)   /* 書くと今の番地に入り、番地が1進む */
+#define KAL_DRAW_REQ  (KAL_BASE + 0x1A0)   /* 書くと PL がピースを描き始める */
 /* 画面に出す文字。1 ワードに 4 文字、下位バイトが左。32桁 x 8行 = 64 ワード */
 #define KAL_TEXT(i)   (KAL_BASE + 0x400 + (i)*0x10)
 #define TXT_COLS      32
@@ -286,6 +287,14 @@ static void HandleKey(int c)
  * URAM は初期値を持てないので、起動時にここで入れる。
  * CELL_CTRL にどちらのセルかを書くと番地が 0 に戻り、あとは
  * CELL_DATA に 65536 回書くだけでよい (番地は PL 側で進む)。
+ *
+ * ★ 段5d-5 から**手前層は PL が描く**ので、ここで入れるのは
+ *   奥層の「油の地」だけになった。手前層は URAM の初期値 (全 0 = 透明)
+ *   のままでよく、その上に PL がピースを描く。
+ *     流し込み  65536 x 2 語 → 65536 語     13ms → 4.3ms
+ *     cell_data.c                 384KB → 128KB
+ *   油の地も PL で作れる (中心から外へのグラデーション + ゆっくりした波) が、
+ *   それは別の回路が要るので今は PS から入れている。
  */
 static void LoadCells(void)
 {
@@ -296,12 +305,27 @@ static void LoadCells(void)
     for (i = 0; i < CELL_N; i++)
         Xil_Out32(KAL_CELL_DATA, cell_back[i]);
 
+    /* ★ 手前層は透明 (全 0) にしてから PL に描かせる。
+     *   URAM は「初期値を持てない」が、これは $readmemh が効かないという
+     *   意味で、**電源投入時の中身が 0 である保証ではない**。
+     *   前の絵やゴミが残っていると、PL が描いたピースに混ざって見える。
+     *   0 を書くだけなので配列は要らない (cell_data.c は増えない)。
+     */
     Xil_Out32(KAL_CELL_CTRL, 1);                 /* 手前層 */
     for (i = 0; i < CELL_N; i++)
-        Xil_Out32(KAL_CELL_DATA, cell_front[i]);
+        Xil_Out32(KAL_CELL_DATA, 0);
 
-    xil_printf("セル画像を入れた (%d 語 x 2、%u フレームぶん)\r\n",
+    xil_printf("油の地を入れ、手前層を透明にした (%d 語 x 2、%u フレームぶん)\r\n",
                CELL_N, (unsigned)(Xil_In32(KAL_FRAME_CNT) - t0));
+
+    /* ★ 流し込みが全部終わってから PL に描かせる (段5d-6)。
+     *   PL は起動しただけでは描き始めない (pdriver が draw_req を待つ)。
+     *   先に描かせると、あとから来るこの流し込みに全部上書きされる。
+     *   段5d-5 の実機で「操作画面は出るが絵が出ない」となって判明した。
+     *     流し込み 67ms (4 フレーム)  >>  PL の描画 10ms (0.63 フレーム)
+     */
+    Xil_Out32(KAL_DRAW_REQ, 1);
+    xil_printf("PL にピースを描かせた (271 個)\r\n");
 }
 
 /* ========== 操作一覧をモニターに出す ==========

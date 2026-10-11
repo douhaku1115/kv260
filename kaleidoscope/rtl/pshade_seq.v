@@ -82,13 +82,22 @@ module pshade_seq
    input  wire [7:0]            p_cr, p_cg, p_cb,   // 粒の色
    input  wire signed [W-1:0]   p_depth,            // 奥行きの暗さ 0.65〜1.0
    input  wire                  p_premul,           // 1 = すでに α を掛けた色を出す種類
+   input  wire                  p_front,            // 1 = 手前層のピース (段5d-5)
    output wire                  busy,
 
    // ---- セル画像への書き込み ----
+   //   奥層は RGB565 の 16bit、手前層は {ablur, a, rgb565} の 32bit。
+   //   同じ口で両方を扱うので 32bit にしてある。奥層のときは上位を捨てる。
+   //   どちらへ書くかは cell_front が示す (rtl_top が振り分ける)。
    output reg                   cell_we,
+   output reg                   cell_front,   // 1 = 手前層へ書く
    output reg  [AB-1:0]         cell_addr,
-   output reg  [15:0]           cell_wdata,   // RGB565
-   input  wire [15:0]           cell_rdata,   // 重ねるために読む
+   output reg  [31:0]           cell_wdata,   // {ablur, a, rgb565}
+   //  下の色は **両方の層から同じ番地を読んでおき、スロットごとに選ぶ**。
+   //  1 つの枠に奥層と手前層が混ざることがあるので、読む側で選り分ける
+   //  (先読みの拍には cell_front がまだ前の枠の値なので、それでは選べない)。
+   input  wire [15:0]           cell_rdata_back,
+   input  wire [31:0]           cell_rdata_front,
    output wire [AB-1:0]         cell_raddr
    );
 
@@ -127,6 +136,7 @@ module pshade_seq
   reg [7:0]          pb_cb   [0:PMIX-1];
   reg signed [W-1:0] pb_depth[0:PMIX-1];
   reg [PMIX-1:0]     pb_premul;
+  reg [PMIX-1:0]     pb_front;    // 手前層のピースか (段5d-5)
 
   // ============ 座標を作る ============
   wire [LANES-1:0]      lv;
@@ -326,6 +336,7 @@ module pshade_seq
         pb_cb   [npiece] <= p_cb;
         pb_depth[npiece] <= p_depth;
         pb_premul[npiece] <= p_premul;
+        pb_front [npiece] <= p_front;
         p_take   <= 1'b1;
         cur_done <= 1'b0;
         st       <= S_LOADX;
@@ -489,20 +500,24 @@ module pshade_seq
   //  【割り切り】同じ枠の中で 2 つのピースが重なると、後のピースは
   //    先のピースの書き込みを見ない (先読みなので)。段5d-2 の時点でも
   //    読みと書きが 1 拍ずれていて同じ制約があった。重なる画素だけの話。
-  reg [15:0] cBG [0:LANES*WARP-1];
+  reg [31:0] cBG [0:LANES*WARP-1];   // 下の色。手前層は {ablur,a,rgb565}
   reg [8:0]  bgi_d1, bgi_d2;
+
+  // 溜める拍のスロットがどちらの層かで選ぶ
+  wire [31:0] rd_sel = pb_front[cPS[bgi_d2[8:3]]] ? cell_rdata_front
+                                                  : {16'd0, cell_rdata_back};
 
   always @(posedge clk) begin
     bgi_d1 <= bgi;
     bgi_d2 <= bgi_d1;
-    if (st == S_EXEC && bgi_d2 < LANES*WARP) cBG[bgi_d2] <= cell_rdata;
+    if (st == S_EXEC && bgi_d2 < LANES*WARP) cBG[bgi_d2] <= rd_sel;
   end
 
   // 読む番地。S_EXEC 以外の拍に出しても害はない (rtl_top が
   // 書き込みのない拍だけ URAM に渡す)
   assign cell_raddr = (bgi < LANES*WARP) ? cAD[bgi[7:0]] : {AB{1'b0}};
 
-  wire [15:0] bg_px = cBG[bi_d2];
+  wire [31:0] bg_px = cBG[bi_d2];
 
   wire signed [W-1:0] bA = cA[bi_d2];
   wire signed [W-1:0] bK = cK[bi_d2];
@@ -551,9 +566,10 @@ module pshade_seq
   reg signed [W-1:0]    dep_1;              // 奥行きの暗さ
   reg [8:0]             al_1;               // α (0〜256)
   reg                   pre_1;              // α をすでに掛けた色か
-  reg [15:0]            bgp_1;              // 下の色 (RGB565)
+  reg [31:0]            bgp_1;              // 下の色 {ablur, a, rgb565}
   reg [AB-1:0]          bad_1;              // 書き込み先
   reg                   act_1;              // この画素を書くか
+  reg                   fr_1;               // 手前層か (段5d-5)
 
   always @(posedge clk) begin
     tr_1  <= tr_q;
@@ -564,6 +580,7 @@ module pshade_seq
     pre_1 <= b_premul;
     bgp_1 <= bg_px;
     bad_1 <= cAD[bi_d2];
+    fr_1  <= pb_front[bsel];
     act_1 <= (st == S_BLEND) && (bi_d2 < LANES*WARP) && cVD[bi_d2];
   end
 
@@ -590,10 +607,11 @@ module pshade_seq
   wire [20:0] pg = pre_1 ? dg * 9'd256 : dg * al_1;
   wire [20:0] pb = pre_1 ? db * 9'd256 : db * al_1;
 
-  // 下の色 (RGB565 から戻す)
+  // 下の色 (RGB565 から戻す)。手前層は上位に {ablur, a} が乗っている
   wire [7:0] br_ = {bgp_1[15:11], bgp_1[15:13]};
   wire [7:0] bg_ = {bgp_1[10:5],  bgp_1[10:9]};
   wire [7:0] bb_ = {bgp_1[4:0],   bgp_1[4:2]};
+  wire [7:0] ba_ = bgp_1[23:16];              // 下の α (手前層のときだけ意味がある)
 
   // 重ねてから 255 相当 (65280) で切る。ここが参照実装の切る場所と同じ
   wire [21:0] mr_w = pr + br_ * ia_1;
@@ -603,10 +621,27 @@ module pshade_seq
   wire [16:0] mg = (mg_w > 22'd65535) ? 17'd65535 : mg_w[16:0];
   wire [16:0] mb = (mb_w > 22'd65535) ? 17'd65535 : mb_w[16:0];
 
+  // ---- 手前層の α も重ねる (段5d-5) ----
+  //   手前層は {ablur, a, rgb565} を持つ。色はプリマルチプライドなので
+  //   奥層と同じ式でよいが、**α も同じ要領で重ねる**必要がある。
+  //     a_out = a_src + a_dst * (1 - a_src)
+  //   奥層は不透明なので α を持たず、ここは使わない (上位は 0 を書く)。
+  //
+  //   ★ ablur (影用のぼかした α) は a をそのまま入れる。
+  //     参照実装は α を 2x2 で平均したものを使うが、ぼかさなくても
+  //     絵の差は平均 0.195/255 しかない (tools/ablur_effect.py で実測。
+  //     参照実装との差 9.34/255 の 2%)。ぼかすにはセル全体 65536 画素を
+  //     なめる 1 パスが要るので、割に合わない。
+  wire [16:0] a_mix = {8'd0, ba_} * ia_1;            // a_dst * (1-a_src)
+  wire [9:0]  a_sum = {1'b0, al_1} + a_mix[16:8];
+  wire [7:0]  a_out = (a_sum >= 10'd255) ? 8'd255 : a_sum[7:0];
+
   always @(posedge clk) begin
     cell_addr  <= bad_1;
-    cell_wdata <= {mr[15:11], mg[15:10], mb[15:11]};
+    cell_wdata <= fr_1 ? {a_out, a_out, mr[15:11], mg[15:10], mb[15:11]}
+                       : {16'd0,        mr[15:11], mg[15:10], mb[15:11]};
     cell_we    <= act_1;
+    cell_front <= fr_1;
   end
 
 endmodule

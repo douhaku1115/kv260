@@ -158,6 +158,10 @@ foreach sig {kx z_mirror remain0 inv_tr cos_t sin_t nx0 ny0 wd0 nx1 ny1 wd1 nx2 
 connect_bd_net [get_bd_pins ${rtl_top_instance}/text_addr] [get_bd_pins ${axi_slave_instance}/text_addr]
 connect_bd_net [get_bd_pins ${axi_slave_instance}/text_ch] [get_bd_pins ${rtl_top_instance}/text_ch]
 # セル画像への流し込み (URAM は初期値を持てないので起動時に PS が入れる)
+# 描画開始 (段5d-6)。PS がセルを入れ終えてから PL に描かせる
+foreach sig {draw_req} {
+  connect_bd_net [get_bd_pins ${axi_slave_instance}/v_$sig] [get_bd_pins ${rtl_top_instance}/p_$sig]
+}
 foreach sig {cf_we cf_sel cf_addr cf_data} {
   connect_bd_net [get_bd_pins ${axi_slave_instance}/v_$sig] [get_bd_pins ${rtl_top_instance}/p_$sig]
 }

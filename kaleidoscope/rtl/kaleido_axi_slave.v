@@ -26,6 +26,9 @@
 //    0x180  CELL_CTRL   bit0 = どちらのセルか (0=奥層 1=手前層)。
 //                       書くと番地が 0 に戻る
 //    0x190  CELL_DATA   書くとそのセルの「いまの番地」に入り、番地が 1 進む。
+//    0x1A0  DRAW_REQ    書くと PL がピースを描き始める (段5d-6)。
+//                       ★ セルの流し込みを**全部終えてから**書くこと。
+//                         先に描かせると流し込みが上書きしてしまう。
 //                       セル画像は URAM に置いてあり URAM は初期値を持てないので、
 //                       起動時に PS がここから 65536 語ずつ流し込む
 //
@@ -102,7 +105,11 @@ module kaleido_axi_slave #(
     output reg                             v_cf_we,
     output reg                             v_cf_sel,    // 0=奥層 1=手前層
     output reg  [15:0]                     v_cf_addr,
-    output reg  [31:0]                     v_cf_data
+    output reg  [31:0]                     v_cf_data,
+    //  ★ 描画開始 (段5d-6)。PS がセルの流し込みを終えてから 1 回書く。
+    //    これが無いと PL は起動 55μs で描き始め、**あとから来る PS の
+    //    流し込み (67ms) に全部上書きされる**。
+    output reg                             v_draw_req
 );
 
     localparam NREG = 23;          // 0x000 〜 0x160
@@ -196,7 +203,8 @@ module kaleido_axi_slave #(
     reg [15:0] cw_addr, cw_aq;
     reg [31:0] cw_data;
     reg        cw_tgl;
-    initial begin cw_sel = 1'b0; cw_addr = 16'd0; cw_tgl = 1'b0; end
+    reg        dr_tgl;                 // 描画開始 (段5d-6)
+    initial begin cw_sel = 1'b0; cw_addr = 16'd0; cw_tgl = 1'b0; dr_tgl = 1'b0; end
 
     always @(posedge S_AXI_ACLK) begin
         if (wr_en) begin
@@ -212,6 +220,8 @@ module kaleido_axi_slave #(
                 cw_addr <= cw_addr + 16'd1;
                 cw_tgl  <= ~cw_tgl;            // 映像側へ「1 語来た」と伝える
             end
+            else if (wr_unit == 7'd26)         // 0x1A0 DRAW_REQ
+                dr_tgl <= ~dr_tgl;
             else if (wr_unit < NREG-1)
                 regs[wr_unit] <= S_AXI_WDATA[19:0];
             else if (wr_unit >= TEXT_BASE && wr_unit < TEXT_BASE + TEXT_WORDS) begin
@@ -228,12 +238,16 @@ module kaleido_axi_slave #(
     //   PS の書き込みは映像クロックよりずっと遅いので、データと番地は
     //   トグルが届く頃には落ち着いている。
     reg c0, c1, c2;
+    reg d0, d1, d2;
     always @(posedge clkv) begin
         c0 <= cw_tgl;  c1 <= c0;  c2 <= c1;
         v_cf_we   <= (c1 != c2);
         v_cf_sel  <= cw_sel;
         v_cf_addr <= cw_aq;
         v_cf_data <= cw_data;
+        // 描画開始も同じトグル 2 段同期で渡す
+        d0 <= dr_tgl;  d1 <= d0;  d2 <= d1;
+        v_draw_req <= (d1 != d2);
     end
 
     // 映像クロック側から読む。書き込みは AXI クロック側。

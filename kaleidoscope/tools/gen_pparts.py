@@ -78,13 +78,16 @@ def piece_words(p):
     depth = 0.65 + 0.35 * p["z"]
     col = p["col"]
     premul = 1 if key in ("glitter", "bubble") else 0
+    # 23 語目: bit0 = premul、bit1 = 手前層か (段5d-5)。
+    # 参照実装 renderCell() と同じく z >= 0.5 を手前層にする
+    front = 1 if p["z"] >= 0.5 else 0
 
     return [typ, w, w * h, x0, y0,
             fx(vqx0), fx(vqy0), fx(qx0), fx(qy0),
             fx(s), fx(s), fx(ca * s), fx(-sa * s), fx(sa * s), fx(ca * s),
             fx(p["seed"]), fx(e), fx(p["rot"]), fx(0.0),
             int(col[0] * 255 + .5), int(col[1] * 255 + .5), int(col[2] * 255 + .5),
-            fx(depth), premul]
+            fx(depth), premul | (front << 1)]
 
 
 def order_by_type_then_z(lst):
@@ -105,7 +108,9 @@ def order_by_type_then_z(lst):
 
 
 def main():
-    want = int(sys.argv[1]) if len(sys.argv) > 1 else 64
+    # 段5d-5 から**手前層も PL で描く**ので、既定の内訳をそのまま全部入れる。
+    # 以前は 64 個に間引いていた (奥層だけ描いていたため)。
+    want = int(sys.argv[1]) if len(sys.argv) > 1 else 0   # 0 = 全部
     rng = random.Random(3)
 
     # ---- 油の地だけのセル画像 ----
@@ -124,7 +129,7 @@ def main():
     rng.shuffle(parts)
     sel = []
     for p in parts:
-        if len(sel) >= want:
+        if want and len(sel) >= want:
             break
         if piece_words(p):
             sel.append(p)
@@ -154,6 +159,9 @@ def main():
         cnt[p["key"]] = cnt.get(p["key"], 0) + 1
     nm = {q[0]: q[1] for q in KV_PIECES}
     print("  内訳: " + "  ".join("%s %d" % (nm[k], v) for k, v in sorted(cnt.items())))
+    nb = sum(1 for p in used if p["z"] < 0.5)
+    print("  層: 奥層 %d 個 / 手前層 %d 個 (z >= 0.5 が手前層)"
+          % (nb, len(used) - nb))
 
     # ---- 期待される絵 (実機と見比べる用) ----
     back, front = K.render(used, CELL)
