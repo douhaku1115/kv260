@@ -1,9 +1,14 @@
 // ============================================================
-//  pdriver — 焼き込んだピースの表を順に並び替え器へ流す
+//  pdriver — ピースの表を順に並び替え器へ流す
 //
-//  pparts.hex に入れておいたピースを頭から 1 個ずつ pshade_seq へ渡し、
-//  最後まで行ったら止まる。本番ではここが AXI のピース表になり、
-//  物理演算の結果を毎フレーム受けて描き直す。
+//  表のピースを頭から 1 個ずつ pshade_seq へ渡し、最後まで行ったら止まる。
+//  draw_req が来るたびに頭から描き直す。
+//
+//  【★ 表は PS が AXI で書く (段5d-7)】
+//    前は pparts.hex を焼き込んだ ROM だった。いまは書ける RAM で、
+//    PS が CELL_CTRL=2 → CELL_DATA に 24 語 x 個数を書く。
+//    書いた語数 (n_words) までを描く。初期値は pparts.hex のまま。
+//    物理演算 (段6) はこの表を毎フレーム書き換える。
 //
 //  【★ 描き始めるのは PS が 0x1A0 DRAW_REQ を書いてから (段5d-6)】
 //    前は起動後 4095 クロック (55μs) 待つだけだった。ところが PS の
@@ -41,7 +46,7 @@ module pdriver
   #(
     parameter W      = 24,
     parameter WORDS  = 24,          // 1 個あたりの語数
-    parameter NPIECE = 271,         // 表に入っている個数
+    parameter MAXP   = 645,         // 表に入る最大の個数 (参照実装の上限)
     parameter CB     = 9,
     parameter CELLB  = 8
     )
@@ -49,7 +54,13 @@ module pdriver
    input  wire                  clk,
    input  wire                  resetn,
    input  wire                  p_take,     // 並び替え器が 1 個取り込んだ
-   input  wire                  draw_req,   // 1 クロック。これが来たら描き始める
+   input  wire                  draw_req,   // 1 クロック。来るたびに表の頭から描き直す
+
+   // ---- 表の書き込み (段5d-7。PS が AXI で書く) ----
+   input  wire                  t_we,
+   input  wire [15:0]           t_addr,     // 語の番地 (個数 x 24 + 語)
+   input  wire [W-1:0]          t_data,
+   input  wire [15:0]           n_words,    // 表に入っている語数 = 個数 x 24
 
    output wire                  p_valid,    // 入口にピースが乗っている
    output wire [3:0]            p_type,
@@ -65,20 +76,25 @@ module pdriver
    output wire signed [W-1:0]   p_depth,
    output wire                  p_premul,
    output wire                  p_front,    // 1 = 手前層のピース
-   output wire                  all_done
+   output wire                  all_done    // 描いていない (配り終えた / まだ始めていない)
    );
 
-  (* rom_style = "block" *)
-  reg [W-1:0] tab [0:NPIECE*WORDS-1];
+  //  表は書ける RAM (段5d-7)。初期値は焼き込みの表 (pparts.hex) なので、
+  //  PS が何も書かなくても段5d-6 と同じ絵が出る。
+  (* ram_style = "block" *)
+  reg [W-1:0] tab [0:MAXP*WORDS-1];
   initial $readmemh("pparts.hex", tab);
+
+  always @(posedge clk) if (t_we) tab[t_addr] <= t_data;
 
   // 読み出しは 1 本だけ。これなら BRAM に載る
   //  ★ 番地は**組み合わせ**で作ること。レジスタにすると番地が 1 拍遅れ、
   //    溜める拍 (wi_d1) とずれて 1 語ぶん前の値が入る。
+  //  ピースの先頭番地 base は 24 ずつ足して作る (個数 x 24 の掛け算をしない)
   reg  [W-1:0]  rdata;
-  reg  [15:0]   idx;
+  reg  [15:0]   base;
   reg  [4:0]    wi;
-  wire [17:0]   raddr = idx * WORDS + wi;
+  wire [15:0]   raddr = base + {11'd0, wi};
   always @(posedge clk) rdata <= tab[raddr];
 
   // 24 語を溜める場所。ここは普通のレジスタ (小さい)
@@ -86,18 +102,18 @@ module pdriver
 
   reg [4:0]  wi_d1;            // 溜める先 (読み出しが 1 拍遅れるぶん)
   reg        rd_v_d1;
-  reg        warm_done;        // PS から描画開始が来た
+  reg        active;           // 描いている (draw_req から配り終えるまで)
   reg        ready;            // 24 語そろった
 
-  wire done = (idx >= NPIECE);
+  wire done = (base >= n_words);
 
   //  ★ 読み出し中かどうかは**組み合わせ**で出すこと。
   //    レジスタにすると 1 拍遅れて立ち、**最初の語 (cur[0]) を取りこぼす**。
   //    症状: p_type だけが x のまま (他の語は 1 つずれずに合っている)
-  wire rd_v = warm_done && !done && !ready;
+  wire rd_v = active && !done && !ready;
 
-  assign p_valid  = ready && !done;
-  assign all_done = done;
+  assign p_valid  = active && ready && !done;
+  assign all_done = !active;
 
   always @(posedge clk) begin
     wi_d1    <= wi;
@@ -105,16 +121,19 @@ module pdriver
     if (rd_v_d1) cur[wi_d1] <= rdata;      // 読めた語を溜める
 
     if (!resetn) begin
-      idx <= 16'd0; wi <= 5'd0; ready <= 1'b0;
-      warm_done <= 1'b0;
-    end else if (!warm_done) begin
-      // ★ 起動しただけでは描き始めない。**PS が 0x1A0 を書くまで待つ。**
-      //   前は 4095 クロック (55μs) 待つだけだったが、PS のセル流し込みは
-      //   67ms かかる。PL が先に 10ms で描き終わってしまい、あとから来る
-      //   流し込みに**全部上書きされていた** (段5d-5 の実機で判明)。
-      if (draw_req) warm_done <= 1'b1;
-    end else if (done) begin
+      base <= 16'd0; wi <= 5'd0; ready <= 1'b0;
+      active <= 1'b0;
+    end else if (draw_req) begin
+      // ★ 起動しただけでは描き始めない。描画開始が来たら表の頭から配る。
+      //   段5d-6 までは PS の 0x1A0 を直接受けて 1 回だけ描いた。
+      //   段5d-7 からは cell_dbuf が「描く面を下地に戻してから」毎回出す。
+      base <= 16'd0; wi <= 5'd0; ready <= 1'b0;
+      active <= 1'b1;
+    end else if (!active) begin
       ready <= 1'b0;
+    end else if (done) begin
+      ready  <= 1'b0;
+      active <= 1'b0;
     end else if (!ready) begin
       // 24 語を順に読む。番地は組み合わせ (raddr) なので、
       // 出した次の拍に rdata が来て cur[wi_d1] へ入る
@@ -125,7 +144,7 @@ module pdriver
         wi <= wi + 5'd1;
       end
     end else if (p_take) begin
-      idx   <= idx + 16'd1;
+      base  <= base + WORDS;
       wi    <= 5'd0;
       ready <= 1'b0;
     end

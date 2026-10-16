@@ -14,7 +14,7 @@
 //
 //  経路と遅延 (count_h/count_v から video_color まで)
 //    scope_pipe   199 クロック  (setup 4 + 16段 x 12 + out 3)
-//    cell_mem       2 クロック
+//    cell_dbuf      2 クロック  (段5d-7 で二重バッファに。遅延は同じ)
 //    影で奥層を暗くする  1 クロック
 //    α合成          1 クロック
 //    減光            1 クロック
@@ -46,11 +46,11 @@ module rtl_top
    input wire               p_mirror2,
    input wire               p_text_on,     // 画面に操作一覧を出す
 
-   // セル画像への流し込み (URAM は初期値を持てないので起動時に PS が入れる)
-   input wire               p_draw_req,   // 描画開始 (段5d-6)。
-                                          // PS がセルを入れ終えてから 1 回来る
+   // ピースの表の書き込みと描き直し (段5d-7)
+   input wire               p_draw_req,     // 描き直しの開始 (1 クロック)
+   output wire              draw_busy,      // 描き直しの途中 (AXI スレーブへ)
    input wire               p_cf_we,
-   input wire               p_cf_sel,       // 0=奥層 1=手前層
+   input wire [1:0]         p_cf_sel,       // 2 = ピースの表 (0/1 は段5d-6 までのセル)
    input wire [15:0]        p_cf_addr,
    input wire [31:0]        p_cf_data,
 
@@ -131,73 +131,44 @@ module rtl_top
   // ============ セル画像を引く (2 クロック) ============
   wire [15:0] back_d;
   wire [31:0] front_d;    // 口A: {ablur, a, rgb565}
-  wire [31:0] shadow_d;   // 口B: 影用にずらした位置 (描画中は 0)
+  wire [31:0] shadow_d;   // 口B: 影用にずらした位置
 
-  // セル画像 2 枚は URAM に置く (段5d)。BRAM が 94% まで来て二重バッファが
-  // 入らなくなったため。URAM へ移すと BRAM が 86 個空く。
-  //   URAM は初期値を持てないので、中身は起動時に PS が AXI で入れる
-  //   (0x180 CELL_CTRL / 0x190 CELL_DATA)。
-  //   奥層はそのあと PL がピースを描き足す。
+  // セル画像は二重バッファ (段5d-7)。奥層・手前層とも 2 面を URAM に置き、
+  // 映す面と描く面を分ける。描き直しは
+  //   描く面を下地に戻す (油の地は BRAM の ROM から) → 表を描く
+  //   → 次のフレーム先頭で入れ替える
+  // の順で、描きかけの絵は画面に出ない。影も描画中に止まらなくなった。
   wire        pc_we, pc_front;
   wire [2*CELL_BITS-1:0] pc_addr;
   wire [31:0] pc_wdata;
   wire [15:0] pc_raddr;     // 下の色を読む番地 (段5d-3)
-
-  // 並び替え器の読み書きを、層で振り分ける (段5d-5)
-  wire pc_we_back  = pc_we && !pc_front;
-  wire pc_we_front = pc_we &&  pc_front;
-
-  // 奥層の口B は 3 通りに使い回す。URAM は同じ拍で読むか書くかの
-  // どちらかしかできないので、**時期で分ける**。
-  //   起動時          PS からの流し込み        (p_cf_we)
-  //   S_BLEND 中      ピース描画の書き込み     (pc_we_back)
-  //   それ以外の拍    下の色の先読み           (pc_raddr)
-  // 並び替え器は S_EXEC 中にだけ先読みするので、書き込みとかち合わない。
-  wire        bw_we    = p_cf_we ? (p_cf_sel == 1'b0) : pc_we_back;
-  wire [15:0] bw_addr  = p_cf_we ? p_cf_addr
-                       : (pc_we_back ? {{(16-2*CELL_BITS){1'b0}}, pc_addr}
-                                     : pc_raddr);
-  wire [15:0] bw_data  = p_cf_we ? p_cf_data[15:0] : pc_wdata[15:0];
-  wire [15:0] back_b_dout;
-
-  cell_uram #(.DATA_W(16), .AW(2*CELL_BITS))
-  cell_back_i (.clk(clkv),
-               .a_addr({by, bx}), .a_dout(back_d),
-               .b_addr(bw_addr[2*CELL_BITS-1:0]), .b_we(bw_we), .b_din(bw_data),
-               .b_dout(back_b_dout));
-
-  // 手前層の口B は 4 通り (段5d-5 で描画の読み書きが加わった)。
-  //   起動時          PS からの流し込み
-  //   S_BLEND 中      ピース描画の書き込み
-  //   S_EXEC 中       下の色の先読み
-  //   描いていない間  影用の読み出し
-  //
-  //  ★ **描いている間は影が止まる。** 影は毎画素引いているので、
-  //    描画の読み書きと必ずかち合う。いまは起動時に 1 回描いて止まるので、
-  //    その数フレームだけ影が出ない。毎フレーム描くようにするときは
-  //    二重バッファと一緒に解く (描く面と映す面を分ければかち合わない)。
-  wire        fw_we   = p_cf_we ? (p_cf_sel == 1'b1) : pc_we_front;
-  wire [15:0] fb_addr = p_cf_we   ? p_cf_addr
-                      : pc_we_front ? {{(16-2*CELL_BITS){1'b0}}, pc_addr}
-                      : ps_busy     ? pc_raddr
-                                    : {{(16-2*CELL_BITS){1'b0}}, {sy, sx}};
-  wire [31:0] fw_data = p_cf_we ? p_cf_data : pc_wdata;
+  wire [15:0] back_b_dout;  // 描く面の下の色
   wire [31:0] front_b_dout;
+  wire        drv_start;
 
-  cell_uram #(.DATA_W(32), .AW(2*CELL_BITS))
-  cell_front_i (.clk(clkv),
-                .a_addr({fy, fx}), .a_dout(front_d),
-                .b_addr(fb_addr[2*CELL_BITS-1:0]), .b_we(fw_we), .b_din(fw_data),
-                .b_dout(front_b_dout));
-
-  // 影。描いている間は壊れた値が出るので 0 にして消す
-  assign shadow_d = ps_busy ? 32'd0 : front_b_dout;
+  cell_dbuf #(.AW(2*CELL_BITS), .OIL_FILE("cell_oil.hex")) cells_i
+    (.clk(clkv), .reset(resetv),
+     .back_addr({by, bx}), .front_addr({fy, fx}), .shadow_addr({sy, sx}),
+     .back_d(back_d), .front_d(front_d), .shadow_d(shadow_d),
+     .d_we_back(pc_we && !pc_front), .d_we_front(pc_we && pc_front),
+     .d_waddr(pc_addr), .d_raddr(pc_raddr[2*CELL_BITS-1:0]), .d_wdata(pc_wdata),
+     .d_rdata_back(back_b_dout), .d_rdata_front(front_b_dout),
+     .draw_req(p_draw_req), .frame_start(frame_start),
+     .draw_idle(ps_done && !ps_busy),
+     .drv_start(drv_start), .busy(draw_busy), .show_buf());
 
   // 下の色は両方の層から読んでおき、どちらを使うかは並び替え器が選ぶ
   // (1 つの枠に奥層と手前層が混ざることがあるため)
 
-  // ============ ピースを描く (段5c・最小版) ============
-  //   焼き込んだ表を頭から順に描いて止まる。動かすのは次の段。
+  // ============ ピースの表 (段5d-7) ============
+  //   PS が CELL_CTRL=2 にしてから CELL_DATA に書く。書いた最後の番地 + 1 を
+  //   語数として pdriver に渡す (起動時は焼き込みの 271 個)。
+  wire pt_we = p_cf_we && (p_cf_sel == 2'd2);
+  reg [15:0] pt_words = 16'd271 * 16'd24;
+  always @(posedge clkv) if (pt_we) pt_words <= p_cf_addr + 16'd1;
+
+  // ============ ピースを描く ============
+  //   表を頭から順に描いて止まる。cell_dbuf が描き直しのたびに起こす。
   wire [3:0]  ps_type;
   wire [8:0]  ps_bw;
   wire [17:0] ps_npix;
@@ -206,8 +177,9 @@ module rtl_top
   wire signed [23:0] ps_sxv, ps_syv, ps_sxqx, ps_syqx, ps_sxqy, ps_syqy;
   wire signed [23:0] ps_seed, ps_e, ps_rot, ps_time, ps_depth;
 
-  pdriver #(.NPIECE(271)) pdrv_i
-    (.clk(clkv), .resetn(~resetv), .p_take(ps_take), .draw_req(p_draw_req),
+  pdriver pdrv_i
+    (.clk(clkv), .resetn(~resetv), .p_take(ps_take), .draw_req(drv_start),
+     .t_we(pt_we), .t_addr(p_cf_addr), .t_data(p_cf_data[23:0]), .n_words(pt_words),
      .p_valid(ps_valid),
      .p_type(ps_type), .p_bw(ps_bw), .p_npix(ps_npix),
      .p_x0(ps_x0), .p_y0(ps_y0),

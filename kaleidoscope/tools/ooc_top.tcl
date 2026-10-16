@@ -28,6 +28,7 @@ read_verilog [list \
   $root/rtl/scope_pipe.v \
   $root/rtl/cell_mem.v \
   $root/rtl/cell_uram.v \
+  $root/rtl/cell_dbuf.v \
   $root/rtl/font_rom.v \
   $root/rtl/pcordic.v \
   $root/rtl/ptrans.v \
@@ -38,7 +39,8 @@ read_verilog [list \
 ]
 foreach h {recip_lut.hex loss_lut.hex seam_lut.hex font_rom.hex \
            log2_lut.hex exp2_lut.hex atan_lut.hex \
-           pprog.hex pprog_base.hex pprog_len.hex pprog_pre.hex pparts.hex} {
+           pprog.hex pprog_base.hex pprog_len.hex pprog_pre.hex pparts.hex \
+           cell_oil.hex} {
   add_files $root/rtl/$h
   set_property file_type {Memory Initialization Files} [get_files $root/rtl/$h]
 }

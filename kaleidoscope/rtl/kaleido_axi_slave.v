@@ -23,14 +23,17 @@
 //    0x140  VX2 / 0x150 VY2
 //    0x160  COMMIT      書くと、その時点の値を一括で映像側へ渡す
 //    0x170  FRAME_CNT   読み出し専用。PL が数えたフレーム数
-//    0x180  CELL_CTRL   bit0 = どちらのセルか (0=奥層 1=手前層)。
-//                       書くと番地が 0 に戻る
-//    0x190  CELL_DATA   書くとそのセルの「いまの番地」に入り、番地が 1 進む。
-//    0x1A0  DRAW_REQ    書くと PL がピースを描き始める (段5d-6)。
-//                       ★ セルの流し込みを**全部終えてから**書くこと。
-//                         先に描かせると流し込みが上書きしてしまう。
-//                       セル画像は URAM に置いてあり URAM は初期値を持てないので、
-//                       起動時に PS がここから 65536 語ずつ流し込む
+//    0x180  CELL_CTRL   bit1:0 = 書き込み先。2 = ピースの表 (段5d-7)。
+//                       書くと番地が 0 に戻る。
+//                       (0=奥層 1=手前層 は段5d-6 までのセルの流し込み。
+//                        段5d-7 で油の地を PL の ROM に移したので、もう使わない)
+//    0x190  CELL_DATA   書くと「いまの番地」に入り、番地が 1 進む。
+//                       ピースの表は 1 個 24 語。書いた語数ぶんを描く
+//    0x1A0  DRAW_REQ    書くと PL が描き直す (描く面を下地に戻す → 表を描く
+//                       → 次のフレーム先頭で映す面と入れ替える)。
+//                       読むと bit0 = 描き直しの途中 (段5d-7)。
+//                       ★ bit0 が 0 になってから表を書き、DRAW_REQ を書くこと。
+//                         描いている途中に表を書き換えると、描きかけが混ざる
 //
 //    0x400 + i*0x10   画面に出す文字 (i = 0〜63)。1 ワードに 4 文字。
 //                     下位バイトが左端。32 桁 x 8 行 = 256 文字。
@@ -103,13 +106,13 @@ module kaleido_axi_slave #(
     // セル画像への流し込み (映像クロック領域)。URAM は初期値を持てないので
     // 起動時に PS がここから入れる
     output reg                             v_cf_we,
-    output reg                             v_cf_sel,    // 0=奥層 1=手前層
+    output reg  [1:0]                      v_cf_sel,    // 2=ピースの表
     output reg  [15:0]                     v_cf_addr,
     output reg  [31:0]                     v_cf_data,
-    //  ★ 描画開始 (段5d-6)。PS がセルの流し込みを終えてから 1 回書く。
-    //    これが無いと PL は起動 55μs で描き始め、**あとから来る PS の
-    //    流し込み (67ms) に全部上書きされる**。
-    output reg                             v_draw_req
+    //  ★ 描画開始 (段5d-6)。段5d-7 からは描き直しの開始
+    output reg                             v_draw_req,
+    //  描き直しの途中か (段5d-7。映像クロック領域から。0x1A0 で読める)
+    input  wire                            v_draw_busy
 );
 
     localparam NREG = 23;          // 0x000 〜 0x160
@@ -204,19 +207,19 @@ module kaleido_axi_slave #(
     // ---- セル画像への流し込み (AXI クロック領域) ----
     //   番地は自分で進める。PS は CELL_CTRL でどちらのセルかを決めて
     //   番地を 0 に戻し、あとは CELL_DATA に 65536 回書くだけでよい。
-    reg        cw_sel;
+    reg [1:0]  cw_sel;
     reg [15:0] cw_addr, cw_aq;
     reg [31:0] cw_data;
     reg        cw_tgl;
     reg        dr_tgl;                 // 描画開始 (段5d-6)
-    initial begin cw_sel = 1'b0; cw_addr = 16'd0; cw_tgl = 1'b0; dr_tgl = 1'b0; end
+    initial begin cw_sel = 2'd0; cw_addr = 16'd0; cw_tgl = 1'b0; dr_tgl = 1'b0; end
 
     always @(posedge S_AXI_ACLK) begin
         if (wr_en) begin
             if (wr_unit == 7'd22)              // 0x160 COMMIT
                 commit_tgl <= ~commit_tgl;
             else if (wr_unit == 7'd24) begin   // 0x180 CELL_CTRL
-                cw_sel  <= S_AXI_WDATA[0];
+                cw_sel  <= S_AXI_WDATA[1:0];
                 cw_addr <= 16'd0;
             end
             else if (wr_unit == 7'd25) begin   // 0x190 CELL_DATA
@@ -298,9 +301,20 @@ module kaleido_axi_slave #(
     always @(posedge clkv) if (frame_start) frame_cnt_v <= frame_cnt_v + 32'd1;
 
     reg [31:0] frame_cnt_a0, frame_cnt_a;
+    reg        busy_a0, busy_a;        // 描き直しの途中か (2 段同期)
+    //  ★ DRAW_REQ を書いた直後は、映像側の busy がまだ AXI 側に届いていない
+    //    (トグル同期 + 2 段同期で数十 ns)。その間に 0 を返すと、PS が
+    //    「終わった」と思って描いている最中の表を書き換えてしまう。
+    //    要求を出してから busy が 1 回見えるまでは req_pend で 1 を返す。
+    reg        req_pend;
+    initial req_pend = 1'b0;
     always @(posedge S_AXI_ACLK) begin
         frame_cnt_a0 <= frame_cnt_v;
         frame_cnt_a  <= frame_cnt_a0;
+        busy_a0      <= v_draw_busy;
+        busy_a       <= busy_a0;
+        if (wr_en && wr_unit == 7'd26) req_pend <= 1'b1;
+        else if (busy_a)               req_pend <= 1'b0;
     end
 
     wire [6:0] rd_unit = S_AXI_ARADDR[10:4];
@@ -309,6 +323,8 @@ module kaleido_axi_slave #(
         if (~axi_rvalid && S_AXI_ARVALID) begin
             if (rd_unit == 7'd23)
                 axi_rdata <= frame_cnt_a;
+            else if (rd_unit == 7'd26)                 // 0x1A0 描き直しの途中か
+                axi_rdata <= {31'd0, busy_a | req_pend};
             else if (rd_unit < NREG-1)
                 axi_rdata <= {12'd0, regs[rd_unit]};
             else

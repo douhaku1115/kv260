@@ -7,7 +7,7 @@
 #include "xavbuf.h"
 #include "xavbuf_clk.h"
 #include "xuartps_hw.h"
-#include "cell_data.h"      /* セル画像 (URAM は初期値を持てないので PS が入れる) */
+#include "parts_data.h"     /* ピースの元の値 (段5d-7。毎フレーム表を作って PL へ書く) */
 #include "xdppsu.h"
 #ifndef SDT
 #include "xscugic.h"
@@ -42,10 +42,12 @@
 #define KAL_VERT(v,i) (KAL_BASE + 0x100 + ((v)*2 + (i))*0x10)   /* x,y */
 #define KAL_COMMIT    (KAL_BASE + 0x160)
 #define KAL_FRAME_CNT (KAL_BASE + 0x170)
-/* セル画像の流し込み。URAM は初期値を持てないので起動時にここから入れる */
-#define KAL_CELL_CTRL (KAL_BASE + 0x180)   /* bit0: 0=奥層 1=手前層。書くと番地が0に戻る */
-#define KAL_CELL_DATA (KAL_BASE + 0x190)   /* 書くと今の番地に入り、番地が1進む */
-#define KAL_DRAW_REQ  (KAL_BASE + 0x1A0)   /* 書くと PL がピースを描き始める */
+/* ピースの表の書き込みと描き直し (段5d-7) */
+#define KAL_CELL_CTRL (KAL_BASE + 0x180)   /* 2 を書くと表の番地が 0 に戻る */
+#define KAL_CELL_DATA (KAL_BASE + 0x190)   /* 書くと表の今の番地に入り、番地が1進む */
+#define KAL_DRAW_REQ  (KAL_BASE + 0x1A0)   /* 書くと描き直す。読むと bit0 = 描き直しの途中 */
+#define CELL_SEL_TABLE 2
+#define PIECE_WORDS    24
 /* 画面に出す文字。1 ワードに 4 文字、下位バイトが左。32桁 x 8行 = 64 ワード */
 #define KAL_TEXT(i)   (KAL_BASE + 0x400 + (i)*0x10)
 #define TXT_COLS      32
@@ -85,7 +87,9 @@ static void ShowSettings(void);
 static void ShowHelp(void);
 static void HandleKey(int c);
 static void UpdateText(void);
-static void LoadCells(void);
+static void PieceWords(const Part *p, double rot, u32 *w);
+static void SelfCheckTable(void);
+static void WriteTable(double t);
 
 int main(void)
 {
@@ -107,13 +111,13 @@ int main(void)
        （2026-09-18 実機で確認。ログが "Running." まで進まなかった）。
        動作実績のある kv260_pong も割り込みを一切設定していない。
        モニタの抜き差しに追従しなくなるが、表示には影響しない。 */
-    /* ========== セル画像を PL へ流し込む ==========
-     * セル画像は URAM に置いてある。URAM は初期値を持てない
-     * (ram_style="ultra" に $readmemh があると BRAM に落ちる。2025.2 で実測) ので、
-     * ここで 65536 語ずつ 2 枚入れる。約 13ms、起動時の 1 回だけ。
-     * 奥層は油の地だけで、この上に PL がピースを描く。
-     * 将来 PL が 2 枚とも毎フレーム描くようになれば、ここは要らなくなる。 */
-    LoadCells();
+    /* ========== ピースの表 (段5d-7) ==========
+     * 段5d-6 までは起動時に油の地を 65536 語流し込んでいた (67ms)。
+     * 段5d-7 から油の地は PL の ROM にあり、PL が描き直しのたびに写すので
+     * 流し込みは要らない。PS は毎フレーム「ピースの表」(271 個 x 24 語) を
+     * 書いて DRAW_REQ を書くだけ。
+     * まず PS の計算が焼き込みの表と同じになるかを確かめる (自己検査)。 */
+    SelfCheckTable();
 
     /* ========== 万華鏡のパラメータを書く ========== */
     KalSetGeometry();
@@ -147,6 +151,9 @@ int main(void)
     int  use_frame_cnt = 1;
     int  reported = 0;
 
+    /* 描き直しの回数を数える (5 秒ごとにシリアルへ。60 なら毎フレーム) */
+    u32 frames = 0, redraws = 0, rep_frames = 0, rep_redraws = 0;
+
     while (1) {
         /* PL が数えたフレーム数が進むまで待つ (映像と歩調を合わせる)。
            進まない場合は待ち続けずに時間待ちへ切り替える。 */
@@ -174,6 +181,22 @@ int main(void)
         Xil_Out32(KAL_SIN_T, (u32)(s32)(sinf(angle) * 32768.0f));
         Xil_Out32(KAL_COMMIT, 1);      /* ここまでの値を次のフレーム先頭で一括反映 */
 
+        /* ========== ピースを描き直す (段5d-7) ==========
+         * PL が前の描き直しを終えて面を入れ替えていれば (bit0 = 0)、
+         * 新しい表を書いて次の描き直しを頼む。
+         * ★ bit0 が 1 の間に表を書くと、描きかけに新しい表が混ざる。 */
+        frames++;
+        if ((Xil_In32(KAL_DRAW_REQ) & 1) == 0) {
+            WriteTable(frames * (double)dt);
+            Xil_Out32(KAL_DRAW_REQ, 1);
+            redraws++;
+        }
+        if (frames - rep_frames >= 300) {
+            xil_printf("描き直し %u 回 / %u フレーム\r\n",
+                       (unsigned)(redraws - rep_redraws), (unsigned)(frames - rep_frames));
+            rep_frames = frames;
+            rep_redraws = redraws;
+        }
     }
     return 0;
 }
@@ -283,49 +306,106 @@ static void HandleKey(int c)
     ShowSettings();
 }
 
-/* ========== セル画像を PL へ流し込む ==========
- * URAM は初期値を持てないので、起動時にここで入れる。
- * CELL_CTRL にどちらのセルかを書くと番地が 0 に戻り、あとは
- * CELL_DATA に 65536 回書くだけでよい (番地は PL 側で進む)。
- *
- * ★ 段5d-5 から**手前層は PL が描く**ので、ここで入れるのは
- *   奥層の「油の地」だけになった。手前層は URAM の初期値 (全 0 = 透明)
- *   のままでよく、その上に PL がピースを描く。
- *     流し込み  65536 x 2 語 → 65536 語     13ms → 4.3ms
- *     cell_data.c                 384KB → 128KB
- *   油の地も PL で作れる (中心から外へのグラデーション + ゆっくりした波) が、
- *   それは別の回路が要るので今は PS から入れている。
+/* ========== ピースの表 (段5d-7) ==========
+ * PL の並び替え器が読む 1 個 24 語を、ピースの元の値から作る。
+ * tools/gen_pparts.py の piece_words() を一行ずつ写したもの。
+ * double で計算する (Python と同じ丸めにするため。A53 は double の演算器を持つ)。
  */
-static void LoadCells(void)
+#define CELL_PX 256
+#define FRAC_ONE 131072.0      /* S6.17 */
+
+static u32 fx24(double v)
 {
-    int i;
-    u32 t0 = Xil_In32(KAL_FRAME_CNT);
+    /* Python の round() は偶数丸め。nearbyint も既定の丸めモードでは偶数丸め */
+    double n = nearbyint(v * FRAC_ONE);
+    if (n >  8388607.0) n =  8388607.0;
+    if (n < -8388608.0) n = -8388608.0;
+    return ((u32)(s32)n) & 0xFFFFFF;
+}
 
-    Xil_Out32(KAL_CELL_CTRL, 0);                 /* 奥層。番地を 0 に戻す */
-    for (i = 0; i < CELL_N; i++)
-        Xil_Out32(KAL_CELL_DATA, cell_back[i]);
+static void PieceWords(const Part *p, double rot, u32 *w)
+{
+    const double pad = p->glitter ? 2.6 : 1.2;
+    const int n = CELL_PX;
+    const double r = p->r * (0.85 + 0.3 * p->z);          /* 奥行きで大きさが変わる */
+    const double half = r * pad;
+    int x0 = (int)floor((p->x - half + 1.0) * 0.5 * n);
+    int x1 = (int)ceil ((p->x + half + 1.0) * 0.5 * n);
+    int y0 = (int)floor((p->y - half + 1.0) * 0.5 * n);
+    int y1 = (int)ceil ((p->y + half + 1.0) * 0.5 * n);
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > n) x1 = n;
+    if (y1 > n) y1 = n;
+    int wdt = x1 - x0;  if (wdt < 8) wdt = 8;               /* 幅は LANES 以上に丸める */
+    int hgt = y1 - y0;  if (hgt < 1) hgt = 1;
+    if (x0 + wdt > n) x0 = n - wdt;                         /* はみ出したら寄せる */
+    if (y0 + hgt > n) y0 = n - hgt;
 
-    /* ★ 手前層は透明 (全 0) にしてから PL に描かせる。
-     *   URAM は「初期値を持てない」が、これは $readmemh が効かないという
-     *   意味で、**電源投入時の中身が 0 である保証ではない**。
-     *   前の絵やゴミが残っていると、PL が描いたピースに混ざって見える。
-     *   0 を書くだけなので配列は要らない (cell_data.c は増えない)。
-     */
-    Xil_Out32(KAL_CELL_CTRL, 1);                 /* 手前層 */
-    for (i = 0; i < CELL_N; i++)
-        Xil_Out32(KAL_CELL_DATA, 0);
+    const double inv_r = 1.0 / r;
+    const double s  = (2.0 / n) * inv_r;
+    const double ca = cos(rot), sa = sin(rot);
+    const double sx = (x0 + 0.5) / n * 2.0 - 1.0;
+    const double sy = (y0 + 0.5) / n * 2.0 - 1.0;
+    const double vqx0 = (sx - p->x) * inv_r;
+    const double vqy0 = (sy - p->y) * inv_r;
+    const double qx0 = ca * vqx0 - sa * vqy0;
+    const double qy0 = sa * vqx0 + ca * vqy0;
+    const double e     = 0.1 + (0.025 - 0.1) * p->z;
+    const double depth = 0.65 + 0.35 * p->z;
+    const int front = (p->z >= 0.5) ? 1 : 0;                /* 参照実装と同じく z >= 0.5 が手前層 */
 
-    xil_printf("油の地を入れ、手前層を透明にした (%d 語 x 2、%u フレームぶん)\r\n",
-               CELL_N, (unsigned)(Xil_In32(KAL_FRAME_CNT) - t0));
+    w[0]  = p->typ;   w[1] = wdt;   w[2] = wdt * hgt;   w[3] = x0;   w[4] = y0;
+    w[5]  = fx24(vqx0);   w[6]  = fx24(vqy0);   w[7]  = fx24(qx0);   w[8]  = fx24(qy0);
+    w[9]  = fx24(s);      w[10] = fx24(s);
+    w[11] = fx24(ca * s); w[12] = fx24(-sa * s); w[13] = fx24(sa * s); w[14] = fx24(ca * s);
+    w[15] = fx24(p->seed); w[16] = fx24(e); w[17] = fx24(rot); w[18] = fx24(0.0);
+    w[19] = p->col[0];  w[20] = p->col[1];  w[21] = p->col[2];
+    w[22] = fx24(depth);
+    w[23] = p->premul | (front << 1);
+}
 
-    /* ★ 流し込みが全部終わってから PL に描かせる (段5d-6)。
-     *   PL は起動しただけでは描き始めない (pdriver が draw_req を待つ)。
-     *   先に描かせると、あとから来るこの流し込みに全部上書きされる。
-     *   段5d-5 の実機で「操作画面は出るが絵が出ない」となって判明した。
-     *     流し込み 67ms (4 フレーム)  >>  PL の描画 10ms (0.63 フレーム)
-     */
-    Xil_Out32(KAL_DRAW_REQ, 1);
-    xil_printf("PL にピースを描かせた (271 個)\r\n");
+/* 起動時の自己検査: 回転を変えずに作った表が pparts.hex (焼き込みの表) と
+ * 1 語も違わないか。PC に C コンパイラが無いので、ここでしか確かめられない。 */
+static void SelfCheckTable(void)
+{
+    u32 w[PIECE_WORDS];
+    u32 first_ps = 0;
+    int bad = 0, first = -1;
+    for (int i = 0; i < NPARTS; i++) {
+        PieceWords(&parts[i], parts[i].rot, w);
+        for (int k = 0; k < PIECE_WORDS; k++) {
+            if (w[k] != parts_check[i * PIECE_WORDS + k]) {
+                if (first < 0) { first = i * PIECE_WORDS + k; first_ps = w[k]; }
+                bad++;
+            }
+        }
+    }
+    xil_printf("表の自己検査: %d 語中 %d 語不一致", NPARTS * PIECE_WORDS, bad);
+    if (bad)
+        xil_printf(" (最初は %d 語目: PS=%06x 正解=%06x)", first,
+                   (unsigned)first_ps, (unsigned)parts_check[first]);
+    xil_printf("\r\n");
+}
+
+/* 表を書く。いまは物理演算 (段6) の代わりに、ピースをその場で回すだけ。
+ * 回る速さはピースごとに種 (seed) で変える (-0.6〜+0.6 rad/s)。
+ * ★ rot は 0〜2π に収めること。ラメのプログラムは rot*4 + seed*60 の
+ *   折り返しが S6.17 (±64) にぎりぎり収まる前提 (CLAUDE.md「ハマったところ」) */
+static void WriteTable(double t)
+{
+    const double TWO_PI = 6.283185307179586;
+    u32 w[PIECE_WORDS];
+    Xil_Out32(KAL_CELL_CTRL, CELL_SEL_TABLE);      /* 表の番地を 0 に戻す */
+    for (int i = 0; i < NPARTS; i++) {
+        const Part *p = &parts[i];
+        double rot = p->rot + 0.6 * (p->seed * 2.0 - 1.0) * t;
+        rot = fmod(rot, TWO_PI);
+        if (rot < 0.0) rot += TWO_PI;
+        PieceWords(p, rot, w);
+        for (int k = 0; k < PIECE_WORDS; k++)
+            Xil_Out32(KAL_CELL_DATA, w[k]);
+    }
 }
 
 /* ========== 操作一覧をモニターに出す ==========
