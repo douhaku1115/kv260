@@ -189,6 +189,11 @@ module kaleido_axi_slave #(
     localparam TEXT_CHARS = TEXT_COLS * TEXT_ROWS;      // 32*8 = 256
     localparam TEXT_WORDS = TEXT_CHARS / 4;             // 64
     localparam TEXT_BASE  = 7'd64;                      // 0x400 >> 4
+    localparam TEXT_AW    = $clog2(TEXT_CHARS);         // 文字番号の幅 (256 字なら 8)
+    // ★ 番地の都合で TEXT_WORDS は 64 まで (0x400〜0x7F0)。
+    //   文字数を増やすときは番地の割り当てから見直すこと。
+    wire [6:0]         tw_off = wr_unit - TEXT_BASE;                 // 何語目か
+    wire [TEXT_AW-3:0] tw_idx = tw_off[TEXT_AW-3:0];                 // 4 文字単位の番号
 
     (* ram_style = "block" *)
     reg [7:0] text_ram [0:TEXT_CHARS-1];
@@ -225,10 +230,10 @@ module kaleido_axi_slave #(
             else if (wr_unit < NREG-1)
                 regs[wr_unit] <= S_AXI_WDATA[19:0];
             else if (wr_unit >= TEXT_BASE && wr_unit < TEXT_BASE + TEXT_WORDS) begin
-                text_ram[{wr_unit[5:0], 2'd0}]         <= S_AXI_WDATA[7:0];
-                text_ram[{wr_unit[5:0], 2'd0} + 3'd1]  <= S_AXI_WDATA[15:8];
-                text_ram[{wr_unit[5:0], 2'd0} + 3'd2]  <= S_AXI_WDATA[23:16];
-                text_ram[{wr_unit[5:0], 2'd0} + 3'd3]  <= S_AXI_WDATA[31:24];
+                text_ram[{tw_idx, 2'd0}]         <= S_AXI_WDATA[7:0];
+                text_ram[{tw_idx, 2'd0} + 3'd1]  <= S_AXI_WDATA[15:8];
+                text_ram[{tw_idx, 2'd0} + 3'd2]  <= S_AXI_WDATA[23:16];
+                text_ram[{tw_idx, 2'd0} + 3'd3]  <= S_AXI_WDATA[31:24];
             end
         end
     end
@@ -252,7 +257,7 @@ module kaleido_axi_slave #(
 
     // 映像クロック側から読む。書き込みは AXI クロック側。
     // 文字は PS が静かに書いてから使うだけなので、普通の単純デュアルポートでよい。
-    always @(posedge clkv) text_ch <= text_ram[text_addr[7:0]];
+    always @(posedge clkv) text_ch <= text_ram[text_addr[TEXT_AW-1:0]];
 
     always @(posedge S_AXI_ACLK) begin
         if (!S_AXI_ARESETN) begin
