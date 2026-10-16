@@ -118,6 +118,14 @@ module mips_top_pipe (
     //   IF ポート  = pc_reg / if_instr
     //   MEM ポート = MEM 段の信号 (mem_byte_en/ex_mem_alu_result/... を前方参照)
     //   PS ポート  = AXI 経由のプログラムロード (imem_we/waddr/wdata)
+    // 前方宣言: 下記は unified_mem 接続(この行より前)で使うため上部で宣言する。
+    //   これが無いと Verilog の暗黙 net 規則で 1bit net が作られ、xsim で z になる
+    //   (Vivado 合成は前方参照を解決するため実機は正常。sim だけの問題)。
+    reg  [31:0] ex_mem_alu_result;
+    reg  [3:0]  mem_byte_en;
+    wire [31:0] mem_write_data;
+    wire [31:0] mem_read_data;   // unified_mem の mem_rdata 出力 (MEM 段で使用、下記参照)
+
     unified_mem unified_mem_inst (
         .if_addr(pc_reg),
         .if_instr(if_instr),
@@ -668,7 +676,7 @@ module mips_top_pipe (
     // ============================================================
 
     reg        ex_mem_reg_write;
-    reg [31:0] ex_mem_alu_result;
+    // ex_mem_alu_result は上部で前方宣言済み
     reg [4:0]  ex_mem_write_reg;
     reg        ex_mem_mem_write;
     reg        ex_mem_mem_to_reg;
@@ -711,7 +719,7 @@ module mips_top_pipe (
 
     // Step 12f: byte_en 生成 (mem_size + addr[1:0], ビッグエンディアン)
     //           halt 中は書き込み禁止
-    reg [3:0] mem_byte_en;
+    // mem_byte_en は上部で前方宣言済み
     always @(*) begin
         if (!(ex_mem_mem_write & ~halt))
             mem_byte_en = 4'b0000;
@@ -731,13 +739,13 @@ module mips_top_pipe (
     end
 
     // 書き込みデータのバイト/ハーフ複製 (byte_en で必要バイトのみ確定)
-    wire [31:0] mem_write_data = (ex_mem_mem_size == 2'b00) ? {4{ex_mem_rd2[7:0]}}  : // sb
+    assign mem_write_data = (ex_mem_mem_size == 2'b00) ? {4{ex_mem_rd2[7:0]}}  : // sb
                                  (ex_mem_mem_size == 2'b01) ? {2{ex_mem_rd2[15:0]}} : // sh
                                                               ex_mem_rd2;             // sw
 
     // OS-prep1: MEM 読出しデータは unified_mem_inst (IF 段付近) の mem_rdata で駆動。
     //   dmem は廃止し命令メモリと統合 (von Neumann)。
-    wire [31:0] mem_read_data;
+    //   宣言は unified_mem_inst の前 (前方宣言ブロック) に移した。
 
     // Step 12f: 読み出しデータのスライス + 符号/ゼロ拡張 (ビッグエンディアン)
     wire [7:0] mem_byte_sel =

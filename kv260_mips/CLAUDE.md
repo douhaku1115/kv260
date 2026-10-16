@@ -39,10 +39,46 @@
 
 ## 標準フロー（毎 Step）
 1. RTL 変更
-2. `vivado.bat -mode batch -source rebuild.tcl` でビルド
-3. 新 Vitis ワークスペース作成（XSA: `project_1/design_1_wrapper.xsa`）
-4. 実機テスト確認
-5. コメント整備 → README.md 更新 → git commit & push
+2. **シミュレーションで検証**（下記「シミュレーション検証」。ここを飛ばさない）
+3. `vivado.bat -mode batch -source rebuild.tcl` でビルド
+4. 新 Vitis ワークスペース作成（XSA: `project_1/design_1_wrapper.xsa`）
+5. 実機テスト確認
+6. コメント整備 → README.md 更新 → git commit & push
+
+## シミュレーション検証（xsim）
+
+Vivado ビルドも実機も不要。数十秒で回る。**仮説は必ずここで実行して確かめること。
+頭の中で検証しない。推論を重ねる前に、まず走らせて出力を見る。**
+
+分からないことは、想像で埋めずに (a) tb を書き足して実行する、(b) ユーザーに聞く、
+のどちらかにする。実行して確かめられる事柄について、自問自答で結論を出さない。
+
+### tb_os1（OS-1 協調マルチタスク検証・動作確認済み）
+
+任意の作業ディレクトリで実行する（`$readmemh("os1.hex")` は cwd を見るため hex のコピーが要る）:
+
+```bash
+export PATH="/e/vivado/2025.2/Vivado/bin:$PATH"
+cp /e/fpga/kria260/kv260_mips/step10/os1.hex .
+R=/e/fpga/kria260/kv260_mips/rtl
+xvlog.bat --relax $R/alu.v $R/control.v $R/regfile.v $R/unified_mem.v $R/mips_top_pipe.v \
+          /e/fpga/kria260/kv260_mips/tb/tb_os1.v
+xelab.bat --relax -debug typical tb_os1 -s tb_os1_sim
+xsim.bat tb_os1_sim -R
+```
+
+期待出力（2026-08-05 実行確認）: `count0 = 58`, `count1 = 57`,
+`PASS: 両タスクが進んだ = 協調マルチタスク成立`
+
+### 注意
+
+- **`--relax` は必須**。`mips_top_pipe.v:473-483` の `ex_mem_reg_write`/`mem_wb_reg_write`、
+  `datapath.v:120` の `rd1` 前方参照など、xvlog の厳格チェックに引っかかる箇所がある
+  （Vivado 合成は通るが xvlog は既定でエラーにする）。
+  `mem_read_data` の暗黙宣言は 2026-10-16 に宣言を前へ移して解消済み
+- `tb/tb_mips.v`（単一サイクル `mips_top` 用）は**現状壊れている**。コンパイル・実行は
+  できるが PC=`xxxxxxxx`、全レジスタ 0 で期待値と一致しない。使うなら先に修正が必要
+- 生成物（`xsim.dir/`, `*.log`, `*.jou`, `*.wdb`）はプロジェクト直下に散らかさない
 
 ## 実機テストの注意
 - **★QSPIブート競合 (2026-06 判明、確立した対処)**: このKV260はQSPIにブート
