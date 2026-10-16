@@ -8,6 +8,7 @@
 #include "xavbuf_clk.h"
 #include "xuartps_hw.h"
 #include "parts_data.h"     /* ピースの元の値 (段5d-7。毎フレーム表を作って PL へ書く) */
+#include "xiltimer.h"       /* XTime_GetTime。物理演算と表の書き込みの時間を測る (段6) */
 #include "xdppsu.h"
 #ifndef SDT
 #include "xscugic.h"
@@ -69,6 +70,10 @@ static int   set_mirror2    = 0;      /* 0 = 3枚鏡, 1 = 2枚鏡 */
 static float set_zoom       = 1.0f;   /* 0.5〜2.5 */
 static float set_autorotate = 0.35f;  /* 0〜1。参照実装の既定値 */
 static int   set_text_on    = 1;      /* 操作一覧をモニターに出すか */
+static float set_viscosity  = 0.5f;   /* 粘り 0〜1。参照実装の既定値 (まだキーは無い) */
+
+/* 筒の回転角 [rad]。PL の COS_T/SIN_T (セルの回転) と物理演算の重力の向きの両方に使う */
+static double sim_tube_angle = 0.0;
 
 typedef enum { LANE_COUNT_1 = 1, LANE_COUNT_2 = 2 } LaneCount_t;
 typedef enum { LINK_RATE_162 = 0x06, LINK_RATE_270 = 0x0A, LINK_RATE_540 = 0x14 } LinkRate_t;
@@ -89,7 +94,9 @@ static void HandleKey(int c);
 static void UpdateText(void);
 static void PieceWords(const Part *p, double rot, u32 *w);
 static void SelfCheckTable(void);
-static void WriteTable(double t);
+static void SimInit(void);
+static void StepSim(double dt);
+static void WriteTable(void);
 
 int main(void)
 {
@@ -118,6 +125,7 @@ int main(void)
      * 書いて DRAW_REQ を書くだけ。
      * まず PS の計算が焼き込みの表と同じになるかを確かめる (自己検査)。 */
     SelfCheckTable();
+    SimInit();                   /* 物理演算の状態を元の値から作る (段6) */
 
     /* ========== 万華鏡のパラメータを書く ========== */
     KalSetGeometry();
@@ -143,16 +151,16 @@ int main(void)
     xil_printf("--- AXI diag done ---\r\n");
     ShowHelp();
 
-    /* ========== 毎フレーム、筒の回転角を進める ========== */
-    /* 参照実装の筒の回転速度 = autoRotate * 0.6 [rad/s] */
-    float angle = 0.0f;
-    const float dt = 1.0f / 60.0f;
+    /* ========== 毎フレーム、物理演算を進めて筒の回転角を PL へ渡す ========== */
+    const double dt = 1.0 / 60.0;
     u32 last = Xil_In32(KAL_FRAME_CNT);
     int  use_frame_cnt = 1;
     int  reported = 0;
 
     /* 描き直しの回数を数える (5 秒ごとにシリアルへ。60 なら毎フレーム) */
     u32 frames = 0, redraws = 0, rep_frames = 0, rep_redraws = 0;
+    /* 物理演算と表の書き込みにかかった時間の最大 (5 秒ごとにシリアルへ) */
+    XTime t_sim_max = 0, t_tbl_max = 0;
 
     while (1) {
         /* PL が数えたフレーム数が進むまで待つ (映像と歩調を合わせる)。
@@ -174,11 +182,16 @@ int main(void)
         int c;
         while ((c = uart_getchar_nb()) >= 0) HandleKey(c);
 
-        angle += set_autorotate * 0.6f * dt;
-        if (angle > 6.2831853f) angle -= 6.2831853f;
+        /* 参照実装と同じく 1 フレームを半分ずつ 2 回進める */
+        XTime t0, t1, t2;
+        XTime_GetTime(&t0);
+        StepSim(dt / 2);
+        StepSim(dt / 2);
+        XTime_GetTime(&t1);
+        if (t1 - t0 > t_sim_max) t_sim_max = t1 - t0;
 
-        Xil_Out32(KAL_COS_T, (u32)(s32)(cosf(angle) * 32768.0f));
-        Xil_Out32(KAL_SIN_T, (u32)(s32)(sinf(angle) * 32768.0f));
+        Xil_Out32(KAL_COS_T, (u32)(s32)(cos(sim_tube_angle) * 32768.0));
+        Xil_Out32(KAL_SIN_T, (u32)(s32)(sin(sim_tube_angle) * 32768.0));
         Xil_Out32(KAL_COMMIT, 1);      /* ここまでの値を次のフレーム先頭で一括反映 */
 
         /* ========== ピースを描き直す (段5d-7) ==========
@@ -187,15 +200,21 @@ int main(void)
          * ★ bit0 が 1 の間に表を書くと、描きかけに新しい表が混ざる。 */
         frames++;
         if ((Xil_In32(KAL_DRAW_REQ) & 1) == 0) {
-            WriteTable(frames * (double)dt);
+            XTime_GetTime(&t1);
+            WriteTable();
             Xil_Out32(KAL_DRAW_REQ, 1);
+            XTime_GetTime(&t2);
+            if (t2 - t1 > t_tbl_max) t_tbl_max = t2 - t1;
             redraws++;
         }
         if (frames - rep_frames >= 300) {
-            xil_printf("描き直し %u 回 / %u フレーム\r\n",
-                       (unsigned)(redraws - rep_redraws), (unsigned)(frames - rep_frames));
+            xil_printf("描き直し %u 回 / %u フレーム  物理 最大 %u us  表 最大 %u us\r\n",
+                       (unsigned)(redraws - rep_redraws), (unsigned)(frames - rep_frames),
+                       (unsigned)(t_sim_max * 1000000 / COUNTS_PER_SECOND),
+                       (unsigned)(t_tbl_max * 1000000 / COUNTS_PER_SECOND));
             rep_frames = frames;
             rep_redraws = redraws;
+            t_sim_max = t_tbl_max = 0;
         }
     }
     return 0;
@@ -388,21 +407,170 @@ static void SelfCheckTable(void)
     xil_printf("\r\n");
 }
 
-/* 表を書く。いまは物理演算 (段6) の代わりに、ピースをその場で回すだけ。
- * 回る速さはピースごとに種 (seed) で変える (-0.6〜+0.6 rad/s)。
+/* ========== 物理演算 (段6) ==========
+ * 参照実装の stepSim() (ref/stepSim.js) を一行ずつ写したもの。
+ * PS が毎フレーム 271 個を動かし、結果を WriteTable で PL の表へ書く。PL は触らない。
+ *
+ * 座標はセル (筒の中) の座標。筒が回るとセルごと回るので、画面の下向き
+ * (重力) はセルの中では筒の回転角の逆に回る (upInCell)。
+ *   - 筒の回転と油の回転の差 wRel が渦を作る (油は粘りに応じて遅れて追従)
+ *   - ピースの目標速度 = 渦 + ゆるい対流 + 沈降 + 微小な揺らぎ。速度は指数緩和で追従
+ *   - 奥行き z はランダムウォーク (気泡は手前に固定)
+ *   - 押し合いは円の衝突を 2 回反復 (ラメは cr=0 で省略)。z が 0.45 以上離れれば重なってよい
+ *   - 筒の内壁 (半径 0.985) の外に出たら内側へ戻す
+ */
+#define TWO_PI_D 6.283185307179586
+
+/* 種類ごとの沈む強さと当たり判定 (tools/piece_table.py の KV_PIECES。番号は kv_cell.py) */
+static const double type_sink[9] = {
+    /* bead glass glitter hexprism bubble stone rod  blob crescent */
+       0.28, 0.15, 0.03,   0.18,    -0.3,  0.34, 0.20, 0.12, 0.10 };
+static const double type_cr[9] = {
+       1.00, 0.85, 0.00,   0.50,    1.00,  1.00, 0.45, 0.90, 0.70 };
+#define TYPE_GLITTER 2
+#define TYPE_BUBBLE  4
+
+typedef struct {
+    double x, y, z, vx, vy, vz, rot, spin, sink, cr;
+} SimPart;
+
+static SimPart sp[NPARTS];          /* parts[] と同じ並び */
+static u16     solid[NPARTS];       /* 押し合いに加わるもの (cr > 0) の番号 */
+static int     nsolid;
+static u16     order[NPARTS];       /* 表に書く順。種類ごとに z 順 (奥から) */
+static double  sim_time = 0.0;
+static double  sim_tube_vel = 0.9;  /* 参照実装の初期値 */
+static double  sim_fluid_vel = 0.0;
+
+/* 乱数 (xorshift32)。参照実装の Math.random() の代わり。0 以上 1 未満 */
+static u32 rng_state = 0x2545F491u;
+static double rnd(void)
+{
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return (rng_state >> 8) * (1.0 / 16777216.0);
+}
+
+static void SimInit(void)
+{
+    nsolid = 0;
+    for (int i = 0; i < NPARTS; i++) {
+        const Part *p = &parts[i];
+        SimPart *s = &sp[i];
+        s->x = p->x;  s->y = p->y;  s->z = p->z;
+        s->vx = s->vy = s->vz = 0.0;
+        s->rot = p->rot;  s->spin = 0.0;
+        s->sink = type_sink[p->typ] * (0.75 + 0.5 * rnd());   /* rand(0.75, 1.25) */
+        s->cr = p->r * type_cr[p->typ];
+        if (s->cr > 0.0) solid[nsolid++] = (u16)i;
+        order[i] = (u16)i;
+    }
+}
+
+static void StepSim(double dt)
+{
+    /* 筒: 自動回転の速さへ近づける。参照実装の keyTurn (矢印キーで回す) はまだ無い */
+    const double target = set_autorotate * 0.6;
+    sim_tube_vel += (target - sim_tube_vel) * (1.0 - exp(-dt * 1.2));
+    sim_tube_angle += sim_tube_vel * dt;
+    if (sim_tube_angle >= TWO_PI_D) sim_tube_angle -= TWO_PI_D;
+    if (sim_tube_angle < 0.0)       sim_tube_angle += TWO_PI_D;
+
+    /* 油: 粘りに応じて筒から遅れて追従する */
+    const double thin = pow(2.5, (0.5 - set_viscosity) * 2.0);
+    sim_fluid_vel += (sim_tube_vel - sim_fluid_vel) * (1.0 - exp(-dt * thin / 2.2));
+    const double wRel = sim_fluid_vel - sim_tube_vel;
+    const double gx = -sin(sim_tube_angle), gy = -cos(sim_tube_angle);   /* -upInCell */
+    const double k = 1.0 - exp(-dt * 6.0 * thin);
+    const double t = sim_time;
+
+    for (int i = 0; i < NPARTS; i++) {
+        SimPart *p = &sp[i];
+        const int typ = parts[i].typ;
+        /* 筒との回転差による渦 + ゆるい対流 (ラメほど流されやすい) + 沈降 */
+        const double drift = (typ == TYPE_GLITTER) ? 0.09 : 0.03;
+        const double tx = -wRel * p->y + drift * sin(p->y * 3.1 + t * 0.31)
+                          + gx * p->sink * thin + (rnd() - 0.5) * 0.02;
+        const double ty =  wRel * p->x + drift * cos(p->x * 2.7 - t * 0.27)
+                          + gy * p->sink * thin + (rnd() - 0.5) * 0.02;
+        p->vx += (tx - p->vx) * k;
+        p->vy += (ty - p->vy) * k;
+        p->x += p->vx * dt;
+        p->y += p->vy * dt;
+        if (typ != TYPE_BUBBLE) {
+            p->vz += ((rnd() - 0.5) * 0.5 - p->vz * 1.5) * dt;
+            p->z += p->vz * dt * 0.15;
+            if (p->z < 0.02) { p->z = 0.02; p->vz =  fabs(p->vz); }
+            if (p->z > 0.98) { p->z = 0.98; p->vz = -fabs(p->vz); }
+        }
+        const double speed = sqrt(p->vx * p->vx + p->vy * p->vy);
+        const double cross = p->vx * gy - p->vy * gx;
+        const double sgn = (cross > 0.0) ? 1.0 : (cross < 0.0) ? -1.0 : 1.0;  /* sign(..||1) */
+        p->spin += (wRel * 0.8 - p->spin) * k;
+        p->rot += (p->spin + speed * 0.3 / parts[i].r * sgn) * dt;
+    }
+
+    /* 押し合い。奥行きが離れていれば重なってよい */
+    for (int it = 0; it < 2; it++) {
+        for (int i = 0; i < nsolid; i++) {
+            SimPart *a = &sp[solid[i]];
+            for (int j = i + 1; j < nsolid; j++) {
+                SimPart *b = &sp[solid[j]];
+                if (fabs(a->z - b->z) > 0.45) continue;
+                const double dx = b->x - a->x, dy = b->y - a->y;
+                const double minD = a->cr + b->cr;
+                const double d2 = dx * dx + dy * dy;
+                if (d2 >= minD * minD || d2 == 0.0) continue;
+                const double d = sqrt(d2);
+                const double ov = (minD - d) / d;
+                const double ma = a->cr * a->cr, mb = b->cr * b->cr, m = ma + mb;
+                a->x -= dx * ov * mb / m;  a->y -= dy * ov * mb / m;
+                b->x += dx * ov * ma / m;  b->y += dy * ov * ma / m;
+            }
+        }
+    }
+    /* 筒の内壁 */
+    for (int i = 0; i < NPARTS; i++) {
+        SimPart *p = &sp[i];
+        const double d = sqrt(p->x * p->x + p->y * p->y);
+        const double half_r = parts[i].r * 0.5;
+        const double lim = 0.985 - (p->cr > half_r ? p->cr : half_r);
+        if (d > lim) { p->x *= lim / d;  p->y *= lim / d; }
+    }
+    sim_time += dt;
+}
+
+/* 表を書く。物理演算の位置・奥行き・回転で 24 語を作る。
+ * 並びは種類ごとにまとめたまま (枠に詰めるため)、種類の中は z 順 (奥から) に
+ * 並べ直す。z が動くので毎回並べ直す (ほぼ整列済みなので挿入ソートで速い)。
  * ★ rot は 0〜2π に収めること。ラメのプログラムは rot*4 + seed*60 の
  *   折り返しが S6.17 (±64) にぎりぎり収まる前提 (CLAUDE.md「ハマったところ」) */
-static void WriteTable(double t)
+static void WriteTable(void)
 {
-    const double TWO_PI = 6.283185307179586;
+    /* parts[] は種類ごとに連続している。種類の切れ目ごとに z で挿入ソート */
+    int g0 = 0;
+    for (int i = 1; i <= NPARTS; i++) {
+        if (i < NPARTS && parts[order[i]].typ == parts[order[g0]].typ) continue;
+        for (int a = g0 + 1; a < i; a++) {
+            u16 v = order[a];
+            int b = a - 1;
+            while (b >= g0 && sp[order[b]].z > sp[v].z) { order[b + 1] = order[b]; b--; }
+            order[b + 1] = v;
+        }
+        g0 = i;
+    }
+
     u32 w[PIECE_WORDS];
     Xil_Out32(KAL_CELL_CTRL, CELL_SEL_TABLE);      /* 表の番地を 0 に戻す */
     for (int i = 0; i < NPARTS; i++) {
-        const Part *p = &parts[i];
-        double rot = p->rot + 0.6 * (p->seed * 2.0 - 1.0) * t;
-        rot = fmod(rot, TWO_PI);
-        if (rot < 0.0) rot += TWO_PI;
-        PieceWords(p, rot, w);
+        const int n = order[i];
+        const SimPart *s = &sp[n];
+        Part p = parts[n];                         /* 種類・色・大きさ・種はそのまま */
+        p.x = s->x;  p.y = s->y;  p.z = s->z;
+        double rot = fmod(s->rot, TWO_PI_D);
+        if (rot < 0.0) rot += TWO_PI_D;
+        PieceWords(&p, rot, w);
         for (int k = 0; k < PIECE_WORDS; k++)
             Xil_Out32(KAL_CELL_DATA, w[k]);
     }
