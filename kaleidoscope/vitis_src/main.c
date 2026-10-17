@@ -100,8 +100,12 @@ static void WriteTable(void);
 
 int main(void)
 {
-    Xil_DCacheDisable();
-    Xil_ICacheDisable();
+    /* キャッシュは有効のまま (BSP の起動処理が有効にする)。
+     * 段6 まではDPDMA の手本どおり両方切っていたが、物理演算が 1 フレーム 24ms かかった。
+     * 切る必要は無い:
+     *   - 映像は PL からの Live Video で、DDR の画像バッファを使わない
+     *   - PL のレジスタ 0x80000000〜0xBFFFFFFF は MMU の表 (translation_table.S) で
+     *     Strongly Ordered なので、D キャッシュを入れても AXI は素通し */
 
     xil_printf("KV260 Kaleidoscope Start\r\n");
 
@@ -571,8 +575,15 @@ static void WriteTable(void)
         double rot = fmod(s->rot, TWO_PI_D);
         if (rot < 0.0) rot += TWO_PI_D;
         PieceWords(&p, rot, w);
-        for (int k = 0; k < PIECE_WORDS; k++)
+        for (int k = 0; k < PIECE_WORDS; k++) {
             Xil_Out32(KAL_CELL_DATA, w[k]);
+            /* ★ 1 語ごとに PL のレジスタを 1 回読んで間隔を空ける。
+             * kaleido_axi_slave は「PS の書き込みは映像クロック (74.25MHz) より
+             * ずっと遅い」前提でトグル 1 本だけを同期して渡す。キャッシュを
+             * 有効にしたら 1 語 80ns 弱 (映像クロック 5〜6 拍) まで詰まり、
+             * 描き直しが 5 秒ほどで止まった (busy が 1 のまま) */
+            (void)Xil_In32(KAL_FRAME_CNT);
+        }
     }
 }
 
