@@ -104,6 +104,13 @@ Could not find ARM device / AP transaction timeout
 `Failed to detect FSBL exit` は**警告**。まずシリアルを見ること。
 出力が出ていればアプリは動いている。
 
+### ★★ 実機の起動は `tools/xsdb_run.tcl`（2026-10-18）。USB を使うときは要注意
+Vitis の Debug は電源投入直後に FSBL で止まる。原因は psu_init の **USB コントローラ初期化**
+（0xFE20C200）で、USB PHY のクロックが無いとバスが固まる。USB の 4 行を外した psu_init.tcl
+（`tools/make_psu_nousb.py`）で初期化すれば止まらず、Claude が xsdb だけで起動できる。
+**USB（マウス・キーボード）を使うようにしたら、この方式は使えない。** README の
+「4. 実機の起動 (xsdb)」の「USB を使うとき」を先に読むこと。
+
 ### Board Initialization の実績（launch.json を実際に調べた結果・2026-09-18）
 Vitis Unified IDE 2025.2 の選択肢は **FSBL と TCL の2つだけ**。「None」は無い。
 

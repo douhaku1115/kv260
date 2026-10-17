@@ -241,6 +241,41 @@ SD を抜いてもフルブートする**。それを前提にした手順が下
 ワークスペースを再利用すると `_ide/bitstream/` が自動更新されない。
 `.bit` を手で置き換えるか、ワークスペースを作り直すこと。
 
+### 4. 実機の起動 (xsdb。Vitis の画面を使わない。2026-10-18)
+
+Vitis の Debug は **電源投入直後に FSBL で止まることが多い**
+(`Failed to detect FSBL exit status using symbol: XFsbl_Exit`)。
+FSBL を使わず、**USB の初期化を外した psu_init.tcl** で PS を初期化すると止まらない
+(電源投入直後 1 回 + 続けて 2 回、すべて成功)。
+
+```
+# 1. USB を外した psu_init を作る (XSA を変えたら作り直す)
+python tools/make_psu_nousb.py <WS>/kaleido_plat/export/kaleido_plat/hw/psu_init.tcl <出力>/psu_nousb.tcl
+# 2. アプリをビルド (アプリの build/ で。PATH に cmake と aarch64 gcc を足す)
+E:/vivado/2025.2/Vitis/bin/ninja.exe
+# 3. 起動 (Tera Term は閉じておく)
+python tools/serlog.py COM14 <秒> <ログ>          # 裏で回してシリアルを記録
+E:/vivado/2025.2/Vitis/bin/xsdb.bat tools/xsdb_run.tcl <WS> <出力>/psu_nousb.tcl
+python tools/sendkey.py <キー> <回数> <間隔秒>      # キー操作もシリアルから送れる
+```
+
+`xsdb_run.tcl` の流れ: 起動モードを JTAG にしてリセット (Vitis の `set_bootmode` と同じ)
+→ PL を書く → `psu_init` (USB 抜き) → PS-PL 分離解除・PL リセット解除 → アプリ。
+
+**止まっていた原因**: この個体は QSPI から起動し、電源投入時に QSPI の U-Boot が
+USB の初期化に失敗する (`No working controllers found`)。そのあと USB PHY から
+クロックが出ないことがあり、psu_init が USB コントローラのレジスタ
+(`0xFE20C200` GUSB2PHYCFG ほか 4 つ) に書いたところでバスが固まる。
+止まった FSBL の PC を `aarch64-none-elf-addr2line -f -e fsbl.elf` で引いて分かった。
+
+#### ★★ USB (マウス・キーボード) を使うとき
+**この方式は使えない。** USB の初期化を外しているので、USB は動かない。
+USB を使うなら、先に「電源投入直後に USB PHY のクロックが無い」問題を解くこと。
+- PHY のリセットは psu_init が起動モード端子で行っている (`BOOT_PIN_CTRL` 0xFF5E0250、
+  Low を 5μs → High)。リセットの長さか、その後の待ちが足りない疑い (未確認)
+- Vivado で USB を無効にする手は失敗した。USB を切る、またはリセット方式を Disable に
+  すると、Vivado が USB リセット端子 = MIO 4 を自動で設定し、QSPI (x4) と衝突してエラーになる
+
 ---
 
 ## 操作
