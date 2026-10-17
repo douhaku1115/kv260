@@ -103,12 +103,17 @@ module kaleido_axi_slave #(
     input  wire [10:0]                     text_addr,   // 文字番号 0〜TEXT_COLS*TEXT_ROWS-1
     output reg  [7:0]                      text_ch,
 
-    // セル画像への流し込み (映像クロック領域)。URAM は初期値を持てないので
-    // 起動時に PS がここから入れる
-    output reg                             v_cf_we,
-    output reg  [1:0]                      v_cf_sel,    // 2=ピースの表
-    output reg  [15:0]                     v_cf_addr,
-    output reg  [31:0]                     v_cf_data,
+    // ピースの表への書き込み (段6b。**AXI クロック領域のまま**出す)。
+    //   表の RAM (pdriver) は書き込み口を AXI クロック、読み出し口を映像クロックで
+    //   動かすので、映像クロックへ乗り換えなくてよい。段5d-7 まではトグル 1 本を
+    //   2 段同期して渡していたが、PS の書き込みが 1 語 80ns まで詰まると取りこぼした
+    output reg                             a_tw_we,
+    output reg  [15:0]                     a_tw_addr,
+    output reg  [23:0]                     a_tw_data,
+    //  表に入っている語数 (最後に書いた番地 + 1)。映像側の pdriver が読むが、
+    //  PS は書き終えてから DRAW_REQ を書き、pdriver はそのあと油の地を写す
+    //  65541 クロックを経てから読むので、乗り換えなしで落ち着いている
+    output reg  [15:0]                     a_tw_words,
     //  ★ 描画開始 (段5d-6)。段5d-7 からは描き直しの開始
     output reg                             v_draw_req,
     //  描き直しの途中か (段5d-7。映像クロック領域から。0x1A0 で読める)
@@ -204,15 +209,22 @@ module kaleido_axi_slave #(
     integer t;
     initial for (t = 0; t < TEXT_CHARS; t = t + 1) text_ram[t] = 8'h20;   // 空白
 
-    // ---- セル画像への流し込み (AXI クロック領域) ----
-    //   番地は自分で進める。PS は CELL_CTRL でどちらのセルかを決めて
-    //   番地を 0 に戻し、あとは CELL_DATA に 65536 回書くだけでよい。
+    // ---- ピースの表への書き込み (AXI クロック領域) ----
+    //   番地は自分で進める。PS は CELL_CTRL=2 で番地を 0 に戻し、
+    //   あとは CELL_DATA に 個数 x 24 回書くだけでよい。
     reg [1:0]  cw_sel;
-    reg [15:0] cw_addr, cw_aq;
-    reg [31:0] cw_data;
-    reg        cw_tgl;
+    reg [15:0] cw_addr;
     reg        dr_tgl;                 // 描画開始 (段5d-6)
-    initial begin cw_sel = 2'd0; cw_addr = 16'd0; cw_tgl = 1'b0; dr_tgl = 1'b0; end
+    initial begin cw_sel = 2'd0; cw_addr = 16'd0; dr_tgl = 1'b0; end
+    initial begin a_tw_we = 1'b0; a_tw_addr = 16'd0; a_tw_data = 24'd0; a_tw_words = 16'd0; end
+
+    wire tw_hit = wr_en && (wr_unit == 7'd25) && (cw_sel == 2'd2);
+    always @(posedge S_AXI_ACLK) begin
+        a_tw_we   <= tw_hit;
+        a_tw_addr <= cw_addr;              // この語を入れる番地
+        a_tw_data <= S_AXI_WDATA[23:0];
+        if (tw_hit) a_tw_words <= cw_addr + 16'd1;
+    end
 
     always @(posedge S_AXI_ACLK) begin
         if (wr_en) begin
@@ -222,12 +234,8 @@ module kaleido_axi_slave #(
                 cw_sel  <= S_AXI_WDATA[1:0];
                 cw_addr <= 16'd0;
             end
-            else if (wr_unit == 7'd25) begin   // 0x190 CELL_DATA
-                cw_data <= S_AXI_WDATA;
-                cw_aq   <= cw_addr;            // この語を入れる番地
+            else if (wr_unit == 7'd25)         // 0x190 CELL_DATA (書くのは上の always)
                 cw_addr <= cw_addr + 16'd1;
-                cw_tgl  <= ~cw_tgl;            // 映像側へ「1 語来た」と伝える
-            end
             else if (wr_unit == 7'd26)         // 0x1A0 DRAW_REQ
                 dr_tgl <= ~dr_tgl;
             else if (wr_unit < NREG-1)
@@ -241,19 +249,10 @@ module kaleido_axi_slave #(
         end
     end
 
-    // ---- セルへの流し込みを映像クロック側へ渡す ----
-    //   トグルだけを 2 段同期し、変化を見たらその拍で 1 語書く。
-    //   PS の書き込みは映像クロックよりずっと遅いので、データと番地は
-    //   トグルが届く頃には落ち着いている。
-    reg c0, c1, c2;
+    // ---- 描画開始を映像クロック側へ渡す ----
+    //   トグルを 2 段同期し、変化を見たらその拍で 1 クロックのパルスにする。
     reg d0, d1, d2;
     always @(posedge clkv) begin
-        c0 <= cw_tgl;  c1 <= c0;  c2 <= c1;
-        v_cf_we   <= (c1 != c2);
-        v_cf_sel  <= cw_sel;
-        v_cf_addr <= cw_aq;
-        v_cf_data <= cw_data;
-        // 描画開始も同じトグル 2 段同期で渡す
         d0 <= dr_tgl;  d1 <= d0;  d2 <= d1;
         v_draw_req <= (d1 != d2);
     end

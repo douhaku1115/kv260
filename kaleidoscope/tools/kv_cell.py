@@ -35,7 +35,7 @@ ROOT = os.path.join(HERE, "..")
 BEAD, GLASS, GLITTER, HEXPRISM, BUBBLE, STONE, ROD, BLOB, CRESCENT = range(9)
 
 KEY_TO_TYPE = {
-    "bead": BEAD, "glass": GLASS, "glitter": GLITTER, "hexprism": HEXPRISM,
+    "bead": BEAD, "bead_s": BEAD, "glass": GLASS, "glitter": GLITTER, "hexprism": HEXPRISM,
     "bubble": BUBBLE, "stone": STONE, "rod": ROD, "blob": BLOB, "crescent": CRESCENT,
 }
 
@@ -46,6 +46,7 @@ COLORS = {
     "blob":     ["#58c43c", "#8ee05a"],
     "crescent": ["#f5f2ea", "#e6eef5"],
     "bead":     ["#3a6bff", "#f2c230", "#ffffff"],
+    "bead_s":   ["#3a6bff", "#f2c230", "#ffffff"],   # 小さいビーズ (ビーズと同じ色)
     "stone":    ["#5f9e7a", "#8a6ad0", "#d9cfc0"],
     "hexprism": ["#e8b64a", "#c9cfd8"],
     "glitter":  ["#b58ae8", "#d9dde6", "#8f6fd8", "#ffffff", "#e6c8ff"],

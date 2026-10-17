@@ -46,7 +46,7 @@ module pdriver
   #(
     parameter W      = 24,
     parameter WORDS  = 24,          // 1 個あたりの語数
-    parameter MAXP   = 645,         // 表に入る最大の個数 (参照実装の上限)
+    parameter MAXP   = 2048,        // 表に入る最大の個数 (段6b で 645 → 2048。番地 16bit に入る上限は 2730)
     parameter CB     = 9,
     parameter CELLB  = 8
     )
@@ -57,6 +57,7 @@ module pdriver
    input  wire                  draw_req,   // 1 クロック。来るたびに表の頭から描き直す
 
    // ---- 表の書き込み (段5d-7。PS が AXI で書く) ----
+   input  wire                  wclk,       // 表の書き込み口のクロック (AXI。段6b)
    input  wire                  t_we,
    input  wire [15:0]           t_addr,     // 語の番地 (個数 x 24 + 語)
    input  wire [W-1:0]          t_data,
@@ -85,7 +86,8 @@ module pdriver
   reg [W-1:0] tab [0:MAXP*WORDS-1];
   initial $readmemh("pparts.hex", tab);
 
-  always @(posedge clk) if (t_we) tab[t_addr] <= t_data;
+  //  書き込み口は AXI クロック、読み出し口は映像クロック (BRAM は口ごとにクロックを持てる)
+  always @(posedge wclk) if (t_we) tab[t_addr] <= t_data;
 
   // 読み出しは 1 本だけ。これなら BRAM に載る
   //  ★ 番地は**組み合わせ**で作ること。レジスタにすると番地が 1 拍遅れ、

@@ -96,6 +96,8 @@ static void PieceWords(const Part *p, double rot, u32 *w);
 static void SelfCheckTable(void);
 static void SimInit(void);
 static void StepSim(double dt);
+static void SimStir(void);
+static void SimTurn(double dir);
 static void WriteTable(void);
 
 int main(void)
@@ -258,10 +260,11 @@ static int uart_getchar_nb(void)
    フレーム同期を圧迫して取りこぼしの原因になる。 */
 static void ShowSettings(void)
 {
-    xil_printf("ポイント %2d  ミラー %d  大きさ %3d  回転 %3d%s\r\n",
+    xil_printf("ポイント %2d  ミラー %d  大きさ %3d  回転 %3d  粘り %3d%s\r\n",
                set_points, set_mirror2 ? 2 : 3,
                (int)(set_zoom * 100.0f + 0.5f),
                (int)(set_autorotate * 100.0f + 0.5f),
+               (int)(set_viscosity * 100.0f + 0.5f),
                (set_points > 10) ? "  ※11以上は反射19回。K=16では外側が崩れる" : "");
 }
 
@@ -272,6 +275,9 @@ static void ShowHelp(void)
     xil_printf("  m    ミラー 3枚/2枚\r\n");
     xil_printf("  a s  大きさ %d〜%d\r\n", (int)(ZOOM_MIN*100), (int)(ZOOM_MAX*100));
     xil_printf("  z x  回転の速さ 0〜100\r\n");
+    xil_printf("  v b  油の粘り 0〜100 (小さいほどサラサラ)\r\n");
+    xil_printf("  e    かき混ぜる\r\n");
+    xil_printf("  j l  筒を手で左/右に回す (押している間)\r\n");
     xil_printf("  i    画面の一覧を出す/消す\r\n");
     xil_printf("  0    初期設定    h  この一覧\r\n");
     ShowSettings();
@@ -308,11 +314,21 @@ static void HandleKey(int c)
     case 'x': case '.': case '>':
         if (set_autorotate < 0.999f) set_autorotate += 0.05f; break;
 
+    /* 油の粘り (段6) */
+    case 'v': if (set_viscosity > 0.001f) set_viscosity -= 0.1f; break;
+    case 'b': if (set_viscosity < 0.999f) set_viscosity += 0.1f; break;
+
+    /* かき混ぜる・筒を手で回す (段6)。表示は変わらないので一覧は出し直さない */
+    case 'e': SimStir();      xil_printf("かき混ぜた\r\n"); return;
+    case 'j': SimTurn(+1.0);  return;
+    case 'l': SimTurn(-1.0);  return;
+
     /* 操作一覧をモニターに出す/消す */
     case 'i': set_text_on = !set_text_on; break;
 
     case '0':
         set_points = 8; set_mirror2 = 0; set_zoom = 1.0f; set_autorotate = 0.35f;
+        set_viscosity = 0.5f;
         geom = 1;
         break;
     case 'h': case '?': ShowHelp(); return;
@@ -323,6 +339,8 @@ static void HandleKey(int c)
     if (set_zoom > ZOOM_MAX) set_zoom = ZOOM_MAX;
     if (set_autorotate < 0.0f) set_autorotate = 0.0f;
     if (set_autorotate > 1.0f) set_autorotate = 1.0f;
+    if (set_viscosity < 0.0f) set_viscosity = 0.0f;
+    if (set_viscosity > 1.0f) set_viscosity = 1.0f;
 
     if (geom) KalSetGeometry();   /* 鏡の法線・頂点・画角を書き直して COMMIT */
     UpdateText();                 /* 画面の一覧にも新しい値を出す。CTRL を最後に書く */
@@ -441,10 +459,32 @@ typedef struct {
 static SimPart sp[NPARTS];          /* parts[] と同じ並び */
 static u16     solid[NPARTS];       /* 押し合いに加わるもの (cr > 0) の番号 */
 static int     nsolid;
+/* 押し合いのマス目。筒の中 (-1〜1) を GRID_N x GRID_N に分ける。
+ * 一辺 grid_size は SimInit で「cr の最大の 2 倍」以上に決める */
+#define GRID_N 16
+static double  grid_size;
+static s16     grid_head[GRID_N * GRID_N];  /* マスごとの最初の番号 (solid[] の添字) */
+static s16     grid_next[NPARTS];           /* 同じマスの次の番号 */
+
+static int GridCell(const SimPart *p)
+{
+    int gx = (int)((p->x + 1.0) / grid_size);
+    int gy = (int)((p->y + 1.0) / grid_size);
+    if (gx < 0) gx = 0;
+    if (gx >= GRID_N) gx = GRID_N - 1;
+    if (gy < 0) gy = 0;
+    if (gy >= GRID_N) gy = GRID_N - 1;
+    return gy * GRID_N + gx;
+}
 static u16     order[NPARTS];       /* 表に書く順。種類ごとに z 順 (奥から) */
 static double  sim_time = 0.0;
 static double  sim_tube_vel = 0.9;  /* 参照実装の初期値 */
 static double  sim_fluid_vel = 0.0;
+/* 筒を手で回す (参照実装の keyTurn。矢印キーを押している間 ±1.2)。
+ * シリアルには「離した」が来ないので、キーが届くたびに一定時間だけ効かせる。
+ * キーリピートの最初の間 (0.5 秒ほど) で途切れないよう 0.6 秒にした */
+static double  sim_key_turn = 0.0;
+static double  sim_key_turn_left = 0.0;   /* あと何秒効かせるか */
 
 /* 乱数 (xorshift32)。参照実装の Math.random() の代わり。0 以上 1 未満 */
 static u32 rng_state = 0x2545F491u;
@@ -468,15 +508,25 @@ static void SimInit(void)
         s->sink = type_sink[p->typ] * (0.75 + 0.5 * rnd());   /* rand(0.75, 1.25) */
         s->cr = p->r * type_cr[p->typ];
         if (s->cr > 0.0) solid[nsolid++] = (u16)i;
+        if (2.0 * s->cr > grid_size) grid_size = 2.0 * s->cr;
         order[i] = (u16)i;
     }
+    /* マス目が筒の中 (幅 2) を覆いきれるように */
+    if (grid_size < 2.0 / GRID_N) grid_size = 2.0 / GRID_N;
+    xil_printf("押し合いのマス: 一辺 %d/1000、当たり判定のあるピース %d 個\r\n",
+               (int)(grid_size * 1000.0), nsolid);
 }
 
 static void StepSim(double dt)
 {
-    /* 筒: 自動回転の速さへ近づける。参照実装の keyTurn (矢印キーで回す) はまだ無い */
-    const double target = set_autorotate * 0.6;
-    sim_tube_vel += (target - sim_tube_vel) * (1.0 - exp(-dt * 1.2));
+    /* 筒: 自動回転の速さ (+ 手で回している分) へ近づける */
+    if (sim_key_turn_left > 0.0) {
+        sim_key_turn_left -= dt;
+        if (sim_key_turn_left <= 0.0) sim_key_turn = 0.0;
+    }
+    const double target = set_autorotate * 0.6 + sim_key_turn;
+    sim_tube_vel += (target - sim_tube_vel)
+                    * (1.0 - exp(-dt * (sim_key_turn != 0.0 ? 4.0 : 1.2)));
     sim_tube_angle += sim_tube_vel * dt;
     if (sim_tube_angle >= TWO_PI_D) sim_tube_angle -= TWO_PI_D;
     if (sim_tube_angle < 0.0)       sim_tube_angle += TWO_PI_D;
@@ -515,22 +565,41 @@ static void StepSim(double dt)
         p->rot += (p->spin + speed * 0.3 / parts[i].r * sgn) * dt;
     }
 
-    /* 押し合い。奥行きが離れていれば重なってよい */
+    /* 押し合い。奥行きが離れていれば重なってよい。
+     * 全部の組 (598 個のとき当たり判定のある 318 個で約 5 万組) を調べると 1 フレーム
+     * 15.5ms かかったので、筒の中をマス目に分け、同じマスと隣のマスだけを調べる。
+     * マスの一辺は「当たる最大の距離」(cr の最大の 2 倍) 以上なので取りこぼさない。
+     * 参照実装とは組を処理する順序だけが違う */
     for (int it = 0; it < 2; it++) {
+        for (int c = 0; c < GRID_N * GRID_N; c++) grid_head[c] = -1;
+        for (int i = 0; i < nsolid; i++) {
+            const int c = GridCell(&sp[solid[i]]);
+            grid_next[i] = grid_head[c];
+            grid_head[c] = (s16)i;
+        }
         for (int i = 0; i < nsolid; i++) {
             SimPart *a = &sp[solid[i]];
-            for (int j = i + 1; j < nsolid; j++) {
-                SimPart *b = &sp[solid[j]];
-                if (fabs(a->z - b->z) > 0.45) continue;
-                const double dx = b->x - a->x, dy = b->y - a->y;
-                const double minD = a->cr + b->cr;
-                const double d2 = dx * dx + dy * dy;
-                if (d2 >= minD * minD || d2 == 0.0) continue;
-                const double d = sqrt(d2);
-                const double ov = (minD - d) / d;
-                const double ma = a->cr * a->cr, mb = b->cr * b->cr, m = ma + mb;
-                a->x -= dx * ov * mb / m;  a->y -= dy * ov * mb / m;
-                b->x += dx * ov * ma / m;  b->y += dy * ov * ma / m;
+            const int c = GridCell(a);
+            const int cx = c % GRID_N, cy = c / GRID_N;
+            for (int ny = cy - 1; ny <= cy + 1; ny++) {
+                if (ny < 0 || ny >= GRID_N) continue;
+                for (int nx = cx - 1; nx <= cx + 1; nx++) {
+                    if (nx < 0 || nx >= GRID_N) continue;
+                    for (int j = grid_head[ny * GRID_N + nx]; j >= 0; j = grid_next[j]) {
+                        if (j <= i) continue;              /* 同じ組を 2 回やらない */
+                        SimPart *b = &sp[solid[j]];
+                        if (fabs(a->z - b->z) > 0.45) continue;
+                        const double dx = b->x - a->x, dy = b->y - a->y;
+                        const double minD = a->cr + b->cr;
+                        const double d2 = dx * dx + dy * dy;
+                        if (d2 >= minD * minD || d2 == 0.0) continue;
+                        const double d = sqrt(d2);
+                        const double ov = (minD - d) / d;
+                        const double ma = a->cr * a->cr, mb = b->cr * b->cr, m = ma + mb;
+                        a->x -= dx * ov * mb / m;  a->y -= dy * ov * mb / m;
+                        b->x += dx * ov * ma / m;  b->y += dy * ov * ma / m;
+                    }
+                }
             }
         }
     }
@@ -543,6 +612,24 @@ static void StepSim(double dt)
         if (d > lim) { p->x *= lim / d;  p->y *= lim / d; }
     }
     sim_time += dt;
+}
+
+/* かき混ぜる (参照実装の「振る」ボタン)。油を左右どちらかへ一気に回し、
+ * ピースの速さもばらつかせる */
+static void SimStir(void)
+{
+    sim_fluid_vel += (rnd() < 0.5 ? -1.0 : 1.0) * 7.0;
+    for (int i = 0; i < NPARTS; i++) {
+        sp[i].vx += rnd() * 1.2 - 0.6;     /* rand(-0.6, 0.6) */
+        sp[i].vy += rnd() * 1.2 - 0.6;
+    }
+}
+
+/* 筒を手で回す。dir = +1 で j (左)、-1 で l (右) */
+static void SimTurn(double dir)
+{
+    sim_key_turn = 1.2 * dir;
+    sim_key_turn_left = 0.6;
 }
 
 /* 表を書く。物理演算の位置・奥行き・回転で 24 語を作る。
@@ -575,15 +662,11 @@ static void WriteTable(void)
         double rot = fmod(s->rot, TWO_PI_D);
         if (rot < 0.0) rot += TWO_PI_D;
         PieceWords(&p, rot, w);
-        for (int k = 0; k < PIECE_WORDS; k++) {
+        /* 段6 では 1 語ごとに PL のレジスタを 1 回読んで間隔を空けていた (映像クロックへの
+         * 乗り換えが速い書き込みを取りこぼし、描き直しが止まったため)。段6b で表の RAM の
+         * 書き込み口を AXI クロックにして乗り換えを無くしたので、続けて書いてよい */
+        for (int k = 0; k < PIECE_WORDS; k++)
             Xil_Out32(KAL_CELL_DATA, w[k]);
-            /* ★ 1 語ごとに PL のレジスタを 1 回読んで間隔を空ける。
-             * kaleido_axi_slave は「PS の書き込みは映像クロック (74.25MHz) より
-             * ずっと遅い」前提でトグル 1 本だけを同期して渡す。キャッシュを
-             * 有効にしたら 1 語 80ns 弱 (映像クロック 5〜6 拍) まで詰まり、
-             * 描き直しが 5 秒ほどで止まった (busy が 1 のまま) */
-            (void)Xil_In32(KAL_FRAME_CNT);
-        }
     }
 }
 
@@ -615,12 +698,14 @@ static void UpdateText(void)
         for (c = 0; c < TXT_COLS; c++) txt[r][c] = ' ';
 
     TxtPut(0, 6, "OIL KALEIDOSCOPE");
-    TxtPut(2, 2, "Q W   POINTS");  TxtNum(2, 24, set_points);
-    TxtPut(3, 2, "M     MIRROR");  TxtNum(3, 24, set_mirror2 ? 2 : 3);
-    TxtPut(4, 2, "A S   ZOOM");    TxtNum(4, 24, (int)(set_zoom * 100.0f + 0.5f));
-    TxtPut(5, 2, "Z X   SPIN");    TxtNum(5, 24, (int)(set_autorotate * 100.0f + 0.5f));
-    TxtPut(6, 2, "0     RESET");
-    TxtPut(7, 2, "I     HIDE THIS LIST");
+    /* 8 行しか無いので、段6 で増えたキーは 6・7 行目に 2 つずつ詰める */
+    TxtPut(1, 2, "Q W   POINTS");  TxtNum(1, 24, set_points);
+    TxtPut(2, 2, "M     MIRROR");  TxtNum(2, 24, set_mirror2 ? 2 : 3);
+    TxtPut(3, 2, "A S   ZOOM");    TxtNum(3, 24, (int)(set_zoom * 100.0f + 0.5f));
+    TxtPut(4, 2, "Z X   SPIN");    TxtNum(4, 24, (int)(set_autorotate * 100.0f + 0.5f));
+    TxtPut(5, 2, "V B   THICK");   TxtNum(5, 24, (int)(set_viscosity * 100.0f + 0.5f));
+    TxtPut(6, 2, "E STIR    J L TURN");
+    TxtPut(7, 2, "0 RESET   I HIDE");
 
     /* 4 文字ずつ 1 ワードにまとめて書く。下位バイトが左端の文字。
        txt は 2 次元配列なので行が隙間なく並んでいる。 */

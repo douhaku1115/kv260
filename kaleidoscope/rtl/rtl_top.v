@@ -49,10 +49,11 @@ module rtl_top
    // ピースの表の書き込みと描き直し (段5d-7)
    input wire               p_draw_req,     // 描き直しの開始 (1 クロック)
    output wire              draw_busy,      // 描き直しの途中 (AXI スレーブへ)
-   input wire               p_cf_we,
-   input wire [1:0]         p_cf_sel,       // 2 = ピースの表 (0/1 は段5d-6 までのセル)
-   input wire [15:0]        p_cf_addr,
-   input wire [31:0]        p_cf_data,
+   // ピースの表への書き込み (段6b。**clk (AXI) のクロック領域**のまま来る)
+   input wire               p_tw_we,
+   input wire [15:0]        p_tw_addr,
+   input wire [23:0]        p_tw_data,
+   input wire [15:0]        p_tw_words,     // 表に入っている語数 (落ち着いてから読む)
 
    // 画面に出す文字 (kaleido_axi_slave の中の RAM を引く)
    output wire [10:0]       text_addr,
@@ -163,9 +164,6 @@ module rtl_top
   // ============ ピースの表 (段5d-7) ============
   //   PS が CELL_CTRL=2 にしてから CELL_DATA に書く。書いた最後の番地 + 1 を
   //   語数として pdriver に渡す (起動時は焼き込みの 271 個)。
-  wire pt_we = p_cf_we && (p_cf_sel == 2'd2);
-  reg [15:0] pt_words = 16'd271 * 16'd24;
-  always @(posedge clkv) if (pt_we) pt_words <= p_cf_addr + 16'd1;
 
   // ============ ピースを描く ============
   //   表を頭から順に描いて止まる。cell_dbuf が描き直しのたびに起こす。
@@ -179,7 +177,7 @@ module rtl_top
 
   pdriver pdrv_i
     (.clk(clkv), .resetn(~resetv), .p_take(ps_take), .draw_req(drv_start),
-     .t_we(pt_we), .t_addr(p_cf_addr), .t_data(p_cf_data[23:0]), .n_words(pt_words),
+     .wclk(clk), .t_we(p_tw_we), .t_addr(p_tw_addr), .t_data(p_tw_data), .n_words(p_tw_words),
      .p_valid(ps_valid),
      .p_type(ps_type), .p_bw(ps_bw), .p_npix(ps_npix),
      .p_x0(ps_x0), .p_y0(ps_y0),

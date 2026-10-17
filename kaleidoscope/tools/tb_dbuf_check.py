@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """二重バッファで 2 回描き直す (sim/tb_dbuf.v) を走らせて採点する。段5d-7。
 
-  表 1 = 実機と同じ 271 個 (乱数 3)    表 2 = 別の並び (乱数 7)
-  表は焼き込みではなく、pdriver の書き込み口から入れる。
+  表 1 = 実機と同じ並び (乱数 3)
+  表 2 = 3 つの乱数 (7, 11, 13) の表をつないだ約 1800 個。段6b で上限を 645 → 2048 に
+         広げたので、645 個を超えた先まで書けて描けるかを見る
+  表は焼き込みではなく、pdriver の書き込み口 (段6b から別クロック) から入れる。
 
 それぞれの描き直しのあと、映す面 (奥層・手前層) を正解と比べる。
 下地は PL の ROM (rtl/cell_oil.hex) なので、正解の下地もそこから作る。
@@ -99,7 +101,8 @@ def score(name, got, want):
 
 
 def main():
-    t1, t2 = make_table(3), make_table(7)
+    t1 = make_table(3)
+    t2 = GP.order_by_type_then_z(make_table(7) + make_table(11) + make_table(13))
     print("表 1: %d 個   表 2: %d 個" % (len(t1), len(t2)))
     os.makedirs(WORK, exist_ok=True)
     write_table(os.path.join(WORK, "tbl1.hex"), t1)

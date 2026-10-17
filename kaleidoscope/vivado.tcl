@@ -164,8 +164,9 @@ connect_bd_net [get_bd_pins ${axi_slave_instance}/text_ch] [get_bd_pins ${rtl_to
 foreach sig {draw_req} {
   connect_bd_net [get_bd_pins ${axi_slave_instance}/v_$sig] [get_bd_pins ${rtl_top_instance}/p_$sig]
 }
-foreach sig {cf_we cf_sel cf_addr cf_data} {
-  connect_bd_net [get_bd_pins ${axi_slave_instance}/v_$sig] [get_bd_pins ${rtl_top_instance}/p_$sig]
+# ピースの表への書き込み (段6b)。AXI クロックのまま渡し、表の RAM の書き込み口を AXI クロックで動かす
+foreach sig {tw_we tw_addr tw_data tw_words} {
+  connect_bd_net [get_bd_pins ${axi_slave_instance}/a_$sig] [get_bd_pins ${rtl_top_instance}/p_$sig]
 }
 # 描き直しの途中か (段5d-7)。rtl_top → AXI スレーブ (0x1A0 で読める)
 connect_bd_net [get_bd_pins ${rtl_top_instance}/draw_busy] [get_bd_pins ${axi_slave_instance}/v_draw_busy]

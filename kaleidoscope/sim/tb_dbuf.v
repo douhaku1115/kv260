@@ -29,6 +29,10 @@ module tb_dbuf;
 
   reg clk = 1'b0;
   always #5 clk = ~clk;
+  // 表の書き込み口のクロック (実機の AXI クロック)。段6b から映像クロックとは別。
+  // わざと周期をずらして、2 つのクロックで動く RAM を確かめる
+  reg wclk = 1'b0;
+  always #3.7 wclk = ~wclk;
   reg resetn = 1'b0;
   reg draw_req = 1'b0;
 
@@ -59,7 +63,7 @@ module tb_dbuf;
 
   pdriver drv
     (.clk(clk), .resetn(resetn), .p_take(p_take), .draw_req(drv_start),
-     .t_we(t_we), .t_addr(t_addr), .t_data(t_data), .n_words(n_words),
+     .wclk(wclk), .t_we(t_we), .t_addr(t_addr), .t_data(t_data), .n_words(n_words),
      .p_valid(p_valid), .p_type(p_type), .p_bw(p_bw), .p_npix(p_npix),
      .p_x0(p_x0), .p_y0(p_y0),
      .p_vqx0(p_vqx0), .p_vqy0(p_vqy0), .p_qx0(p_qx0), .p_qy0(p_qy0),
@@ -126,19 +130,19 @@ module tb_dbuf;
   end
 
   // ---- 表を書き込み口から入れる ----
-  reg [W-1:0] tbl [0:16383];
+  reg [W-1:0] tbl [0:65535];
   integer nw;
   task load_table(input [8*16-1:0] fname);
     integer k;
     begin
-      for (k = 0; k < 16384; k = k + 1) tbl[k] = {W{1'b0}};
+      for (k = 0; k < 65536; k = k + 1) tbl[k] = {W{1'b0}};
       $readmemh(fname, tbl);
       nw = tbl[0] * 24;                 // 1 行目は個数
       for (k = 0; k < nw; k = k + 1) begin
-        @(negedge clk);
+        @(negedge wclk);
         t_we = 1'b1; t_addr = k; t_data = tbl[k + 1];
       end
-      @(negedge clk);
+      @(negedge wclk);
       t_we = 1'b0;
       n_words = nw;
       $display("DBUF 表を書いた %0s : %0d 個 (%0d 語)", fname, nw / 24, nw);
