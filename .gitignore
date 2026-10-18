@@ -17,3 +17,9 @@ kv260_cnn/vivado_build.jou
 # Vivado が作業中に吐くログ
 dfx_runtime.txt
 retry_open_fs.log
+
+# ---- Zephyr (R5) ----
+# psu_init_nousb.tcl は kaleidoscope/tools/make_psu_nousb.py で作る。elf は build.sh で作る
+kv260_zephyr/psu_init_nousb.tcl
+kv260_zephyr/*.elf
+kv260_zephyr/*.txt
