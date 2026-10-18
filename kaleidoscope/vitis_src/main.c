@@ -74,6 +74,9 @@ static float set_viscosity  = 0.5f;   /* 粘り 0〜1。参照実装の既定値
 
 /* 筒の回転角 [rad]。PL の COS_T/SIN_T (セルの回転) と物理演算の重力の向きの両方に使う */
 static double sim_tube_angle = 0.0;
+/* 物理演算の内訳の時間 (移動・押し合い・壁)。300 フレームぶん足して平均を出す */
+static XTime  t_move_sum, t_push_sum, t_wall_sum;
+static u32    n_pair_sum, n_hit_sum;   /* 調べた組 / 実際に重なっていた組 */
 
 typedef enum { LANE_COUNT_1 = 1, LANE_COUNT_2 = 2 } LaneCount_t;
 typedef enum { LINK_RATE_162 = 0x06, LINK_RATE_270 = 0x0A, LINK_RATE_540 = 0x14 } LinkRate_t;
@@ -188,22 +191,13 @@ int main(void)
         int c;
         while ((c = uart_getchar_nb()) >= 0) HandleKey(c);
 
-        /* 参照実装と同じく 1 フレームを半分ずつ 2 回進める */
-        XTime t0, t1, t2;
-        XTime_GetTime(&t0);
-        StepSim(dt / 2);
-        StepSim(dt / 2);
-        XTime_GetTime(&t1);
-        if (t1 - t0 > t_sim_max) t_sim_max = t1 - t0;
-
-        Xil_Out32(KAL_COS_T, (u32)(s32)(cos(sim_tube_angle) * 32768.0));
-        Xil_Out32(KAL_SIN_T, (u32)(s32)(sin(sim_tube_angle) * 32768.0));
-        Xil_Out32(KAL_COMMIT, 1);      /* ここまでの値を次のフレーム先頭で一括反映 */
-
         /* ========== ピースを描き直す (段5d-7) ==========
          * PL が前の描き直しを終えて面を入れ替えていれば (bit0 = 0)、
          * 新しい表を書いて次の描き直しを頼む。
-         * ★ bit0 が 1 の間に表を書くと、描きかけに新しい表が混ざる。 */
+         * ★ bit0 が 1 の間に表を書くと、描きかけに新しい表が混ざる。
+         * ★ 物理演算より先に頼む (表は前のフレームの位置)。ピース 2038 個だと PL の
+         *   描き直しに 30ms 余りかかり、物理演算 (10ms) の後に頼むと 3 フレームに 1 回に落ちた */
+        XTime t0, t1, t2;
         frames++;
         if ((Xil_In32(KAL_DRAW_REQ) & 1) == 0) {
             XTime_GetTime(&t1);
@@ -213,11 +207,31 @@ int main(void)
             if (t2 - t1 > t_tbl_max) t_tbl_max = t2 - t1;
             redraws++;
         }
+
+        /* 参照実装と同じく 1 フレームを半分ずつ 2 回進める */
+        XTime_GetTime(&t0);
+        StepSim(dt / 2);
+        StepSim(dt / 2);
+        XTime_GetTime(&t1);
+        if (t1 - t0 > t_sim_max) t_sim_max = t1 - t0;
+
+        Xil_Out32(KAL_COS_T, (u32)(s32)(cos(sim_tube_angle) * 32768.0));
+        Xil_Out32(KAL_SIN_T, (u32)(s32)(sin(sim_tube_angle) * 32768.0));
+        Xil_Out32(KAL_COMMIT, 1);      /* ここまでの値を次のフレーム先頭で一括反映 */
         if (frames - rep_frames >= 300) {
             xil_printf("描き直し %u 回 / %u フレーム  物理 最大 %u us  表 最大 %u us\r\n",
                        (unsigned)(redraws - rep_redraws), (unsigned)(frames - rep_frames),
                        (unsigned)(t_sim_max * 1000000 / COUNTS_PER_SECOND),
                        (unsigned)(t_tbl_max * 1000000 / COUNTS_PER_SECOND));
+            /* 1 フレームあたりの平均 (StepSim 2 回ぶん) */
+            const u32 nf = frames - rep_frames;
+            xil_printf("  内訳 平均: 移動 %u us  押し合い %u us  壁 %u us  組 %u  重なり %u\r\n",
+                       (unsigned)(t_move_sum * 1000000 / COUNTS_PER_SECOND / nf),
+                       (unsigned)(t_push_sum * 1000000 / COUNTS_PER_SECOND / nf),
+                       (unsigned)(t_wall_sum * 1000000 / COUNTS_PER_SECOND / nf),
+                       (unsigned)(n_pair_sum / nf), (unsigned)(n_hit_sum / nf));
+            t_move_sum = t_push_sum = t_wall_sum = 0;
+            n_pair_sum = n_hit_sum = 0;
             rep_frames = frames;
             rep_redraws = redraws;
             t_sim_max = t_tbl_max = 0;
@@ -463,8 +477,13 @@ static int     nsolid;
  * 一辺 grid_size は SimInit で「cr の最大の 2 倍」以上に決める */
 #define GRID_N 16
 static double  grid_size;
-static s16     grid_head[GRID_N * GRID_N];  /* マスごとの最初の番号 (solid[] の添字) */
-static s16     grid_next[NPARTS];           /* 同じマスの次の番号 */
+/* 押し合いに使う値だけをマス目の順に詰めた写し (float)。
+ * 段6b で 2038 個にしたとき、sp[] (1 個 80 バイト) を番号でたどる形だと
+ * 毎フレーム 32 万組・16ms かかった。詰めて並べると 1 次キャッシュに収まる */
+static u16     cell_start[GRID_N * GRID_N + 1];  /* マス c の範囲は cell_start[c]〜[c+1] */
+static u16     cell_fill[GRID_N * GRID_N];
+static u16     pk_idx[NPARTS];                   /* 詰めた位置 → sp[] の番号 */
+static float   pk_x[NPARTS], pk_y[NPARTS], pk_z[NPARTS], pk_cr[NPARTS];
 
 static int GridCell(const SimPart *p)
 {
@@ -538,6 +557,8 @@ static void StepSim(double dt)
     const double gx = -sin(sim_tube_angle), gy = -cos(sim_tube_angle);   /* -upInCell */
     const double k = 1.0 - exp(-dt * 6.0 * thin);
     const double t = sim_time;
+    XTime ta, tb, tc, td;
+    XTime_GetTime(&ta);
 
     for (int i = 0; i < NPARTS; i++) {
         SimPart *p = &sp[i];
@@ -570,40 +591,72 @@ static void StepSim(double dt)
      * 15.5ms かかったので、筒の中をマス目に分け、同じマスと隣のマスだけを調べる。
      * マスの一辺は「当たる最大の距離」(cr の最大の 2 倍) 以上なので取りこぼさない。
      * 参照実装とは組を処理する順序だけが違う */
+    XTime_GetTime(&tb);
     for (int it = 0; it < 2; it++) {
-        for (int c = 0; c < GRID_N * GRID_N; c++) grid_head[c] = -1;
+        /* マスごとに数えて、マス目の順に詰める (数え上げソート) */
+        static u16 cell_of[NPARTS];
+        for (int c = 0; c < GRID_N * GRID_N; c++) cell_fill[c] = 0;
         for (int i = 0; i < nsolid; i++) {
-            const int c = GridCell(&sp[solid[i]]);
-            grid_next[i] = grid_head[c];
-            grid_head[c] = (s16)i;
+            cell_of[i] = (u16)GridCell(&sp[solid[i]]);
+            cell_fill[cell_of[i]]++;
+        }
+        cell_start[0] = 0;
+        for (int c = 0; c < GRID_N * GRID_N; c++) {
+            cell_start[c + 1] = cell_start[c] + cell_fill[c];
+            cell_fill[c] = cell_start[c];
         }
         for (int i = 0; i < nsolid; i++) {
-            SimPart *a = &sp[solid[i]];
-            const int c = GridCell(a);
-            const int cx = c % GRID_N, cy = c / GRID_N;
-            for (int ny = cy - 1; ny <= cy + 1; ny++) {
-                if (ny < 0 || ny >= GRID_N) continue;
-                for (int nx = cx - 1; nx <= cx + 1; nx++) {
-                    if (nx < 0 || nx >= GRID_N) continue;
-                    for (int j = grid_head[ny * GRID_N + nx]; j >= 0; j = grid_next[j]) {
-                        if (j <= i) continue;              /* 同じ組を 2 回やらない */
-                        SimPart *b = &sp[solid[j]];
-                        if (fabs(a->z - b->z) > 0.45) continue;
-                        const double dx = b->x - a->x, dy = b->y - a->y;
-                        const double minD = a->cr + b->cr;
-                        const double d2 = dx * dx + dy * dy;
-                        if (d2 >= minD * minD || d2 == 0.0) continue;
-                        const double d = sqrt(d2);
-                        const double ov = (minD - d) / d;
-                        const double ma = a->cr * a->cr, mb = b->cr * b->cr, m = ma + mb;
-                        a->x -= dx * ov * mb / m;  a->y -= dy * ov * mb / m;
-                        b->x += dx * ov * ma / m;  b->y += dy * ov * ma / m;
+            const int k = cell_fill[cell_of[i]]++;
+            const SimPart *s = &sp[solid[i]];
+            pk_idx[k] = solid[i];
+            pk_x[k] = (float)s->x;  pk_y[k] = (float)s->y;
+            pk_z[k] = (float)s->z;  pk_cr[k] = (float)s->cr;
+        }
+        /* 同じマスの中と、隣のマスのうち片側半分 (右・左下・下・右下) だけを調べる。
+         * 反対側の 4 マスは、相手のマスから見たときに調べられる */
+        static const int nbr_dx[4] = { 1, -1, 0, 1 };
+        static const int nbr_dy[4] = { 0,  1, 1, 1 };
+        for (int cy = 0; cy < GRID_N; cy++) {
+            for (int cx = 0; cx < GRID_N; cx++) {
+                const int c = cy * GRID_N + cx;
+                for (int a = cell_start[c]; a < cell_start[c + 1]; a++) {
+                    for (int nb = -1; nb < 4; nb++) {
+                        int b0, b1;
+                        if (nb < 0) {
+                            b0 = a + 1;  b1 = cell_start[c + 1];
+                        } else {
+                            const int nx = cx + nbr_dx[nb], ny = cy + nbr_dy[nb];
+                            if (nx < 0 || nx >= GRID_N || ny >= GRID_N) continue;
+                            const int n = ny * GRID_N + nx;
+                            b0 = cell_start[n];  b1 = cell_start[n + 1];
+                        }
+                        for (int b = b0; b < b1; b++) {
+                            n_pair_sum++;
+                            if (fabsf(pk_z[a] - pk_z[b]) > 0.45f) continue;
+                            const float dx = pk_x[b] - pk_x[a], dy = pk_y[b] - pk_y[a];
+                            const float minD = pk_cr[a] + pk_cr[b];
+                            const float d2 = dx * dx + dy * dy;
+                            if (d2 >= minD * minD || d2 == 0.0f) continue;
+                            n_hit_sum++;
+                            const float d = sqrtf(d2);
+                            const float ov = (minD - d) / d;
+                            const float ma = pk_cr[a] * pk_cr[a], mb = pk_cr[b] * pk_cr[b];
+                            const float m = ma + mb;
+                            pk_x[a] -= dx * ov * mb / m;  pk_y[a] -= dy * ov * mb / m;
+                            pk_x[b] += dx * ov * ma / m;  pk_y[b] += dy * ov * ma / m;
+                        }
                     }
                 }
             }
         }
+        /* 押し合いで動いた位置を戻す */
+        for (int k = 0; k < nsolid; k++) {
+            SimPart *s = &sp[pk_idx[k]];
+            s->x = pk_x[k];  s->y = pk_y[k];
+        }
     }
     /* 筒の内壁 */
+    XTime_GetTime(&tc);
     for (int i = 0; i < NPARTS; i++) {
         SimPart *p = &sp[i];
         const double d = sqrt(p->x * p->x + p->y * p->y);
@@ -611,6 +664,10 @@ static void StepSim(double dt)
         const double lim = 0.985 - (p->cr > half_r ? p->cr : half_r);
         if (d > lim) { p->x *= lim / d;  p->y *= lim / d; }
     }
+    XTime_GetTime(&td);
+    t_move_sum += tb - ta;
+    t_push_sum += tc - tb;
+    t_wall_sum += td - tc;
     sim_time += dt;
 }
 

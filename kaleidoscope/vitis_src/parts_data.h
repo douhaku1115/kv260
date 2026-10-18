@@ -2,7 +2,7 @@
 #ifndef PARTS_DATA_H
 #define PARTS_DATA_H
 
-#define NPARTS 598
+#define NPARTS 2038
 
 typedef struct {
     unsigned char typ;      /* 種類 (pprog の番号) */
