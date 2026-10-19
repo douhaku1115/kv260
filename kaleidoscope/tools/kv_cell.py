@@ -46,7 +46,9 @@ COLORS = {
     "blob":     ["#58c43c", "#8ee05a"],
     "crescent": ["#f5f2ea", "#e6eef5"],
     "bead":     ["#3a6bff", "#f2c230", "#ffffff"],
-    "bead_s":   ["#3a6bff", "#f2c230", "#ffffff"],   # 小さいビーズ (ビーズと同じ色)
+    # 小さいビーズ。ビーズの青・金・白を同じ色相のまま淡くした (2026-10-20)。
+    # 細かくすると覆われる面積が減って暗い地が増えるので、粒の明るさで補う
+    "bead_s":   ["#9db8ff", "#ffe08a", "#ffffff", "#ffffff"],
     "stone":    ["#5f9e7a", "#8a6ad0", "#d9cfc0"],
     "hexprism": ["#e8b64a", "#c9cfd8"],
     "glitter":  ["#b58ae8", "#d9dde6", "#8f6fd8", "#ffffff", "#e6c8ff"],

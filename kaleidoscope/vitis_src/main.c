@@ -74,6 +74,47 @@ static float set_viscosity  = 0.5f;   /* 粘り 0〜1。参照実装の既定値
 
 /* 筒の回転角 [rad]。PL の COS_T/SIN_T (セルの回転) と物理演算の重力の向きの両方に使う */
 static double sim_tube_angle = 0.0;
+
+/* ========== 色の組み合わせ (c キーで切り替え) ==========
+ * 0 番は生成したときの色 (tools/kv_cell.py の COLORS) をそのまま使う。
+ * 1 番以降は、ピースの番号で色を選び、種 (seed) で明るさを 0.88〜1.08 倍ばらつかせる
+ * (kv_cell.py の spawn() と同じ幅)。表に入る色が変わるだけなので合成は要らない。
+ * ラメは粒の色がそのまま光の色になるので、白・金・銀などの別の並びを持つ。
+ * ★ ビーズ (小ビーズも) にも明るい並びを別に持たせる。宝石色をそのまま当てたら
+ *   「細かな粒が無い」と言われた。元の色ではビーズに白と黄色が入っていて、暗い地の上で
+ *   それが細かい粒として光っていた。濃い色の小さい粒は地に沈んで見えなくなる */
+typedef struct {
+    const char *name;           /* 画面に出す名前 (英字 8 文字まで) */
+    u8 solid[6][3];             /* ガラス・石・棒など */
+    u8 bead[4][3];              /* ビーズ・小ビーズ (明るい色) */
+    u8 glit[4][3];              /* ラメ */
+} Palette;
+
+static const Palette palettes[] = {
+    { "ORIGINAL", {{0}}, {{0}}, {{0}} },
+    { "JEWEL",
+      {{220, 20, 60}, {15, 82, 186}, {0, 155, 119}, {255, 176, 0}, {153, 102, 204}, {255, 200, 124}},
+      {{255, 255, 255}, {255, 215, 120}, {255, 150, 170}, {150, 220, 255}},
+      {{255, 255, 255}, {255, 215, 120}, {220, 225, 235}, {255, 190, 220}} },
+    { "RAINBOW",
+      {{255, 40, 40}, {255, 140, 0}, {255, 230, 0}, {40, 200, 60}, {30, 90, 255}, {170, 60, 255}},
+      {{255, 255, 255}, {255, 240, 120}, {140, 255, 160}, {150, 200, 255}},
+      {{255, 255, 255}, {255, 240, 200}, {200, 230, 255}, {255, 200, 255}} },
+    { "PASTEL",
+      {{255, 179, 186}, {255, 223, 186}, {255, 255, 186}, {186, 255, 201}, {186, 225, 255}, {220, 190, 255}},
+      {{255, 255, 255}, {255, 240, 245}, {240, 250, 255}, {255, 250, 220}},
+      {{255, 255, 255}, {255, 240, 245}, {240, 250, 255}, {255, 250, 230}} },
+    { "WARM",
+      {{255, 60, 30}, {255, 120, 0}, {255, 190, 40}, {200, 30, 80}, {255, 220, 150}, {180, 60, 20}},
+      {{255, 255, 255}, {255, 225, 130}, {255, 190, 140}, {255, 240, 200}},
+      {{255, 215, 120}, {255, 255, 255}, {255, 180, 120}, {255, 230, 180}} },
+    { "BLUE",
+      {{20, 60, 220}, {40, 140, 255}, {0, 200, 230}, {90, 60, 220}, {170, 210, 255}, {30, 30, 140}},
+      {{255, 255, 255}, {190, 230, 255}, {160, 255, 250}, {210, 200, 255}},
+      {{255, 255, 255}, {200, 230, 255}, {180, 160, 255}, {220, 240, 255}} },
+};
+#define NPALETTES ((int)(sizeof(palettes) / sizeof(palettes[0])))
+static int set_palette = 0;
 /* 物理演算の内訳の時間 (移動・押し合い・壁)。300 フレームぶん足して平均を出す */
 static XTime  t_move_sum, t_push_sum, t_wall_sum;
 static u32    n_pair_sum, n_hit_sum;   /* 調べた組 / 実際に重なっていた組 */
@@ -274,11 +315,12 @@ static int uart_getchar_nb(void)
    フレーム同期を圧迫して取りこぼしの原因になる。 */
 static void ShowSettings(void)
 {
-    xil_printf("ポイント %2d  ミラー %d  大きさ %3d  回転 %3d  粘り %3d%s\r\n",
+    xil_printf("ポイント %2d  ミラー %d  大きさ %3d  回転 %3d  粘り %3d  色 %s%s\r\n",
                set_points, set_mirror2 ? 2 : 3,
                (int)(set_zoom * 100.0f + 0.5f),
                (int)(set_autorotate * 100.0f + 0.5f),
                (int)(set_viscosity * 100.0f + 0.5f),
+               palettes[set_palette].name,
                (set_points > 10) ? "  ※11以上は反射19回。K=16では外側が崩れる" : "");
 }
 
@@ -293,6 +335,7 @@ static void ShowHelp(void)
     xil_printf("  e    かき混ぜる\r\n");
     xil_printf("  j l  筒を手で左/右に回す (押している間)\r\n");
     xil_printf("  i    画面の一覧を出す/消す\r\n");
+    xil_printf("  c    色の組み合わせを切り替える (%d 通り)\r\n", NPALETTES);
     xil_printf("  0    初期設定    h  この一覧\r\n");
     ShowSettings();
 }
@@ -340,9 +383,12 @@ static void HandleKey(int c)
     /* 操作一覧をモニターに出す/消す */
     case 'i': set_text_on = !set_text_on; break;
 
+    /* 色の組み合わせ。次の描き直しから変わる */
+    case 'c': set_palette = (set_palette + 1) % NPALETTES; break;
+
     case '0':
         set_points = 8; set_mirror2 = 0; set_zoom = 1.0f; set_autorotate = 0.35f;
-        set_viscosity = 0.5f;
+        set_viscosity = 0.5f;  set_palette = 0;
         geom = 1;
         break;
     case 'h': case '?': ShowHelp(); return;
@@ -377,6 +423,16 @@ static u32 fx24(double v)
     if (n < -8388608.0) n = -8388608.0;
     return ((u32)(s32)n) & 0xFFFFFF;
 }
+
+/* ラメのきらめきの時刻 (表の 18 語目、プログラムの time)。
+ * 段6 までは 0 のままで、ラメは回転 (rot) が変わったときしか光り方が変わらなかった。
+ * WriteTable が毎回 sim_time から作る。
+ * ★ プログラムは tt = (seed*0.6+0.3) * time を S6.17 (±64) で扱う前提で、
+ *   time は 2π/0.9 (= 6.98) 未満に折り返して渡すこと (tools/piece_isa.py)。
+ *   折り返した瞬間に位相が飛ぶが、そのラメが急に光るか消えるだけで目立たない */
+#define GLIT_SPEED 2.5      /* きらめきの速さ。1 で参照実装と同じ (1 粒 7〜21 秒に 1 回) */
+#define GLIT_WRAP  6.9
+static double glit_time = 0.0;
 
 static void PieceWords(const Part *p, double rot, u32 *w)
 {
@@ -414,7 +470,7 @@ static void PieceWords(const Part *p, double rot, u32 *w)
     w[5]  = fx24(vqx0);   w[6]  = fx24(vqy0);   w[7]  = fx24(qx0);   w[8]  = fx24(qy0);
     w[9]  = fx24(s);      w[10] = fx24(s);
     w[11] = fx24(ca * s); w[12] = fx24(-sa * s); w[13] = fx24(sa * s); w[14] = fx24(ca * s);
-    w[15] = fx24(p->seed); w[16] = fx24(e); w[17] = fx24(rot); w[18] = fx24(0.0);
+    w[15] = fx24(p->seed); w[16] = fx24(e); w[17] = fx24(rot); w[18] = fx24(glit_time);
     w[19] = p->col[0];  w[20] = p->col[1];  w[21] = p->col[2];
     w[22] = fx24(depth);
     w[23] = p->premul | (front << 1);
@@ -463,6 +519,7 @@ static const double type_sink[9] = {
        0.28, 0.15, 0.03,   0.18,    -0.3,  0.34, 0.20, 0.12, 0.10 };
 static const double type_cr[9] = {
        1.00, 0.85, 0.00,   0.50,    1.00,  1.00, 0.45, 0.90, 0.70 };
+#define TYPE_BEAD    0
 #define TYPE_GLITTER 2
 #define TYPE_BUBBLE  4
 
@@ -694,6 +751,24 @@ static void SimTurn(double dir)
  * 並べ直す。z が動くので毎回並べ直す (ほぼ整列済みなので挿入ソートで速い)。
  * ★ rot は 0〜2π に収めること。ラメのプログラムは rot*4 + seed*60 の
  *   折り返しが S6.17 (±64) にぎりぎり収まる前提 (CLAUDE.md「ハマったところ」) */
+/* ピース n の色を今の組み合わせ (palettes[]) で決める。0 番 (生成したときの色) なら何もしない */
+static void ApplyPalette(Part *p, int n)
+{
+    if (set_palette == 0 || p->typ == TYPE_BUBBLE) return;
+    const Palette *pl = &palettes[set_palette];
+    const u32 h = (u32)n * 2654435761u;              /* 番号を混ぜて偏りを無くす */
+    const u8 *c = (p->typ == TYPE_GLITTER) ? pl->glit[(h >> 16) % 4]
+                : (p->typ == TYPE_BEAD)    ? pl->bead[(h >> 16) % 4]
+                                           : pl->solid[(h >> 16) % 6];
+    double fr = p->seed * 7.3;
+    fr -= floor(fr);
+    const double jit = 0.88 + 0.20 * fr;
+    for (int k = 0; k < 3; k++) {
+        const double v = c[k] * jit;
+        p->col[k] = (v > 255.0) ? 255 : (u8)v;
+    }
+}
+
 static void WriteTable(void)
 {
     /* parts[] は種類ごとに連続している。種類の切れ目ごとに z で挿入ソート */
@@ -710,12 +785,14 @@ static void WriteTable(void)
     }
 
     u32 w[PIECE_WORDS];
+    glit_time = fmod(sim_time * GLIT_SPEED, GLIT_WRAP);
     Xil_Out32(KAL_CELL_CTRL, CELL_SEL_TABLE);      /* 表の番地を 0 に戻す */
     for (int i = 0; i < NPARTS; i++) {
         const int n = order[i];
         const SimPart *s = &sp[n];
         Part p = parts[n];                         /* 種類・色・大きさ・種はそのまま */
         p.x = s->x;  p.y = s->y;  p.z = s->z;
+        ApplyPalette(&p, n);                       /* 色の組み合わせ (c キー) */
         double rot = fmod(s->rot, TWO_PI_D);
         if (rot < 0.0) rot += TWO_PI_D;
         PieceWords(&p, rot, w);
@@ -762,7 +839,8 @@ static void UpdateText(void)
     TxtPut(4, 2, "Z X   SPIN");    TxtNum(4, 24, (int)(set_autorotate * 100.0f + 0.5f));
     TxtPut(5, 2, "V B   THICK");   TxtNum(5, 24, (int)(set_viscosity * 100.0f + 0.5f));
     TxtPut(6, 2, "E STIR    J L TURN");
-    TxtPut(7, 2, "0 RESET   I HIDE");
+    TxtPut(7, 2, "0 RESET I HIDE C");
+    TxtPut(7, 19, palettes[set_palette].name);
 
     /* 4 文字ずつ 1 ワードにまとめて書く。下位バイトが左端の文字。
        txt は 2 次元配列なので行が隙間なく並んでいる。 */
