@@ -47,6 +47,21 @@
 #define KAL_CELL_CTRL (KAL_BASE + 0x180)   /* 2 を書くと表の番地が 0 に戻る */
 #define KAL_CELL_DATA (KAL_BASE + 0x190)   /* 書くと表の今の番地に入り、番地が1進む */
 #define KAL_DRAW_REQ  (KAL_BASE + 0x1A0)   /* 書くと描き直す。読むと bit0 = 描き直しの途中 */
+/* きらめき層 (rtl/sparkle.v)。画面の画素の細かさで光る点を足す。模様を拡大しても点は細かいまま
+ * SPK_CTRL: bit0 = 有効, bit3:1 = lv (格子の細かさ), bit11:4 = dens (点がある格子の割合/256)
+ * SPK_K   : 点の大きさの係数 (画面 1 画素ぶんの格子の大きさから決める。SpkSet を見る)
+ * SPK_GAIN: bit7:0 = base (いつもの明るさ/128), bit15:8 = flash (光ったときの上乗せ/128)
+ * SPK_TIME: bit7:0 = 時刻 (256 で 1 周)。毎フレーム書く */
+#define KAL_SPK_CTRL  (KAL_BASE + 0x1B0)
+#define KAL_SPK_K     (KAL_BASE + 0x1C0)
+#define KAL_SPK_GAIN  (KAL_BASE + 0x1D0)
+#define KAL_SPK_TIME  (KAL_BASE + 0x1E0)
+#define SPK_GAP_PX    7.0     /* 点と点の間隔のめやす [画面の画素] */
+#define SPK_DOT_PX    0.75    /* 点の半径のめやす [画面の画素] */
+#define SPK_DENS      115     /* 0.45 * 256 */
+#define SPK_BASE      26      /* 0.2 * 128 */
+#define SPK_FLASH     205     /* 1.6 * 128 */
+#define SPK_SPEED     2.0     /* 光る速さ [rad/s] */
 #define CELL_SEL_TABLE 2
 #define PIECE_WORDS    24
 /* 画面に出す文字。1 ワードに 4 文字、下位バイトが左。32桁 x 8行 = 64 ワード */
@@ -131,6 +146,8 @@ static void RunDP(void);
 static void SetupVideoStream(void);
 static u32 TrainLink(void);
 static void KalSetGeometry(void);
+static void SpkSet(void);
+static void SpkTick(void);
 static int  uart_getchar_nb(void);
 static void ShowSettings(void);
 static void ShowHelp(void);
@@ -258,7 +275,8 @@ int main(void)
 
         Xil_Out32(KAL_COS_T, (u32)(s32)(cos(sim_tube_angle) * 32768.0));
         Xil_Out32(KAL_SIN_T, (u32)(s32)(sin(sim_tube_angle) * 32768.0));
-        Xil_Out32(KAL_COMMIT, 1);      /* ここまでの値を次のフレーム先頭で一括反映 */
+        SpkTick();
+        Xil_Out32(KAL_COMMIT, 1);     /* ここまでの値を次のフレーム先頭で一括反映 */
         if (frames - rep_frames >= 300) {
             xil_printf("描き直し %u 回 / %u フレーム  物理 最大 %u us  表 最大 %u us\r\n",
                        (unsigned)(redraws - rep_redraws), (unsigned)(frames - rep_frames),
@@ -906,7 +924,34 @@ static void KalSetGeometry(void)
     Xil_Out32(KAL_CTRL,     (set_mirror2 ? 1 : 0) | (set_text_on ? 2 : 0));
     Xil_Out32(KAL_COS_T,    32768);
     Xil_Out32(KAL_SIN_T,    0);
+    SpkSet();
     Xil_Out32(KAL_COMMIT,   1);
+}
+
+/* ========== きらめき層の設定 ==========
+ * tools/sparkle_fx.py の params_for_zoom() と同じ式。模様の大きさ (zoom) が変わると
+ * 画面 1 画素ぶんの c が変わるので、格子の細かさ lv と点の大きさ k を取り直す。
+ * 呼ぶのは KalSetGeometry から (COMMIT の前)。 */
+static void SpkSet(void)
+{
+    const double c_per_px = (Z_CELL / TUBE_R) / (720.0 * 0.85 * set_zoom);
+    int lv = (int)lround(log2(2.0 / (SPK_GAP_PX * c_per_px)));
+    if (lv < 3) lv = 3;
+    if (lv > 7) lv = 7;
+    const double cell_px = 2.0 / (double)(1 << lv) / c_per_px;
+    long k = lround((cell_px / SPK_DOT_PX) * (cell_px / SPK_DOT_PX) * 256.0);
+    if (k < 0) k = 0;
+    if (k > 65535) k = 65535;
+
+    Xil_Out32(KAL_SPK_CTRL, 1u | ((u32)lv << 1) | ((u32)SPK_DENS << 4));
+    Xil_Out32(KAL_SPK_K,    (u32)k);
+    Xil_Out32(KAL_SPK_GAIN, (u32)SPK_BASE | ((u32)SPK_FLASH << 8));
+}
+
+/* 時刻を進める。毎フレーム COMMIT の前に呼ぶ (256 で 1 周) */
+static void SpkTick(void)
+{
+    Xil_Out32(KAL_SPK_TIME, (u32)lround(sim_time * SPK_SPEED / TWO_PI_D * 256.0) & 0xFF);
 }
 
 static int InitDP(void)

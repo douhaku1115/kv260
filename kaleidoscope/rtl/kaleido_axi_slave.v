@@ -98,6 +98,19 @@ module kaleido_axi_slave #(
     output reg                             v_mirror2,
     output reg                             v_text_on,   // CTRL bit1
 
+    // きらめき層 (段7、rtl/sparkle.v)。0x1B0〜0x1E0 に書き、COMMIT で他と一緒に取り込む
+    //   0x1B0 SPK_CTRL  bit0 = 出す、bit3:1 = 格子 2^lv マス、bit11:4 = 点がある割合 /256
+    //   0x1C0 SPK_K     (1 マスの画面画素 / 点の半径)^2  Q8
+    //   0x1D0 SPK_GAIN  bit7:0 = いつもの明るさ、bit15:8 = キラッと光るとき (128 = 1.0)
+    //   0x1E0 SPK_TIME  時刻 (256 で 1 周)。PS が毎フレーム進める
+    output reg                             v_spk_en,
+    output reg  [2:0]                      v_spk_lv,
+    output reg  [7:0]                      v_spk_dens,
+    output reg  [15:0]                     v_spk_k,
+    output reg  [7:0]                      v_spk_base,
+    output reg  [7:0]                      v_spk_flash,
+    output reg  [7:0]                      v_spk_tphase,
+
     // 画面に出す文字。映像側から読む (書き込みは AXI 側、読み出しは映像側の
     // 単純デュアルポート RAM。PS が書いた文字がそのまま画面に出る)
     input  wire [10:0]                     text_addr,   // 文字番号 0〜TEXT_COLS*TEXT_ROWS-1
@@ -139,6 +152,16 @@ module kaleido_axi_slave #(
     // ---- レジスタ本体 (AXI クロック領域) ----
     reg [19:0] regs [0:NREG-1];
     reg        commit_tgl;
+
+    // きらめき層の設定 (段7)。0x1B0 = 27 番から 4 つ
+    localparam [6:0] SPK_BASE = 7'd27;
+    reg [15:0] spk_regs [0:3];
+    initial begin
+        spk_regs[0] = 16'd0;       // 出さない (PS が設定してから出す)
+        spk_regs[1] = 16'd0;
+        spk_regs[2] = 16'd0;
+        spk_regs[3] = 16'd0;
+    end
 
     // 電源投入時の既定値: ポイント数 8、3枚鏡、回転なし
     //   tools/ref_scope.py の mirror_geometry(8) と同じ値
@@ -240,6 +263,8 @@ module kaleido_axi_slave #(
                 dr_tgl <= ~dr_tgl;
             else if (wr_unit < NREG-1)
                 regs[wr_unit] <= S_AXI_WDATA[19:0];
+            else if (wr_unit >= SPK_BASE && wr_unit < SPK_BASE + 7'd4)   // 0x1B0〜0x1E0
+                spk_regs[wr_unit[1:0] - SPK_BASE[1:0]] <= S_AXI_WDATA[15:0];
             else if (wr_unit >= TEXT_BASE && wr_unit < TEXT_BASE + TEXT_WORDS) begin
                 text_ram[{tw_idx, 2'd0}]         <= S_AXI_WDATA[7:0];
                 text_ram[{tw_idx, 2'd0} + 3'd1]  <= S_AXI_WDATA[15:8];
@@ -364,6 +389,8 @@ module kaleido_axi_slave #(
         v_vx0 = 18'h00000; v_vy0 = 18'h10666;
         v_vx1 = 18'h39B95; v_vy1 = 18'h30D93;
         v_vx2 = 18'h0646B; v_vy2 = 18'h30D93;
+        v_spk_en = 1'b0;  v_spk_lv = 3'd5;  v_spk_dens = 8'd0;  v_spk_k = 16'd0;
+        v_spk_base = 8'd0;  v_spk_flash = 8'd0;  v_spk_tphase = 8'd0;
     end
 
     always @(posedge clkv) begin
@@ -382,6 +409,13 @@ module kaleido_axi_slave #(
             v_vx0 <= regs[16][17:0]; v_vy0 <= regs[17][17:0];
             v_vx1 <= regs[18][17:0]; v_vy1 <= regs[19][17:0];
             v_vx2 <= regs[20][17:0]; v_vy2 <= regs[21][17:0];
+            v_spk_en     <= spk_regs[0][0];
+            v_spk_lv     <= spk_regs[0][3:1];
+            v_spk_dens   <= spk_regs[0][11:4];
+            v_spk_k      <= spk_regs[1];
+            v_spk_base   <= spk_regs[2][7:0];
+            v_spk_flash  <= spk_regs[2][15:8];
+            v_spk_tphase <= spk_regs[3][7:0];
         end
     end
 

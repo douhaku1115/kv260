@@ -32,6 +32,7 @@ set rtl_files [list \
   $script_dir/rtl/ppixgen.v \
   $script_dir/rtl/pshade_seq.v \
   $script_dir/rtl/pdriver.v \
+  $script_dir/rtl/sparkle.v \
 ]
 # $readmemh が読む表。tools/gen_hex.py が作る
 set hex_files [list \
@@ -48,6 +49,8 @@ set hex_files [list \
   $script_dir/rtl/pprog_pre.hex \
   $script_dir/rtl/pparts.hex \
   $script_dir/rtl/cell_oil.hex \
+  $script_dir/rtl/spk_fall.hex \
+  $script_dir/rtl/spk_tw.hex \
 ]
 set pin_xdc_file    $script_dir/pins.xdc
 set timing_xdc_file $script_dir/timings.xdc
@@ -153,7 +156,7 @@ connect_bd_net [get_bd_pins proc_sys_reset_0/peripheral_aresetn] [get_bd_pins ${
 
 # ---- AXI スレーブ ↔ rtl_top (映像クロック領域で確定したパラメータ) ----
 connect_bd_net [get_bd_pins ${rtl_top_instance}/frame_start] [get_bd_pins ${axi_slave_instance}/frame_start]
-foreach sig {kx z_mirror remain0 inv_tr cos_t sin_t nx0 ny0 wd0 nx1 ny1 wd1 nx2 ny2 wd2 vx0 vy0 vx1 vy1 vx2 vy2 mirror2 text_on} {
+foreach sig {kx z_mirror remain0 inv_tr cos_t sin_t nx0 ny0 wd0 nx1 ny1 wd1 nx2 ny2 wd2 vx0 vy0 vx1 vy1 vx2 vy2 mirror2 text_on spk_en spk_lv spk_dens spk_k spk_base spk_flash spk_tphase} {
   connect_bd_net [get_bd_pins ${axi_slave_instance}/v_$sig] [get_bd_pins ${rtl_top_instance}/p_$sig]
 }
 # 画面に出す文字: rtl_top がアドレスを出し、AXI スレーブの中の RAM が返す

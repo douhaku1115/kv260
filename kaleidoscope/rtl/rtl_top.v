@@ -17,9 +17,10 @@
 //    cell_dbuf      2 クロック  (段5d-7 で二重バッファに。遅延は同じ)
 //    影で奥層を暗くする  1 クロック
 //    α合成          1 クロック
-//    減光            1 クロック
+//    きらめき層を待つ  5 クロック  (段7。sparkle は c から 10 クロックかかる)
+//    減光 (きらめきを足してから) 1 クロック
 //    周辺減光+合わせ目 1 クロック
-//    ------------------------- 合計 205  → vga_iface の PIXEL_DELAY
+//    ------------------------- 合計 210  → vga_iface の PIXEL_DELAY
 //
 //  鏡の形・画角・セルの回転は kaleido_axi_slave から受け取る。
 // ============================================================
@@ -45,6 +46,14 @@ module rtl_top
    input wire signed [17:0] p_vx2, p_vy2,
    input wire               p_mirror2,
    input wire               p_text_on,     // 画面に操作一覧を出す
+   // きらめき層 (段7。kaleido_axi_slave の 0x1B0〜0x1E0)
+   input wire               p_spk_en,
+   input wire [2:0]         p_spk_lv,
+   input wire [7:0]         p_spk_dens,
+   input wire [15:0]        p_spk_k,
+   input wire [7:0]         p_spk_base,
+   input wire [7:0]         p_spk_flash,
+   input wire [7:0]         p_spk_tphase,
 
    // ピースの表の書き込みと描き直し (段5d-7)
    input wire               p_draw_req,     // 描き直しの開始 (1 クロック)
@@ -76,7 +85,11 @@ module rtl_top
   localparam signed [17:0] CELL_GAP = 18'sd22938;   // 0.35 cm Q16  手前層 → 奥層
 
   localparam SCOPE_LAT = 4 + K*12 + 3;                  // = 199
-  localparam TOTAL_LAT = SCOPE_LAT + 2 + 1 + 1 + 1 + 1; // = 205
+  // きらめき層 (sparkle) は scope_pipe の out_cx (out_fx より 1 クロック早い) から
+  // 10 クロックで出る。α 合成の出力 (out_fx から 4 クロック) より 5 クロック遅いので、
+  // 色の流れを SPK_D クロック待たせて揃える
+  localparam SPK_D     = 5;
+  localparam TOTAL_LAT = SCOPE_LAT + 2 + 1 + 1 + SPK_D + 1 + 1; // = 210
 
   // ---- リセット同期 ----
   wire reset, resetv;
@@ -106,6 +119,7 @@ module rtl_top
   wire [4:0]           nrefl;
   wire [15:0]          seam;
   wire                 black;
+  wire signed [17:0]   spk_cx, spk_cy;    // きらめき層へ (out_fx より 1 クロック早い)
 
   scope_pipe #(.K(K), .CELL_BITS(CELL_BITS),
                .LUT_FILE("recip_lut.hex"), .SEAM_LUT_FILE("seam_lut.hex"))
@@ -124,7 +138,18 @@ module rtl_top
      .out_fx(fx), .out_fy(fy),
      .out_bx(bx), .out_by(by),
      .out_sx(sx), .out_sy(sy),
+     .out_cx(spk_cx), .out_cy(spk_cy),
      .out_nrefl(nrefl), .out_seam(seam), .out_black(black));
+
+  // ============ きらめき層 (段7) ============
+  //   折り返したあとの細かい座標 c に格子を敷き、マスごとの光る点を画面の画素の
+  //   細かさで描く。模様を大きくしても点は大きくならない (rtl/sparkle.v)
+  wire [8:0] spk_r, spk_g, spk_b;
+  sparkle #(.FALL_FILE("spk_fall.hex"), .TW_FILE("spk_tw.hex")) spk_i
+    (.clk(clkv), .cx(spk_cx), .cy(spk_cy),
+     .en(p_spk_en), .lv(p_spk_lv), .dens(p_spk_dens), .k(p_spk_k),
+     .base(p_spk_base), .flash(p_spk_flash), .tphase(p_spk_tphase),
+     .out_r(spk_r), .out_g(spk_g), .out_b(spk_b));
 
   // ピース描画の状態 (セルの口の振り分けで使うので先に宣言する)
   wire        ps_busy, ps_valid, ps_take, ps_premul, ps_front, ps_done;
@@ -263,17 +288,20 @@ module rtl_top
 
   // ============ nrefl / seam / black を合成の遅れに合わせる ============
   //   scope_pipe の出力 (199) から、使うところまで遅らせる
-  reg [4:0]  nr_d [0:3];
-  reg [15:0] sm_d [0:3];
-  reg        bk_d [0:4];
+  //   段7 からはきらめき層を待つ SPK_D クロックぶん長い
+  localparam NR_AT = 3 + SPK_D;     // 減光の段で使う位置
+  localparam BK_AT = 4 + SPK_D;     // 出力の段で使う位置
+  reg [4:0]  nr_d [0:NR_AT];
+  reg [15:0] sm_d [0:NR_AT];
+  reg        bk_d [0:BK_AT];
   integer d;
   always @(posedge clkv) begin
     nr_d[0] <= nrefl;  sm_d[0] <= seam;  bk_d[0] <= black;
-    for (d = 1; d < 4; d = d + 1) begin
+    for (d = 1; d <= NR_AT; d = d + 1) begin
       nr_d[d] <= nr_d[d-1];
       sm_d[d] <= sm_d[d-1];
     end
-    for (d = 1; d < 5; d = d + 1) bk_d[d] <= bk_d[d-1];
+    for (d = 1; d <= BK_AT; d = d + 1) bk_d[d] <= bk_d[d-1];
   end
 
   // ============ 画面に出す文字 (操作一覧) ============
@@ -386,14 +414,35 @@ module rtl_top
   reg [8:0] loss_lut [0:31];
   initial $readmemh("loss_lut.hex", loss_lut);
 
-  wire [8:0] gain = loss_lut[nr_d[3]];
+  wire [8:0] gain = loss_lut[nr_d[NR_AT]];
+
+  // ---- きらめき層を待ってから足す (段7) ----
+  //   α 合成の色を SPK_D クロック遅らせ、sparkle の出力と揃えて足し、255 で切る。
+  //   減光・周辺減光・合わせ目はこのあとで掛けるので、きらめきも鏡の奥ほど暗くなる
+  //   (tools/sparkle_layer.py と同じ順)
+  reg [7:0] r_cd [0:SPK_D-1];
+  reg [7:0] g_cd [0:SPK_D-1];
+  reg [7:0] b_cd [0:SPK_D-1];
+  integer q;
+  always @(posedge clkv) begin
+    r_cd[0] <= r_c;  g_cd[0] <= g_c;  b_cd[0] <= b_c;
+    for (q = 1; q < SPK_D; q = q + 1) begin
+      r_cd[q] <= r_cd[q-1];  g_cd[q] <= g_cd[q-1];  b_cd[q] <= b_cd[q-1];
+    end
+  end
+  wire [9:0] r_t = {2'b00, r_cd[SPK_D-1]} + {1'b0, spk_r};
+  wire [9:0] g_t = {2'b00, g_cd[SPK_D-1]} + {1'b0, spk_g};
+  wire [9:0] b_t = {2'b00, b_cd[SPK_D-1]} + {1'b0, spk_b};
+  wire [7:0] r_k = (r_t > 10'd255) ? 8'd255 : r_t[7:0];
+  wire [7:0] g_k = (g_t > 10'd255) ? 8'd255 : g_t[7:0];
+  wire [7:0] b_k = (b_t > 10'd255) ? 8'd255 : b_t[7:0];
 
   // 掛け算は必ず幅を持った wire に受けてから切り出す。
   //   r_l <= (r_c * gain) >> 8;  と書くと代入先の 8bit で積が切り捨てられ、
   //   シフト後にほぼ 0 になる (Verilog の式幅の規則)。
-  wire [16:0] r_m = r_c * gain;
-  wire [16:0] g_m = g_c * gain;
-  wire [16:0] b_m = b_c * gain;
+  wire [16:0] r_m = r_k * gain;
+  wire [16:0] g_m = g_k * gain;
+  wire [16:0] b_m = b_k * gain;
 
   reg [7:0] r_l, g_l, b_l;
   always @(posedge clkv) begin
@@ -403,7 +452,7 @@ module rtl_top
   end
 
   // ============ 周辺減光と合わせ目をかけて出力 ============
-  wire [31:0] vq_sm = vq * sm_d[3];
+  wire [31:0] vq_sm = vq * sm_d[NR_AT];
   reg [15:0] vq2;
   always @(posedge clkv) vq2 <= vq_sm[30:15];
 
@@ -411,9 +460,9 @@ module rtl_top
   wire [23:0] g_v = g_l * vq2;
   wire [23:0] b_v = b_l * vq2;
 
-  wire [7:0] r_base = bk_d[4] ? 8'd3 : r_v[22:15];   // 筒の縁は暗い色
-  wire [7:0] g_base = bk_d[4] ? 8'd2 : g_v[22:15];
-  wire [7:0] b_base = bk_d[4] ? 8'd3 : b_v[22:15];
+  wire [7:0] r_base = bk_d[BK_AT] ? 8'd3 : r_v[22:15];   // 筒の縁は暗い色
+  wire [7:0] g_base = bk_d[BK_AT] ? 8'd2 : g_v[22:15];
+  wire [7:0] b_base = bk_d[BK_AT] ? 8'd3 : b_v[22:15];
 
   reg [7:0] r_o, g_o, b_o;
   always @(posedge clkv) begin

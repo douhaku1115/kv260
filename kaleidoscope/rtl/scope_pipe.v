@@ -64,6 +64,9 @@ module scope_pipe
    output wire [CELL_BITS-1:0] out_fx, out_fy,   // 手前層
    output wire [CELL_BITS-1:0] out_bx, out_by,   // 奥層 (CELL_GAP 分ずれた位置)
    output wire [CELL_BITS-1:0] out_sx, out_sy,   // 影 (手前層の α をずらして読む)
+   // 回したあとの手前層の c (Q15)。きらめき層 (段7) が使う。
+   // ★ out_fx より 1 クロック早い (O1 の出力をそのまま出す)
+   output wire signed [17:0]   out_cx, out_cy,
    output wire [4:0]           out_nrefl,
    output wire [15:0]          out_seam,
    output wire                 out_black
@@ -296,6 +299,8 @@ module scope_pipe
     bk_o2 <= bk_r;
   end
 
+  assign out_cx    = cxf_r;
+  assign out_cy    = cyf_r;
   assign out_fx    = fx_o;
   assign out_fy    = fy_o;
   assign out_bx    = bx_o;
