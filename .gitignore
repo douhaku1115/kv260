@@ -23,3 +23,9 @@ retry_open_fs.log
 kv260_zephyr/psu_init_nousb.tcl
 kv260_zephyr/*.elf
 kv260_zephyr/*.txt
+
+# ---- NES ----
+# Vivado のプロジェクト一式。vivado.tcl で再生成できる
+kv260_nes/project_1/
+# xsim の作業場。sim/run_sim.sh で再生成できる
+kv260_nes/sim/simbuild/
