@@ -9,6 +9,9 @@
 #include "xuartps_hw.h"
 #include "parts_data.h"     /* ピースの元の値 (段5d-7。毎フレーム表を作って PL へ書く) */
 #include "xiltimer.h"       /* XTime_GetTime。物理演算と表の書き込みの時間を測る (段6) */
+#include "ff.h"             /* SD カード (xilffs = FatFs)。配色の保存 */
+#include <stdio.h>          /* snprintf */
+#include <string.h>
 #include "xdppsu.h"
 #ifndef SDT
 #include "xscugic.h"
@@ -91,9 +94,12 @@ static float set_viscosity  = 0.5f;   /* 粘り 0〜1。参照実装の既定値
 static double sim_tube_angle = 0.0;
 
 /* ========== 色の組み合わせ (c キーで切り替え) ==========
- * 0 番は生成したときの色 (tools/kv_cell.py の COLORS) をそのまま使う。
- * 1 番以降は、ピースの番号で色を選び、種 (seed) で明るさを 0.88〜1.08 倍ばらつかせる
- * (kv_cell.py の spawn() と同じ幅)。表に入る色が変わるだけなので合成は要らない。
+ * 下の palettes[] は「組み込みの組」。c キーで選ぶと、今の配色 cset[] (種類ごとに 8 色と割合)
+ * へ写す。ピースの色は cset[] から、ピースの番号で色を選び、種 (seed) で明るさを
+ * 0.88〜1.08 倍ばらつかせる (kv_cell.py の spawn() と同じ幅)。表に入る色が変わるだけなので
+ * 合成は要らない。0 番 ORIGINAL は生成したときの色 (tools/kv_cell.py の COLORS。
+ * parts_data.c の kind_orig[]) で、色の選ばれ方は生成時と違うが割合は同じ。
+ * cset[] は p キーの配色エディタで直せて、SD カードに 4 つまで保存できる (下の「配色エディタ」)。
  * ラメは粒の色がそのまま光の色になるので、白・金・銀などの別の並びを持つ。
  * ★ ビーズ (小ビーズも) にも明るい並びを別に持たせる。宝石色をそのまま当てたら
  *   「細かな粒が無い」と言われた。元の色ではビーズに白と黄色が入っていて、暗い地の上で
@@ -130,6 +136,31 @@ static const Palette palettes[] = {
 };
 #define NPALETTES ((int)(sizeof(palettes) / sizeof(palettes[0])))
 static int set_palette = 0;
+
+/* 今の配色。種類 (parts_data.h の kind、gen_parts_c.py の KINDS の順) ごとに 8 色と割合 [%]。
+ * 割合 0 の色は使わない。割合の合計は 100 でなくてよい (合計に対する比で選ぶ) */
+typedef struct {
+    u8 rgb[KCOLS][3];
+    u8 rate[KCOLS];
+} KindColor;
+static KindColor cset[NKINDS];
+static char      cset_name[12] = "ORIGINAL";      /* 画面に出す名前 (組の名前か SLOTn) */
+/* 画面に出す種類の名前 (英字 7 文字まで)。気泡は色を変えないので編集の対象外 */
+static const char *const kind_name[NKINDS] = {
+    "BEAD", "S.BEAD", "GLASS", "GLITTER", "STONE", "HEX", "ROD", "BLOB", "MOON", "BUBBLE"
+};
+#define KIND_BEAD     0
+#define KIND_SBEAD    1
+#define KIND_GLITTER  3
+#define KIND_BUBBLE   (NKINDS - 1)
+#define NKIND_EDIT    (NKINDS - 1)
+static void LoadPreset(int n);
+static int  SdSave(int slot);
+static int  SdLoad(int slot);
+static void EditKey(int c);
+static void ShowEditHelp(void);
+static int  ed_on = 0;                 /* 配色エディタを出しているか (p キー) */
+static char ed_msg[12] = "";           /* 保存した・SD が無い などをエディタの 1 行目に出す */
 /* 物理演算の内訳の時間 (移動・押し合い・壁)。300 フレームぶん足して平均を出す */
 static XTime  t_move_sum, t_push_sum, t_wall_sum;
 static u32    n_pair_sum, n_hit_sum;   /* 調べた組 / 実際に重なっていた組 */
@@ -193,6 +224,14 @@ int main(void)
      * まず PS の計算が焼き込みの表と同じになるかを確かめる (自己検査)。 */
     SelfCheckTable();
     SimInit();                   /* 物理演算の状態を元の値から作る (段6) */
+
+    /* 配色。SD カードに KPAL1.TXT があればそれで始める。無ければ ORIGINAL */
+    LoadPreset(0);
+    {
+        const int r = SdLoad(1);
+        if (r > 0) xil_printf("SD: KPAL1.TXT を読み込んだ (%d 種類)\r\n", r);
+        else       xil_printf("SD: KPAL1.TXT なし (%d)。配色は ORIGINAL\r\n", r);
+    }
 
     /* ========== 万華鏡のパラメータを書く ========== */
     KalSetGeometry();
@@ -338,7 +377,7 @@ static void ShowSettings(void)
                (int)(set_zoom * 100.0f + 0.5f),
                (int)(set_autorotate * 100.0f + 0.5f),
                (int)(set_viscosity * 100.0f + 0.5f),
-               palettes[set_palette].name,
+               cset_name,
                (set_points > 10) ? "  ※11以上は反射19回。K=16では外側が崩れる" : "");
 }
 
@@ -354,6 +393,7 @@ static void ShowHelp(void)
     xil_printf("  j l  筒を手で左/右に回す (押している間)\r\n");
     xil_printf("  i    画面の一覧を出す/消す\r\n");
     xil_printf("  c    色の組み合わせを切り替える (%d 通り)\r\n", NPALETTES);
+    xil_printf("  p    配色エディタ (種類ごとに 8 色と割合。SD に保存)\r\n");
     xil_printf("  0    初期設定    h  この一覧\r\n");
     ShowSettings();
 }
@@ -368,6 +408,8 @@ static void HandleKey(int c)
        「届いていない」のか「届いたが値が端まで来ている」のかを区別するため。 */
     if (c >= 0x20 && c < 0x7F) xil_printf("[%c] ", c);
     else                       xil_printf("[%02x] ", c);
+
+    if (ed_on) { EditKey(c); return; }    /* 配色エディタの中ではキーの意味が変わる */
 
     switch (c) {
     /* ポイント数 */
@@ -402,11 +444,14 @@ static void HandleKey(int c)
     case 'i': set_text_on = !set_text_on; break;
 
     /* 色の組み合わせ。次の描き直しから変わる */
-    case 'c': set_palette = (set_palette + 1) % NPALETTES; break;
+    case 'c': LoadPreset((set_palette + 1) % NPALETTES); break;
+
+    /* 配色エディタを出す */
+    case 'p': ed_on = 1; ed_msg[0] = '\0'; UpdateText(); ShowEditHelp(); return;
 
     case '0':
         set_points = 8; set_mirror2 = 0; set_zoom = 1.0f; set_autorotate = 0.35f;
-        set_viscosity = 0.5f;  set_palette = 0;
+        set_viscosity = 0.5f;  LoadPreset(0);
         geom = 1;
         break;
     case 'h': case '?': ShowHelp(); return;
@@ -772,12 +817,16 @@ static void SimTurn(double dir)
 /* ピース n の色を今の組み合わせ (palettes[]) で決める。0 番 (生成したときの色) なら何もしない */
 static void ApplyPalette(Part *p, int n)
 {
-    if (set_palette == 0 || p->typ == TYPE_BUBBLE) return;
-    const Palette *pl = &palettes[set_palette];
+    if (p->kind == KIND_BUBBLE) return;
+    const KindColor *kc = &cset[p->kind];
+    u32 sum = 0;
+    for (int j = 0; j < KCOLS; j++) sum += kc->rate[j];
+    if (sum == 0) return;                            /* 全部 0 なら元の色のまま */
     const u32 h = (u32)n * 2654435761u;              /* 番号を混ぜて偏りを無くす */
-    const u8 *c = (p->typ == TYPE_GLITTER) ? pl->glit[(h >> 16) % 4]
-                : (p->typ == TYPE_BEAD)    ? pl->bead[(h >> 16) % 4]
-                                           : pl->solid[(h >> 16) % 6];
+    u32 pick = (h >> 16) % sum;                      /* 割合に比例して色を選ぶ */
+    int j = 0;
+    while (pick >= kc->rate[j]) { pick -= kc->rate[j]; j++; }
+    const u8 *c = kc->rgb[j];
     double fr = p->seed * 7.3;
     fr -= floor(fr);
     const double jit = 0.88 + 0.20 * fr;
@@ -785,6 +834,229 @@ static void ApplyPalette(Part *p, int n)
         const double v = c[k] * jit;
         p->col[k] = (v > 255.0) ? 255 : (u8)v;
     }
+}
+
+/* 組み込みの組 n を今の配色 cset[] へ写す。ORIGINAL は kind_orig[] (生成したときの色)。
+ * それ以外は palettes[] の 3 つの並びを種類に割り振り、割合は等分する */
+static void LoadPreset(int n)
+{
+    for (int k = 0; k < NKINDS; k++)
+        for (int j = 0; j < KCOLS; j++) {
+            for (int i = 0; i < 3; i++) cset[k].rgb[j][i] = kind_orig[k][j][i];
+            cset[k].rate[j] = kind_orig[k][j][3];
+        }
+    if (n > 0) {
+        const Palette *pl = &palettes[n];
+        for (int k = 0; k < NKIND_EDIT; k++) {
+            const int nc = (k == KIND_GLITTER) ? 4 : (k == KIND_BEAD || k == KIND_SBEAD) ? 4 : 6;
+            for (int j = 0; j < KCOLS; j++) {
+                const u8 *c = (k == KIND_GLITTER) ? pl->glit[j % 4]
+                            : (k == KIND_BEAD || k == KIND_SBEAD) ? pl->bead[j % 4]
+                            : pl->solid[j % 6];
+                for (int i = 0; i < 3; i++) cset[k].rgb[j][i] = c[i];
+                cset[k].rate[j] = (j < nc) ? (u8)(100 / nc) : 0;
+            }
+        }
+    }
+    set_palette = n;
+    int i = 0;
+    for (const char *s = palettes[n].name; *s && i < (int)sizeof(cset_name) - 1; s++) cset_name[i++] = *s;
+    cset_name[i] = '\0';
+}
+
+/* ========== 配色を SD カードに保存・読み込み ==========
+ * SD カードの FAT の区画の一番上に KPAL1.TXT 〜 KPAL4.TXT を置く (他のファイルと同居できる)。
+ * BSP に xilffs (FatFs) が要る。ファイル名は 8.3 形式だけ (長い名前は BSP で無効)。
+ * 中身は人が読める文字で、PC で直してもよい:
+ *     # KV260 kaleidoscope colors (JEWEL)
+ *     BEAD FFFFFF/25 FFD778/25 FF96AA/25 96DCFF/25 000000/0 000000/0 000000/0 000000/0
+ *     S.BEAD ...
+ * 1 行 = 種類の名前 + 「色 (RRGGBB の 16 進)/割合 [%]」が 8 つ。書いていない種類は今の色のまま。
+ * SD を挿し替えても追従するように、保存・読み込みのたびにつなぎ直す。
+ * 書き込み・読み込みは数 ms〜数十 ms かかるので、その間は映像の歩調から外れる (キーを押したときだけ) */
+static FATFS sd_fs;
+static FIL   sd_fil;
+static char  sd_buf[2048] __attribute__((aligned(64)));    /* SD の DMA に合わせて揃える */
+
+static int SdMount(void)
+{
+    f_mount(NULL, "0:/", 0);
+    return (f_mount(&sd_fs, "0:/", 1) == FR_OK) ? 0 : -1;
+}
+
+static void SdPath(char *path, int slot)
+{
+    snprintf(path, 16, "0:/KPAL%d.TXT", slot);
+}
+
+/* 戻り値: 0 = 保存した, -1 = SD が無い/読めない, -2 = 開けない, -3 = 書けない */
+static int SdSave(int slot)
+{
+    char path[16];
+    if (SdMount() != 0) return -1;
+    SdPath(path, slot);
+    int n = snprintf(sd_buf, sizeof(sd_buf),
+                     "# KV260 kaleidoscope colors (%s)\r\n# kind  RRGGBB/rate[%%] x %d\r\n",
+                     cset_name, KCOLS);
+    for (int k = 0; k < NKIND_EDIT; k++) {
+        n += snprintf(sd_buf + n, sizeof(sd_buf) - n, "%s", kind_name[k]);
+        for (int j = 0; j < KCOLS; j++)
+            n += snprintf(sd_buf + n, sizeof(sd_buf) - n, " %02X%02X%02X/%u",
+                          cset[k].rgb[j][0], cset[k].rgb[j][1], cset[k].rgb[j][2],
+                          (unsigned)cset[k].rate[j]);
+        n += snprintf(sd_buf + n, sizeof(sd_buf) - n, "\r\n");
+    }
+    if (f_open(&sd_fil, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return -2;
+    UINT bw = 0;
+    FRESULT r = f_write(&sd_fil, sd_buf, (UINT)n, &bw);
+    f_close(&sd_fil);
+    return (r == FR_OK && bw == (UINT)n) ? 0 : -3;
+}
+
+/* 「RRGGBB/割合」を 1 つ読む。読めなければ NULL */
+static const char *ParseEntry(const char *p, u8 rgb[3], u8 *rate)
+{
+    while (*p == ' ' || *p == '\t') p++;
+    u32 v = 0;
+    for (int i = 0; i < 6; i++, p++) {
+        const char ch = *p;
+        int d = (ch >= '0' && ch <= '9') ? ch - '0'
+              : (ch >= 'A' && ch <= 'F') ? ch - 'A' + 10
+              : (ch >= 'a' && ch <= 'f') ? ch - 'a' + 10 : -1;
+        if (d < 0) return NULL;
+        v = (v << 4) | (u32)d;
+    }
+    if (*p++ != '/') return NULL;
+    u32 w = 0;
+    if (*p < '0' || *p > '9') return NULL;
+    while (*p >= '0' && *p <= '9') w = w * 10 + (u32)(*p++ - '0');
+    rgb[0] = (u8)(v >> 16);  rgb[1] = (u8)(v >> 8);  rgb[2] = (u8)v;
+    *rate = (u8)((w > 100) ? 100 : w);
+    return p;
+}
+
+/* 戻り値: 読めた種類の数 (1 以上), -1 = SD が無い/読めない, -2 = ファイルが無い,
+ *         -3 = 読めない, -4 = 中身に種類の行が無い */
+static int SdLoad(int slot)
+{
+    char path[16];
+    if (SdMount() != 0) return -1;
+    SdPath(path, slot);
+    if (f_open(&sd_fil, path, FA_READ) != FR_OK) return -2;
+    UINT br = 0;
+    FRESULT r = f_read(&sd_fil, sd_buf, sizeof(sd_buf) - 1, &br);
+    f_close(&sd_fil);
+    if (r != FR_OK) return -3;
+    sd_buf[br] = '\0';
+
+    static KindColor tmp[NKINDS];          /* 途中で壊れた行があっても今の配色を壊さない */
+    memcpy(tmp, cset, sizeof(cset));
+    int got = 0;
+    char *s = sd_buf;
+    while (*s) {
+        char *e = s;
+        while (*e && *e != '\n') e++;
+        const char save = *e;
+        *e = '\0';
+        for (int k = 0; k < NKIND_EDIT && *s != '#'; k++) {
+            const size_t len = strlen(kind_name[k]);
+            if (strncmp(s, kind_name[k], len) != 0 || (s[len] != ' ' && s[len] != '\t')) continue;
+            const char *p = s + len;
+            KindColor kc;
+            int j;
+            for (j = 0; j < KCOLS && p; j++) p = ParseEntry(p, kc.rgb[j], &kc.rate[j]);
+            if (p) { tmp[k] = kc; got++; }
+            break;
+        }
+        *e = save;
+        s = (*e) ? e + 1 : e;
+    }
+    if (got == 0) return -4;
+    memcpy(cset, tmp, sizeof(cset));
+    snprintf(cset_name, sizeof(cset_name), "SLOT%d", slot);
+    return got;
+}
+
+/* ========== 配色エディタ (p キーで出す/閉じる) ==========
+ * 画面の操作一覧の代わりに出る。今の配色 cset[] を直接直すので、模様を見ながら決められる
+ * (次の描き直しから変わる)。色見本は出さない (画面の文字は白だけ)。
+ * 種類 → 色の番号 (1〜8) を選び、赤・緑・青と割合を増減する。
+ * エディタの中ではキーの意味が変わる (下の EditKey)。 */
+static int  ed_kind = 0;               /* 0 〜 NKIND_EDIT-1 */
+static int  ed_col  = 0;               /* 0 〜 KCOLS-1 */
+#define ED_RGB_STEP   8
+#define ED_RATE_STEP  5
+
+static void SdMessage(const char *what, int slot, int r)
+{
+    if (r >= 0) {
+        snprintf(ed_msg, sizeof(ed_msg), "%s %d", what, slot);
+        xil_printf("SD: %s KPAL%d.TXT\r\n", (what[0] == 'S') ? "保存した" : "読み込んだ", slot);
+        return;
+    }
+    const char *m = (r == -1) ? "NO SD" : (r == -2) ? "NO FILE" : (r == -4) ? "BAD FILE" : "SD ERROR";
+    snprintf(ed_msg, sizeof(ed_msg), "%s", m);
+    xil_printf("SD: KPAL%d.TXT  %s (%d)\r\n", slot, m, r);
+}
+
+static void ShowEdit(void)
+{
+    const KindColor *kc = &cset[ed_kind];
+    u32 sum = 0;
+    for (int j = 0; j < KCOLS; j++) sum += kc->rate[j];
+    xil_printf("配色 %s  %s  色 %d/%d  R %3d G %3d B %3d  割合 %3d (この種類の合計 %u)\r\n",
+               cset_name, kind_name[ed_kind], ed_col + 1, KCOLS,
+               kc->rgb[ed_col][0], kc->rgb[ed_col][1], kc->rgb[ed_col][2],
+               kc->rate[ed_col], (unsigned)sum);
+}
+
+static void ShowEditHelp(void)
+{
+    xil_printf("\r\n--- 配色エディタ (p で閉じる) ---\r\n");
+    xil_printf("  q w  種類 (BEAD S.BEAD GLASS GLITTER STONE HEX ROD BLOB MOON)\r\n");
+    xil_printf("  a s  色の番号 1〜%d\r\n", KCOLS);
+    xil_printf("  e d  赤 +/-   r f  緑 +/-   t g  青 +/-   (%d ずつ)\r\n", ED_RGB_STEP);
+    xil_printf("  y h  割合 +/- (%d%% ずつ。0 の色は使わない)\r\n", ED_RATE_STEP);
+    xil_printf("  c    組み込みの組を写す (今の直しは消える)\r\n");
+    xil_printf("  1〜4 SD の KPAL1〜4.TXT に保存   5〜8 KPAL1〜4.TXT を読み込む\r\n");
+    ShowEdit();
+}
+
+static int Clamp255(int v) { return (v < 0) ? 0 : (v > 255) ? 255 : v; }
+
+static void EditKey(int c)
+{
+    KindColor *kc = &cset[ed_kind];
+    u8 *rgb = kc->rgb[ed_col];
+    ed_msg[0] = '\0';
+    switch (c) {
+    case 'q': ed_kind = (ed_kind + NKIND_EDIT - 1) % NKIND_EDIT; break;
+    case 'w': ed_kind = (ed_kind + 1) % NKIND_EDIT;              break;
+    case 'a': ed_col  = (ed_col + KCOLS - 1) % KCOLS;            break;
+    case 's': ed_col  = (ed_col + 1) % KCOLS;                    break;
+    case 'e': rgb[0] = (u8)Clamp255(rgb[0] + ED_RGB_STEP); break;
+    case 'd': rgb[0] = (u8)Clamp255(rgb[0] - ED_RGB_STEP); break;
+    case 'r': rgb[1] = (u8)Clamp255(rgb[1] + ED_RGB_STEP); break;
+    case 'f': rgb[1] = (u8)Clamp255(rgb[1] - ED_RGB_STEP); break;
+    case 't': rgb[2] = (u8)Clamp255(rgb[2] + ED_RGB_STEP); break;
+    case 'g': rgb[2] = (u8)Clamp255(rgb[2] - ED_RGB_STEP); break;
+    case 'y': kc->rate[ed_col] = (u8)((kc->rate[ed_col] + ED_RATE_STEP > 100) ? 100
+                                      : kc->rate[ed_col] + ED_RATE_STEP); break;
+    case 'h': kc->rate[ed_col] = (u8)((kc->rate[ed_col] < ED_RATE_STEP) ? 0
+                                      : kc->rate[ed_col] - ED_RATE_STEP); break;
+    case 'c': LoadPreset((set_palette + 1) % NPALETTES); break;
+    case '1': case '2': case '3': case '4':
+        SdMessage("SAVED", c - '0', SdSave(c - '0'));
+        break;
+    case '5': case '6': case '7': case '8':
+        SdMessage("LOADED", c - '4', SdLoad(c - '4'));
+        break;
+    case 'p': ed_on = 0; UpdateText(); ShowHelp(); return;
+    case '?': ShowEditHelp(); return;      /* h は割合 - に使うので一覧は ? だけ */
+    default: xil_printf("(割り当て無し)\r\n"); return;
+    }
+    UpdateText();
+    ShowEdit();
 }
 
 static void WriteTable(void)
@@ -842,6 +1114,34 @@ static void TxtNum(int row, int col, int v)
     while (v > 0 && col >= 0) { txt[row][col--] = (char)('0' + v % 10); v /= 10; }
 }
 
+/* 配色エディタの画面 (32 桁 x 8 行)。p キーで操作一覧と入れ替わる */
+static void EditText(void)
+{
+    const KindColor *kc = &cset[ed_kind];
+    TxtPut(0, 0, "COLOR EDIT");
+    TxtPut(0, 11, cset_name);
+    TxtPut(0, 22, ed_msg);
+    TxtPut(1, 0, ">");
+    TxtPut(1, 2, kind_name[ed_kind]);
+    TxtPut(1, 11, "COLOR");  TxtNum(1, 17, ed_col + 1);  TxtPut(1, 18, "/8");
+    TxtPut(1, 22, "RATE");   TxtNum(1, 29, kc->rate[ed_col]);
+    static const char *const ch[3] = { "R", "G", "B" };
+    for (int i = 0; i < 3; i++) {
+        const int v = kc->rgb[ed_col][i];
+        TxtPut(2 + i, 2, ch[i]);
+        TxtNum(2 + i, 6, v);
+        for (int b = 0; b < (v + 8) / 16; b++) txt[2 + i][8 + b] = '#';    /* 0〜16 文字の棒 */
+    }
+    /* 8 色の割合を並べ、今の色に > を付ける */
+    TxtPut(5, 0, "%");
+    for (int j = 0; j < KCOLS; j++) {
+        TxtNum(5, 4 + j * 3, kc->rate[j]);
+        if (j == ed_col) txt[5][2 + j * 3] = '>';
+    }
+    TxtPut(6, 0, "QW KIND AS COL ED RF TG:RGB +-");
+    TxtPut(7, 0, "YH RATE C SET 1-4SV 5-8LD P END");
+}
+
 static void UpdateText(void)
 {
     int r, c, i;
@@ -849,6 +1149,10 @@ static void UpdateText(void)
     for (r = 0; r < TXT_ROWS; r++)
         for (c = 0; c < TXT_COLS; c++) txt[r][c] = ' ';
 
+    if (ed_on) {
+        EditText();
+        goto put;
+    }
     TxtPut(0, 6, "OIL KALEIDOSCOPE");
     /* 8 行しか無いので、段6 で増えたキーは 6・7 行目に 2 つずつ詰める */
     TxtPut(1, 2, "Q W   POINTS");  TxtNum(1, 24, set_points);
@@ -856,10 +1160,11 @@ static void UpdateText(void)
     TxtPut(3, 2, "A S   ZOOM");    TxtNum(3, 24, (int)(set_zoom * 100.0f + 0.5f));
     TxtPut(4, 2, "Z X   SPIN");    TxtNum(4, 24, (int)(set_autorotate * 100.0f + 0.5f));
     TxtPut(5, 2, "V B   THICK");   TxtNum(5, 24, (int)(set_viscosity * 100.0f + 0.5f));
-    TxtPut(6, 2, "E STIR    J L TURN");
+    TxtPut(6, 2, "E STIR  J L TURN  P EDIT");
     TxtPut(7, 2, "0 RESET I HIDE C");
-    TxtPut(7, 19, palettes[set_palette].name);
+    TxtPut(7, 19, cset_name);
 
+put:
     /* 4 文字ずつ 1 ワードにまとめて書く。下位バイトが左端の文字。
        txt は 2 次元配列なので行が隙間なく並んでいる。 */
     for (i = 0; i < TXT_COLS * TXT_ROWS / 4; i++) {
