@@ -11,7 +11,7 @@ ROM はテスト ROM (nestest / blargg) と、無料公開の自作ゲーム (NR
 | 段 | 内容 | 状態 |
 |---|---|---|
 | A | 画面バッファ 256x240 を 3 倍で HDMI に表示、I2S2 の固定トーン | sim PASS・合成前 |
-| B | 6502 CPU (公式命令)。nestest のログと 1 命令ずつ照合 | |
+| B | 6502 CPU (公式命令)。nestest のログと 1 命令ずつ照合 | sim で 5003 命令・サイクル数まで一致 |
 | C | CPU を実機へ。PRG を AXI で書き込み nestest を実行 | |
 | D | PPU (背景・スクロール・NMI・スプライト) | |
 | E | コントローラ ($4016) と UART キー | |
@@ -58,7 +58,10 @@ nes_axi_slave ── 単純なバス ──► rtl_top
 | `rtl/nes_palette.v` | 64 色の表 |
 | `rtl/vga_iface.v` ほか 2 本 | kv260_chip8 から流用 |
 | `rtl/i2s_tx.v`, `sine_lut.hex` | kv260_i2s2 から流用 |
+| `rtl/cpu6502.v` | 6502 CPU (サイクル数は実機と同じ、10 進モード無し) |
 | `sim/tb_stageA.v` | 段A の検証 |
+| `sim/tb_cpu_nestest.v` | 段B: nestest の正解ログと照合 |
+| `tools/nestest_prep.py` | nestest の ROM とログを hex に変換 (roms/ に置く) |
 | `sim/run_sim.sh` | `bash sim/run_sim.sh tb_stageA` |
 | `vivado.tcl` | プロジェクト生成・ビルド・XSA 出力 |
 | `vitis_src/main.c` | 段A の PS 側 |
@@ -70,6 +73,9 @@ bash sim/run_sim.sh tb_stageA
 ```
 
 AXI で ID 読み出し → 画面バッファ全体を書く → 映像 1 フレーム 921,600 画素を全部照合 → FRAME が増えるか。
+
+段B: `roms/` に nestest.nes と nestest.log を置き (christopherpow/nes-test-roms の other/)、
+`python tools/nestest_prep.py` → `bash sim/run_sim.sh tb_cpu_nestest`。
 
 ★ テストベンチで、連結式の中で同じ関数を何度も呼ぶと xsim では x になる。変数に受けてから組む。
 

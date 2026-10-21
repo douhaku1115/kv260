@@ -29,3 +29,5 @@ kv260_zephyr/*.txt
 kv260_nes/project_1/
 # xsim の作業場。sim/run_sim.sh で再生成できる
 kv260_nes/sim/simbuild/
+# テスト ROM と正解ログ。配布元から取得する (README 参照)
+kv260_nes/roms/
