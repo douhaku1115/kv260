@@ -160,6 +160,8 @@ static int  SdLoad(int slot);
 static void EditKey(int c);
 static void ShowEditHelp(void);
 static int  ed_on = 0;                 /* 配色エディタを出しているか (p キー) */
+static int  ed_kind = 0;               /* 直している種類 0 〜 NKIND_EDIT-1 */
+static int  ed_col  = 0;               /* 直している色の番号 0 〜 KCOLS-1 */
 static char ed_msg[12] = "";           /* 保存した・SD が無い などをエディタの 1 行目に出す */
 /* 物理演算の内訳の時間 (移動・押し合い・壁)。300 フレームぶん足して平均を出す */
 static XTime  t_move_sum, t_push_sum, t_wall_sum;
@@ -827,6 +829,14 @@ static void ApplyPalette(Part *p, int n)
     int j = 0;
     while (pick >= kc->rate[j]) { pick -= kc->rate[j]; j++; }
     const u8 *c = kc->rgb[j];
+    /* 配色エディタを開いている間は、直している種類・色のピースを点滅させる。
+     * 1 色だけ直しても目立たず「色が変わらない」と言われたため (2026-10-22)。
+     * 0.6 秒周期で、半分は元の色、半分は白か黒 (元の色が明るければ黒) */
+    if (ed_on && p->kind == ed_kind && j == ed_col && fmod(sim_time, 0.6) < 0.3) {
+        const u8 v = (c[0] + c[1] + c[2] > 384) ? 0 : 255;
+        p->col[0] = p->col[1] = p->col[2] = v;
+        return;
+    }
     double fr = p->seed * 7.3;
     fr -= floor(fr);
     const double jit = 0.88 + 0.20 * fr;
@@ -982,8 +992,6 @@ static int SdLoad(int slot)
  * (次の描き直しから変わる)。色見本は出さない (画面の文字は白だけ)。
  * 種類 → 色の番号 (1〜8) を選び、赤・緑・青と割合を増減する。
  * エディタの中ではキーの意味が変わる (下の EditKey)。 */
-static int  ed_kind = 0;               /* 0 〜 NKIND_EDIT-1 */
-static int  ed_col  = 0;               /* 0 〜 KCOLS-1 */
 #define ED_RGB_STEP   8
 #define ED_RATE_STEP  5
 
