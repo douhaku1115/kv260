@@ -31,3 +31,6 @@ kv260_nes/project_1/
 kv260_nes/sim/simbuild/
 # テスト ROM と正解ログ。配布元から取得する (README 参照)
 kv260_nes/roms/
+# 合成のログ (vivado.tcl を -log build.log で走らせたもの)
+kv260_nes/build.log
+kv260_nes/build.jou
