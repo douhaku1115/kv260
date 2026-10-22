@@ -3,6 +3,7 @@
   python tools/nestest_prep.py
 入力: roms/nestest.nes, roms/nestest.log
 出力: roms/nestest_prg.hex  PRG 16KB (1 行 1 バイト)
+      roms/nestest_chr.hex  CHR 8KB  (1 行 1 バイト)
       roms/nestest_exp.hex  公式命令の各行を 88bit に詰めたもの
                             {CYC[31:0], PC[15:0], A, X, Y, P, SP}
       照合は最初の非公式命令 ('*' 印) の手前まで。
@@ -22,6 +23,10 @@ prg = rom[16:16 + prg_banks * 16384]
 if len(prg) != 16384:
     sys.exit(f"PRG が 16KB でない ({len(prg)})")
 (ROMS / "nestest_prg.hex").write_text("".join(f"{b:02X}\n" for b in prg))
+chr_ = rom[16 + prg_banks * 16384:16 + prg_banks * 16384 + rom[5] * 8192]
+if len(chr_) != 8192:
+    sys.exit(f"CHR が 8KB でない ({len(chr_)})")
+(ROMS / "nestest_chr.hex").write_text("".join(f"{b:02X}\n" for b in chr_))
 
 pat = re.compile(r"^([0-9A-F]{4})  (.{8}) ([ *])\w{3}.*"
                  r"A:([0-9A-F]{2}) X:([0-9A-F]{2}) Y:([0-9A-F]{2}) P:([0-9A-F]{2}) SP:([0-9A-F]{2}).*CYC:(\d+)")

@@ -34,3 +34,5 @@ kv260_nes/roms/
 # 合成のログ (vivado.tcl を -log build.log で走らせたもの)
 kv260_nes/build.log
 kv260_nes/build.jou
+# NES: ROM を埋め込んだヘッダ (tools/rom2c.py が作る)
+kv260_nes/vitis_src/rom_data.h

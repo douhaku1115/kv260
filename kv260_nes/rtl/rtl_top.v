@@ -8,12 +8,22 @@
 // 音は Pmod I2S2 (J2) へ。段A は i2s_tx の固定トーン (約 762Hz) で配線確認だけ。
 //
 // 【AXI マップ (ベース 0xA0000000, 256KB)】 レジスタは 0x10 刻み
-//   0x00000 CTRL  (RW) 段A では未使用 (段C で NES リセット解除に使う)
+//   0x00000 CTRL  (RW) bit0=1 で CPU 実行 (0 でリセット保持) / bit1=1 で PRG 16KB 折り返し
+//                      bit2=1 でネームテーブル垂直ミラー (0 = 水平)
 //   0x00010 ID    (R)  0x4E455301 ("NES" + 版)。AXI が届いているかの確認用
-//   0x00020 PAD   (RW) コントローラ (段E)
+//   0x00020 PAD   (RW) コントローラ 1。1 = 押下
+//                      [0]A [1]B [2]Select [3]Start [4]上 [5]下 [6]左 [7]右
 //   0x00030 FRAME (R)  映像のフレーム数 (60Hz で増える)。映像クロックの生存確認
+//   0x00040 PC    (R)  CPU の PC (観測用)
+//   0x00050 CYC   (R)  CPU の経過サイクル数 (CTRL bit0=0 で 0 に戻る)
+//   0x00060 PFRM  (R)  PPU のフレーム数 (VBlank に入った回数)
+//   0x08000-0x09FFC WRAM (R) 内蔵 RAM。1 語 = 1 バイト ([7:0])、番地 = $0000 + n
 //   0x10000-0x1EFFC FB (W) 画面バッファ。語番号 = y*64 + x/4、1 語 = 横 4 画素
 //                    データ [5:0]=x, [13:8]=x+1, [21:16]=x+2, [29:24]=x+3 (色番号)
+//   0x20000-0x27FFC PRG (W) 1 語 = 4 バイト ([7:0] が若い番地)。CPU 停止中に書く
+//   0x30000-0x37FFC CHR (W) 1 語 = 1 バイト ([7:0])、番地 = $0000 + n。CPU 停止中に書く
+//
+// 画面バッファは PPU が 1 画素ずつ書く。PS からの FB 書き込みは PPU が書かないクロックだけ通る。
 
 module rtl_top
   (
@@ -58,6 +68,43 @@ module rtl_top
 
   wire wr_reg = bus_wr_en && (bus_wr_addr[17:16] == 2'b00);
   wire wr_fb  = bus_wr_en && (bus_wr_addr[17:16] == 2'b01);
+  wire wr_prg = bus_wr_en && (bus_wr_addr[17:15] == 3'b100);
+  wire wr_chr = bus_wr_en && (bus_wr_addr[17:15] == 3'b110);
+
+  // NES 本体
+  wire [15:0] cpu_pc;
+  wire [31:0] cpu_cycles;
+  wire [7:0]  wram_rdata;
+  wire        pix_we;
+  wire [7:0]  pix_x, pix_y;
+  wire [5:0]  pix_c;
+  wire [31:0] ppu_frames;
+
+  nes_core core
+    (
+     .clk        (clk),
+     .run        (reg_ctrl[0]),
+     .prg16      (reg_ctrl[1]),
+     .mirror_v   (reg_ctrl[2]),
+     .pad        (reg_pad[7:0]),
+     .chr_we     (wr_chr),
+     .chr_waddr  (bus_wr_addr[14:2]),
+     .chr_wdata  (bus_wr_data[7:0]),
+     .pix_we     (pix_we),
+     .pix_x      (pix_x),
+     .pix_y      (pix_y),
+     .pix_c      (pix_c),
+     .ppu_frames (ppu_frames),
+     .prg_we     (wr_prg),
+     .prg_waddr  (bus_wr_addr[14:2]),
+     .prg_wdata  (bus_wr_data),
+     .wram_raddr (bus_rd_addr[12:2]),
+     .wram_rdata (wram_rdata),
+     .dbg_pc     (cpu_pc),
+     .cpu_cycles (cpu_cycles),
+     .cpu_sync   (),
+     .cpu_addr   ()
+     );
 
   always @(posedge clk) begin
     if (reset) begin
@@ -72,14 +119,21 @@ module rtl_top
     end
   end
 
+  // 読み: WRAM は nes_core 内で 1 拍遅れ、ここでさらに 1 拍 (nes_axi_slave は 3 拍待つ)
   always @(posedge clk) begin
-    case (bus_rd_addr[7:4])
-      4'h0: bus_rd_data <= reg_ctrl;
-      4'h1: bus_rd_data <= NES_ID;
-      4'h2: bus_rd_data <= reg_pad;
-      4'h3: bus_rd_data <= frame_cnt;
-      default: bus_rd_data <= 32'd0;
-    endcase
+    if (bus_rd_addr[17:13] == 5'b00100)
+      bus_rd_data <= {24'd0, wram_rdata};
+    else
+      case (bus_rd_addr[7:4])
+        4'h0: bus_rd_data <= reg_ctrl;
+        4'h1: bus_rd_data <= NES_ID;
+        4'h2: bus_rd_data <= reg_pad;
+        4'h3: bus_rd_data <= frame_cnt;
+        4'h4: bus_rd_data <= {16'd0, cpu_pc};
+        4'h5: bus_rd_data <= cpu_cycles;
+        4'h6: bus_rd_data <= ppu_frames;
+        default: bus_rd_data <= 32'd0;
+      endcase
   end
 
   // ------------------------------------------------------------
@@ -88,13 +142,18 @@ module rtl_top
   wire [13:0] fb_raddr;
   wire [23:0] fb_rdata;
 
+  // PPU の 1 画素書き (優先) と PS の 4 画素書き
+  wire        axi_fb_we = wr_fb && (bus_wr_addr[15:2] < 14'd15360);
+  wire [3:0]  pix_mask  = 4'b0001 << pix_x[1:0];
+
   nes_fb fb0
     (
      .clk   (clk),
-     .we    (wr_fb && (bus_wr_addr[15:2] < 14'd15360)),
-     .wmask (4'hF),
-     .waddr (bus_wr_addr[15:2]),
-     .wdata ({bus_wr_data[29:24], bus_wr_data[21:16], bus_wr_data[13:8], bus_wr_data[5:0]}),
+     .we    (pix_we | axi_fb_we),
+     .wmask (pix_we ? pix_mask : 4'hF),
+     .waddr (pix_we ? {pix_y, pix_x[7:2]} : bus_wr_addr[15:2]),
+     .wdata (pix_we ? {4{pix_c}}
+                    : {bus_wr_data[29:24], bus_wr_data[21:16], bus_wr_data[13:8], bus_wr_data[5:0]}),
      .clkv  (clkv),
      .raddr (fb_raddr),
      .rdata (fb_rdata)

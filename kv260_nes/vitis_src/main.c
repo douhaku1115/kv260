@@ -1,18 +1,27 @@
 /* ============================================================
- * KV260 NES 段A: 画面バッファ表示の確認
+ * KV260 NES 段E: ROM を読み込んで動かし、UART のキーで操作する
  * ============================================================
  *
- * PL の NES 画面バッファ (256x240, 1 画素 = 6bit の色番号) に PS から
- * 色見本を書き、HDMI に 3 倍 (768x720) で映るかを見る。
- * 同時に Pmod I2S2 (J2) から約 762Hz の固定トーンが鳴る (PL だけで鳴らす)。
+ * CPU・PPU は PL にある。PS の仕事は
+ *   1. HDMI の初期化 (InitDP / RunDP)
+ *   2. CPU を止めたまま PRG / CHR を AXI で PL に書き、実行させる
+ *   3. UART のキーをコントローラの押下状態にして PAD に書く (約 60Hz)
+ * ROM は vitis_src/rom_data.h (python tools/rom2c.py ROM.nes で作る、NROM のみ)。
+ *
+ * キー:  x / k = A     z / j = B     スペース = Select   Enter = Start
+ *        矢印 / w a s d = 上下左右    r = リセット
+ * UART は「押した」しか届かないので、押したら KEY_HOLD_FRAMES フレーム押しっぱなしにする。
+ * 押し続けると端末のキーリピートで保持が延びる。
  *
  * AXI マップ (0xA0000000, 256KB)。レジスタは 0x10 刻み:
- *   0x00000 CTRL  (RW)  段C で使う
+ *   0x00000 CTRL  (RW)  bit0=1 実行 (0 でリセット保持) / bit2=1 垂直ミラー
  *   0x00010 ID    (R)   0x4E455301
- *   0x00020 PAD   (RW)  段E で使う
+ *   0x00020 PAD   (RW)  [0]A [1]B [2]Select [3]Start [4]上 [5]下 [6]左 [7]右 (1 = 押下)
  *   0x00030 FRAME (R)   映像のフレーム数
- *   0x10000〜     FB    (W)  語番号 = y*64 + x/4、1 語 = 横 4 画素
- *                       [5:0]=x, [13:8]=x+1, [21:16]=x+2, [29:24]=x+3
+ *   0x00040 PC    (R)   CPU の PC
+ *   0x00060 PFRM  (R)   PPU のフレーム数
+ *   0x20000〜     PRG   (W)  1 語 = 4 バイト
+ *   0x30000〜     CHR   (W)  1 語 = 1 バイト
  */
 
 #include "xil_printf.h"
@@ -22,8 +31,13 @@
 #include "xdppsu.h"
 #include "xavbuf.h"
 #include "xavbuf_clk.h"
+#include "xuartps_hw.h"
 #include "sleep.h"
 #include <stdint.h>
+#include "rom_data.h"
+
+#define UART_BASE        0xFF010000U   /* KV260 USB-UART = UART_1 */
+#define KEY_HOLD_FRAMES  12            /* キー 1 回でボタンを押しておくフレーム数 */
 
 #ifndef SDT
 #define DPPSU_DEVICE_ID   XPAR_PSU_DP_DEVICE_ID
@@ -40,10 +54,23 @@
 #define NES_ID       (NES_BASE + 0x00010)
 #define NES_PAD      (NES_BASE + 0x00020)
 #define NES_FRAME    (NES_BASE + 0x00030)
-#define NES_FB       (NES_BASE + 0x10000)
+#define NES_PC       (NES_BASE + 0x00040)
+#define NES_PFRM     (NES_BASE + 0x00060)
+#define NES_PRG      (NES_BASE + 0x20000)
+#define NES_CHR      (NES_BASE + 0x30000)
 
-#define NES_W  256
-#define NES_H  240
+#define CTRL_RUN     0x1U
+#define CTRL_MIRV    0x4U
+
+/* PAD のビット */
+#define BTN_A      0x01
+#define BTN_B      0x02
+#define BTN_SELECT 0x04
+#define BTN_START  0x08
+#define BTN_UP     0x10
+#define BTN_DOWN   0x20
+#define BTN_LEFT   0x40
+#define BTN_RIGHT  0x80
 
 typedef enum { LINK_RATE_270 = 0x0A } LinkRate_t;
 
@@ -55,26 +82,41 @@ static void RunDP(void);
 static void SetupVideoStream(void);
 static u32  TrainLink(void);
 
-/* 色見本の 1 画素: 色番号 (0〜63) を返す
- *   外周 1 画素 = 白 (0x30)。NES 画面の端が欠けずに映っているかを見る
- *   内側 = 横 16 列 x 縦 4 段で 64 色を全部並べる (列 = 下位 4bit, 段 = 上位 2bit) */
-static uint32_t test_color(int x, int y)
+/* UART 1 文字ノンブロッキング読み込み (-1 if empty) */
+static int uart_getchar_nb(void)
 {
-    if (x == 0 || x == NES_W - 1 || y == 0 || y == NES_H - 1) return 0x30;
-    return (uint32_t)(((y / 60) << 4) | (x / 16));
+    u32 sr = XUartPs_ReadReg(UART_BASE, XUARTPS_SR_OFFSET);
+    if (sr & XUARTPS_SR_RXEMPTY) return -1;
+    return (int)(XUartPs_ReadReg(UART_BASE, XUARTPS_FIFO_OFFSET) & 0xFF);
 }
 
-/* 画面バッファ全体に色見本を書く (1 語 = 横 4 画素) */
-static void fb_draw_test(void)
+/* CPU を止めて ROM を書き、走らせ直す (CPU が止まっている間に書く約束) */
+static void nes_load_and_run(void)
 {
-    for (int y = 0; y < NES_H; y++) {
-        for (int x = 0; x < NES_W; x += 4) {
-            uint32_t w = test_color(x, y)
-                       | (test_color(x + 1, y) << 8)
-                       | (test_color(x + 2, y) << 16)
-                       | (test_color(x + 3, y) << 24);
-            Xil_Out32(NES_FB + (uint32_t)((y * 64 + x / 4) * 4), w);
-        }
+    u32 ctrl = ROM_MIRROR_V ? CTRL_MIRV : 0;
+    Xil_Out32(NES_CTRL, ctrl);                          /* bit0=0: リセット保持 */
+    for (int i = 0; i < 32768; i += 4)
+        Xil_Out32(NES_PRG + (u32)i,
+                  rom_prg[i] | (rom_prg[i + 1] << 8) | (rom_prg[i + 2] << 16) | ((u32)rom_prg[i + 3] << 24));
+    for (int i = 0; i < 8192; i++)
+        Xil_Out32(NES_CHR + (u32)i * 4, rom_chr[i]);
+    Xil_Out32(NES_PAD, 0);
+    Xil_Out32(NES_CTRL, ctrl | CTRL_RUN);
+}
+
+/* キーボード文字 → ボタン (対応なしは 0) */
+static int map_key(int c)
+{
+    switch (c) {
+    case 'x': case 'k': return BTN_A;
+    case 'z': case 'j': return BTN_B;
+    case ' ':           return BTN_SELECT;
+    case '\r': case '\n': return BTN_START;
+    case 'w': return BTN_UP;
+    case 's': return BTN_DOWN;
+    case 'a': return BTN_LEFT;
+    case 'd': return BTN_RIGHT;
+    default:  return 0;
     }
 }
 
@@ -83,7 +125,7 @@ int main(void)
     Xil_DCacheDisable();
     Xil_ICacheDisable();
 
-    xil_printf("\r\n==== KV260 NES stage A ====\r\n");
+    xil_printf("\r\n==== KV260 NES stage E ====\r\n");
 
     /* AXI が届いているか: ID を読む */
     u32 id = Xil_In32(NES_ID);
@@ -93,19 +135,50 @@ int main(void)
     sleep(1);
     RunDP();
 
-    /* 映像クロックが PL に来ているか: 1 秒でフレーム数が約 60 増えるか */
-    u32 f0 = Xil_In32(NES_FRAME);
-    sleep(1);
-    u32 f1 = Xil_In32(NES_FRAME);
-    xil_printf("FRAME %u -> %u (+%u, expect about 60)\r\n", f0, f1, f1 - f0);
+    nes_load_and_run();
+    xil_printf("ROM %s loaded (%s mirror)\r\n", ROM_NAME, ROM_MIRROR_V ? "vertical" : "horizontal");
+    xil_printf("keys: x/k=A z/j=B space=Select Enter=Start arrows/wasd=dir r=reset\r\n");
 
-    fb_draw_test();
-    xil_printf("test pattern written: 64 colors (16 x 4) + white border\r\n");
-    xil_printf("I2S2 (J2): about 762Hz tone should be playing\r\n");
+    int hold[8] = {0};     /* ボタンごとの残りフレーム数 */
+    int esc = 0;           /* 矢印キー ESC [ A〜D の読み途中 (0=なし 1=ESC 2=ESC[) */
+    int n = 0;
 
+    /* 約 60Hz */
     while (1) {
-        sleep(5);
-        xil_printf("FRAME %u\r\n", Xil_In32(NES_FRAME));
+        int c;
+        while ((c = uart_getchar_nb()) >= 0) {
+            int b = 0;
+            if (esc == 1) { esc = (c == '[') ? 2 : 0; continue; }
+            if (esc == 2) {
+                esc = 0;
+                if      (c == 'A') b = BTN_UP;
+                else if (c == 'B') b = BTN_DOWN;
+                else if (c == 'C') b = BTN_RIGHT;
+                else if (c == 'D') b = BTN_LEFT;
+            } else if (c == 0x1B) {
+                esc = 1; continue;
+            } else if (c == 'r') {
+                nes_load_and_run();
+                for (int i = 0; i < 8; i++) hold[i] = 0;
+                xil_printf("reset\r\n");
+                continue;
+            } else
+                b = map_key(c);
+            for (int i = 0; i < 8; i++)
+                if (b & (1 << i)) hold[i] = KEY_HOLD_FRAMES;
+        }
+
+        u32 pad = 0;
+        for (int i = 0; i < 8; i++)
+            if (hold[i] > 0) { pad |= 1U << i; hold[i]--; }
+        Xil_Out32(NES_PAD, pad);
+
+        /* 5 秒ごとに生存確認 (CPU の PC と PPU のフレーム数) */
+        if (++n == 300) {
+            n = 0;
+            xil_printf("PC=%04x PFRM=%u\r\n", Xil_In32(NES_PC), Xil_In32(NES_PFRM));
+        }
+        usleep(16667);
     }
     return 0;
 }
