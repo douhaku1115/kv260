@@ -59,12 +59,18 @@
 #define KAL_SPK_K     (KAL_BASE + 0x1C0)
 #define KAL_SPK_GAIN  (KAL_BASE + 0x1D0)
 #define KAL_SPK_TIME  (KAL_BASE + 0x1E0)
+/* 点の色の表 16 個 {R,G,B} (段7b)。点ごとにハッシュで 1 つ選ばれる。
+ * PS は配色エディタの SPARK の 8 色を、割合に応じて 16 個へ振り分けて書く (SpkColors) */
+#define KAL_SPK_COL(i) (KAL_BASE + 0x1F0 + (i)*0x10)
+#define SPK_NCOL      16
 #define SPK_GAP_PX    7.0     /* 点と点の間隔のめやす [画面の画素] */
-#define SPK_DOT_PX    0.75    /* 点の半径のめやす [画面の画素] */
-#define SPK_DENS      115     /* 0.45 * 256 */
-#define SPK_BASE      26      /* 0.2 * 128 */
-#define SPK_FLASH     205     /* 1.6 * 128 */
+#define SPK_BASE      26      /* 明るさ 100% のときの base (0.2 * 128) */
+#define SPK_FLASH     205     /* 明るさ 100% のときの flash (1.6 * 128) */
 #define SPK_SPEED     2.0     /* 光る速さ [rad/s] */
+/* 量・明るさ・大きさ。配色エディタで SPARK を選んで u j / i k / o l で変える */
+static int spk_amount = 45;   /* 点がある格子の割合 [%] 0〜100 */
+static int spk_bright = 100;  /* 明るさ [%] 0〜200 */
+static int spk_size   = 75;   /* 点の半径 [画面の画素 x100] 50〜200。50 未満は k が 16bit をあふれる */
 #define CELL_SEL_TABLE 2
 #define PIECE_WORDS    24
 /* 画面に出す文字。1 ワードに 4 文字、下位バイトが左。32桁 x 8行 = 64 ワード */
@@ -143,24 +149,29 @@ typedef struct {
     u8 rgb[KCOLS][3];
     u8 rate[KCOLS];
 } KindColor;
-static KindColor cset[NKINDS];
+#define KIND_SPARK    NKINDS           /* きらめき層の点 (ピースではない)。cset[] の最後 */
+#define NCSET         (NKINDS + 1)
+static KindColor cset[NCSET];
 static char      cset_name[12] = "ORIGINAL";      /* 画面に出す名前 (組の名前か SLOTn) */
 /* 画面に出す種類の名前 (英字 7 文字まで)。気泡は色を変えないので編集の対象外 */
-static const char *const kind_name[NKINDS] = {
-    "BEAD", "S.BEAD", "GLASS", "GLITTER", "STONE", "HEX", "ROD", "BLOB", "MOON", "BUBBLE"
+static const char *const kind_name[NCSET] = {
+    "BEAD", "S.BEAD", "GLASS", "GLITTER", "STONE", "HEX", "ROD", "BLOB", "MOON", "BUBBLE", "SPARK"
 };
 #define KIND_BEAD     0
 #define KIND_SBEAD    1
 #define KIND_GLITTER  3
 #define KIND_BUBBLE   (NKINDS - 1)
-#define NKIND_EDIT    (NKINDS - 1)
+#define NKIND_EDIT    (NKINDS - 1)     /* 色を直せるピースの種類の数 (気泡を除く) */
+/* 配色エディタで直せるか (気泡だけ除く。SPARK は直せる) */
+#define KIND_EDITABLE(k)  ((k) != KIND_BUBBLE)
 static void LoadPreset(int n);
+static void SpkColors(void);
 static int  SdSave(int slot);
 static int  SdLoad(int slot);
 static void EditKey(int c);
 static void ShowEditHelp(void);
 static int  ed_on = 0;                 /* 配色エディタを出しているか (p キー) */
-static int  ed_kind = 0;               /* 直している種類 0 〜 NKIND_EDIT-1 */
+static int  ed_kind = 0;               /* 直している種類 (cset[] の番号。気泡は飛ばす) */
 static int  ed_col  = 0;               /* 直している色の番号 0 〜 KCOLS-1 */
 static char ed_msg[12] = "";           /* 保存した・SD が無い などをエディタの 1 行目に出す */
 /* 物理演算の内訳の時間 (移動・押し合い・壁)。300 フレームぶん足して平均を出す */
@@ -446,7 +457,7 @@ static void HandleKey(int c)
     case 'i': set_text_on = !set_text_on; break;
 
     /* 色の組み合わせ。次の描き直しから変わる */
-    case 'c': LoadPreset((set_palette + 1) % NPALETTES); break;
+    case 'c': LoadPreset((set_palette + 1) % NPALETTES); SpkSet(); break;
 
     /* 配色エディタを出す */
     case 'p': ed_on = 1; ed_msg[0] = '\0'; UpdateText(); ShowEditHelp(); return;
@@ -454,6 +465,7 @@ static void HandleKey(int c)
     case '0':
         set_points = 8; set_mirror2 = 0; set_zoom = 1.0f; set_autorotate = 0.35f;
         set_viscosity = 0.5f;  LoadPreset(0);
+        spk_amount = 45;  spk_bright = 100;  spk_size = 75;    /* SpkSet は KalSetGeometry から */
         geom = 1;
         break;
     case 'h': case '?': ShowHelp(); return;
@@ -829,10 +841,12 @@ static void ApplyPalette(Part *p, int n)
     int j = 0;
     while (pick >= kc->rate[j]) { pick -= kc->rate[j]; j++; }
     const u8 *c = kc->rgb[j];
-    /* 配色エディタを開いている間は、直している種類・色のピースを点滅させる。
+    /* 配色エディタを開いている間は、直している種類のピースを全部点滅させる。
      * 1 色だけ直しても目立たず「色が変わらない」と言われたため (2026-10-22)。
+     * 最初は直している色のピースだけ点滅させたが、ガラスでも約 20 個しかなく
+     * 「どこか分からない」と言われたので種類ごとにした。
      * 0.6 秒周期で、半分は元の色、半分は白か黒 (元の色が明るければ黒) */
-    if (ed_on && p->kind == ed_kind && j == ed_col && fmod(sim_time, 0.6) < 0.3) {
+    if (ed_on && p->kind == ed_kind && fmod(sim_time, 0.6) < 0.3) {
         const u8 v = (c[0] + c[1] + c[2] > 384) ? 0 : 255;
         p->col[0] = p->col[1] = p->col[2] = v;
         return;
@@ -847,7 +861,8 @@ static void ApplyPalette(Part *p, int n)
 }
 
 /* 組み込みの組 n を今の配色 cset[] へ写す。ORIGINAL は kind_orig[] (生成したときの色)。
- * それ以外は palettes[] の 3 つの並びを種類に割り振り、割合は等分する */
+ * それ以外は palettes[] の 3 つの並びを種類に割り振り、割合は等分する。
+ * きらめき層の点 (SPARK) は、ORIGINAL なら段7 の白・金・淡い青 (2:1:1)、それ以外はラメの並び */
 static void LoadPreset(int n)
 {
     for (int k = 0; k < NKINDS; k++)
@@ -855,6 +870,18 @@ static void LoadPreset(int n)
             for (int i = 0; i < 3; i++) cset[k].rgb[j][i] = kind_orig[k][j][i];
             cset[k].rate[j] = kind_orig[k][j][3];
         }
+    static const u8 spk_orig[3][4] = { {255, 255, 255, 50}, {255, 224, 140, 25}, {191, 217, 255, 25} };
+    KindColor *sk = &cset[KIND_SPARK];
+    for (int j = 0; j < KCOLS; j++) {
+        for (int i = 0; i < 3; i++) sk->rgb[j][i] = (j < 3) ? spk_orig[j][i] : 0;
+        sk->rate[j] = (j < 3) ? spk_orig[j][3] : 0;
+    }
+    if (n > 0) {
+        for (int j = 0; j < KCOLS; j++) {
+            for (int i = 0; i < 3; i++) sk->rgb[j][i] = palettes[n].glit[j % 4][i];
+            sk->rate[j] = (j < 4) ? 25 : 0;
+        }
+    }
     if (n > 0) {
         const Palette *pl = &palettes[n];
         for (int k = 0; k < NKIND_EDIT; k++) {
@@ -881,6 +908,8 @@ static void LoadPreset(int n)
  *     # KV260 kaleidoscope colors (JEWEL)
  *     BEAD FFFFFF/25 FFD778/25 FF96AA/25 96DCFF/25 000000/0 000000/0 000000/0 000000/0
  *     S.BEAD ...
+ *     SPARK ...                  (きらめき層の点。段7b)
+ *     SPKPARAM 45 100 75         (きらめき層の量 [%]・明るさ [%]・大きさ [画素 x100])
  * 1 行 = 種類の名前 + 「色 (RRGGBB の 16 進)/割合 [%]」が 8 つ。書いていない種類は今の色のまま。
  * SD を挿し替えても追従するように、保存・読み込みのたびにつなぎ直す。
  * 書き込み・読み込みは数 ms〜数十 ms かかるので、その間は映像の歩調から外れる (キーを押したときだけ) */
@@ -908,7 +937,8 @@ static int SdSave(int slot)
     int n = snprintf(sd_buf, sizeof(sd_buf),
                      "# KV260 kaleidoscope colors (%s)\r\n# kind  RRGGBB/rate[%%] x %d\r\n",
                      cset_name, KCOLS);
-    for (int k = 0; k < NKIND_EDIT; k++) {
+    for (int k = 0; k < NCSET; k++) {
+        if (!KIND_EDITABLE(k)) continue;
         n += snprintf(sd_buf + n, sizeof(sd_buf) - n, "%s", kind_name[k]);
         for (int j = 0; j < KCOLS; j++)
             n += snprintf(sd_buf + n, sizeof(sd_buf) - n, " %02X%02X%02X/%u",
@@ -916,6 +946,9 @@ static int SdSave(int slot)
                           (unsigned)cset[k].rate[j]);
         n += snprintf(sd_buf + n, sizeof(sd_buf) - n, "\r\n");
     }
+    /* きらめき層の量 [%]・明るさ [%]・大きさ [画素 x100] */
+    n += snprintf(sd_buf + n, sizeof(sd_buf) - n, "SPKPARAM %d %d %d\r\n",
+                  spk_amount, spk_bright, spk_size);
     if (f_open(&sd_fil, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return -2;
     UINT bw = 0;
     FRESULT r = f_write(&sd_fil, sd_buf, (UINT)n, &bw);
@@ -959,7 +992,7 @@ static int SdLoad(int slot)
     if (r != FR_OK) return -3;
     sd_buf[br] = '\0';
 
-    static KindColor tmp[NKINDS];          /* 途中で壊れた行があっても今の配色を壊さない */
+    static KindColor tmp[NCSET];           /* 途中で壊れた行があっても今の配色を壊さない */
     memcpy(tmp, cset, sizeof(cset));
     int got = 0;
     char *s = sd_buf;
@@ -968,7 +1001,24 @@ static int SdLoad(int slot)
         while (*e && *e != '\n') e++;
         const char save = *e;
         *e = '\0';
-        for (int k = 0; k < NKIND_EDIT && *s != '#'; k++) {
+        if (strncmp(s, "SPKPARAM ", 9) == 0) {           /* きらめき層の量・明るさ・大きさ */
+            int v[3], i = 0;
+            const char *p = s + 9;
+            while (i < 3) {
+                while (*p == ' ') p++;
+                if (*p < '0' || *p > '9') break;
+                v[i] = 0;
+                while (*p >= '0' && *p <= '9') v[i] = v[i] * 10 + (*p++ - '0');
+                i++;
+            }
+            if (i == 3) {
+                spk_amount = (v[0] > 100) ? 100 : v[0];
+                spk_bright = (v[1] > 200) ? 200 : v[1];
+                spk_size   = (v[2] < 50) ? 50 : (v[2] > 200) ? 200 : v[2];
+            }
+        }
+        for (int k = 0; k < NCSET && *s != '#'; k++) {
+            if (!KIND_EDITABLE(k)) continue;
             const size_t len = strlen(kind_name[k]);
             if (strncmp(s, kind_name[k], len) != 0 || (s[len] != ' ' && s[len] != '\t')) continue;
             const char *p = s + len;
@@ -1016,15 +1066,20 @@ static void ShowEdit(void)
                cset_name, kind_name[ed_kind], ed_col + 1, KCOLS,
                kc->rgb[ed_col][0], kc->rgb[ed_col][1], kc->rgb[ed_col][2],
                kc->rate[ed_col], (unsigned)sum);
+    if (ed_kind == KIND_SPARK)
+        xil_printf("  きらめき層  量 %d%%  明るさ %d%%  大きさ %d (半径 x100 画素)\r\n",
+                   spk_amount, spk_bright, spk_size);
 }
 
 static void ShowEditHelp(void)
 {
     xil_printf("\r\n--- 配色エディタ (p で閉じる) ---\r\n");
-    xil_printf("  q w  種類 (BEAD S.BEAD GLASS GLITTER STONE HEX ROD BLOB MOON)\r\n");
+    xil_printf("  q w  種類 (BEAD S.BEAD GLASS GLITTER STONE HEX ROD BLOB MOON SPARK)\r\n");
+    xil_printf("       選んだ種類のピースが点滅する。SPARK はきらめき層の点 (点が消えたり出たりする)\r\n");
     xil_printf("  a s  色の番号 1〜%d\r\n", KCOLS);
     xil_printf("  e d  赤 +/-   r f  緑 +/-   t g  青 +/-   (%d ずつ)\r\n", ED_RGB_STEP);
     xil_printf("  y h  割合 +/- (%d%% ずつ。0 の色は使わない)\r\n", ED_RATE_STEP);
+    xil_printf("  SPARK のとき  u j  量 +/-   i k  明るさ +/-   o l  大きさ +/-\r\n");
     xil_printf("  c    組み込みの組を写す (今の直しは消える)\r\n");
     xil_printf("  1〜4 SD の KPAL1〜4.TXT に保存   5〜8 KPAL1〜4.TXT を読み込む\r\n");
     ShowEdit();
@@ -1032,14 +1087,29 @@ static void ShowEditHelp(void)
 
 static int Clamp255(int v) { return (v < 0) ? 0 : (v > 255) ? 255 : v; }
 
+/* 直せる種類を dir (+1/-1) 方向に 1 つ進める。気泡は飛ばす */
+static int NextKind(int k, int dir)
+{
+    do { k = (k + dir + NCSET) % NCSET; } while (!KIND_EDITABLE(k));
+    return k;
+}
+
 static void EditKey(int c)
 {
     KindColor *kc = &cset[ed_kind];
     u8 *rgb = kc->rgb[ed_col];
+    const int spk = (ed_kind == KIND_SPARK);
     ed_msg[0] = '\0';
     switch (c) {
-    case 'q': ed_kind = (ed_kind + NKIND_EDIT - 1) % NKIND_EDIT; break;
-    case 'w': ed_kind = (ed_kind + 1) % NKIND_EDIT;              break;
+    case 'q': ed_kind = NextKind(ed_kind, -1); break;
+    case 'w': ed_kind = NextKind(ed_kind, +1); break;
+    /* きらめき層の量・明るさ・大きさ (SPARK を選んでいるときだけ) */
+    case 'u': if (spk && spk_amount < 100) spk_amount += 5;  break;
+    case 'j': if (spk && spk_amount > 0)   spk_amount -= 5;  break;
+    case 'i': if (spk && spk_bright < 200) spk_bright += 10; break;
+    case 'k': if (spk && spk_bright > 0)   spk_bright -= 10; break;
+    case 'o': if (spk && spk_size < 200)   spk_size   += 25; break;
+    case 'l': if (spk && spk_size > 50)    spk_size   -= 25; break;
     case 'a': ed_col  = (ed_col + KCOLS - 1) % KCOLS;            break;
     case 's': ed_col  = (ed_col + 1) % KCOLS;                    break;
     case 'e': rgb[0] = (u8)Clamp255(rgb[0] + ED_RGB_STEP); break;
@@ -1063,6 +1133,7 @@ static void EditKey(int c)
     case '?': ShowEditHelp(); return;      /* h は割合 - に使うので一覧は ? だけ */
     default: xil_printf("(割り当て無し)\r\n"); return;
     }
+    SpkSet();                              /* きらめき層の色・量・明るさ・大きさ (COMMIT は下の UpdateText) */
     UpdateText();
     ShowEdit();
 }
@@ -1147,7 +1218,14 @@ static void EditText(void)
         if (j == ed_col) txt[5][2 + j * 3] = '>';
     }
     TxtPut(6, 0, "QW KIND AS COL ED RF TG:RGB +-");
-    TxtPut(7, 0, "YH RATE C SET 1-4SV 5-8LD P END");
+    if (ed_kind == KIND_SPARK) {
+        /* きらめき層は量・明るさ・大きさも出す (キーの一覧は ? でシリアルに) */
+        TxtPut(7, 0, "UJ AMT");   TxtNum(7, 9, spk_amount);
+        TxtPut(7, 11, "IK BRT");  TxtNum(7, 20, spk_bright);
+        TxtPut(7, 22, "OL SZ");   TxtNum(7, 30, spk_size);
+    } else {
+        TxtPut(7, 0, "YH RATE C SET 1-4SV 5-8LD P END");
+    }
 }
 
 static void UpdateText(void)
@@ -1244,7 +1322,10 @@ static void KalSetGeometry(void)
 /* ========== きらめき層の設定 ==========
  * tools/sparkle_fx.py の params_for_zoom() と同じ式。模様の大きさ (zoom) が変わると
  * 画面 1 画素ぶんの c が変わるので、格子の細かさ lv と点の大きさ k を取り直す。
- * 呼ぶのは KalSetGeometry から (COMMIT の前)。 */
+ * 量・明るさ・大きさ (spk_amount / spk_bright / spk_size) と色の表もここで書く。
+ * 呼ぶのは KalSetGeometry と配色エディタ・c キーから (どれも後で COMMIT を書く)。 */
+static int spk_dark = 0;               /* 点滅で点を消している (色の表を黒にしている) */
+
 static void SpkSet(void)
 {
     const double c_per_px = (Z_CELL / TUBE_R) / (720.0 * 0.85 * set_zoom);
@@ -1252,19 +1333,64 @@ static void SpkSet(void)
     if (lv < 3) lv = 3;
     if (lv > 7) lv = 7;
     const double cell_px = 2.0 / (double)(1 << lv) / c_per_px;
-    long k = lround((cell_px / SPK_DOT_PX) * (cell_px / SPK_DOT_PX) * 256.0);
+    const double dot_px  = spk_size / 100.0;
+    long k = lround((cell_px / dot_px) * (cell_px / dot_px) * 256.0);
     if (k < 0) k = 0;
     if (k > 65535) k = 65535;
+    int dens  = spk_amount * 256 / 100;              /* 100% で 256 → 255 に切る */
+    int base  = SPK_BASE  * spk_bright / 100;
+    int flash = SPK_FLASH * spk_bright / 100;
+    if (dens  > 255) dens  = 255;
+    if (base  > 255) base  = 255;
+    if (flash > 255) flash = 255;
 
-    Xil_Out32(KAL_SPK_CTRL, 1u | ((u32)lv << 1) | ((u32)SPK_DENS << 4));
+    Xil_Out32(KAL_SPK_CTRL, (dens > 0 ? 1u : 0u) | ((u32)lv << 1) | ((u32)dens << 4));
     Xil_Out32(KAL_SPK_K,    (u32)k);
-    Xil_Out32(KAL_SPK_GAIN, (u32)SPK_BASE | ((u32)SPK_FLASH << 8));
+    Xil_Out32(KAL_SPK_GAIN, (u32)base | ((u32)flash << 8));
+    SpkColors();
 }
 
-/* 時刻を進める。毎フレーム COMMIT の前に呼ぶ (256 で 1 周) */
+/* 配色エディタの SPARK の 8 色を、割合に応じて PL の色の表 16 個へ振り分けて書く。
+ * 16 個の中の数 = 16 * 割合 / 合計 の整数部、余りは小数部の大きい色から 1 つずつ足す。
+ * 点はハッシュで 16 個から等しく選ばれるので、割合は 1/16 (6.25%) 刻みになる。
+ * 割合が全部 0 なら白にする */
+static void SpkColors(void)
+{
+    const KindColor *kc = &cset[KIND_SPARK];
+    u32 sum = 0;
+    for (int j = 0; j < KCOLS; j++) sum += kc->rate[j];
+    int cnt[KCOLS], rem[KCOLS], used = 0;
+    for (int j = 0; j < KCOLS; j++) {
+        const u32 x = (sum > 0) ? (u32)SPK_NCOL * kc->rate[j] : 0;
+        cnt[j] = (sum > 0) ? (int)(x / sum) : 0;
+        rem[j] = (sum > 0) ? (int)(x % sum) : 0;
+        used += cnt[j];
+    }
+    while (sum > 0 && used < SPK_NCOL) {             /* 余りを小数部の大きい色へ */
+        int best = 0;
+        for (int j = 1; j < KCOLS; j++) if (rem[j] > rem[best]) best = j;
+        cnt[best]++;  rem[best] = -1;  used++;
+    }
+    int slot = 0;
+    for (int j = 0; j < KCOLS && slot < SPK_NCOL; j++)
+        for (int m = 0; m < cnt[j] && slot < SPK_NCOL; m++, slot++) {
+            const u32 v = spk_dark ? 0u
+                        : ((u32)kc->rgb[j][0] << 16) | ((u32)kc->rgb[j][1] << 8) | kc->rgb[j][2];
+            Xil_Out32(KAL_SPK_COL(slot), v);
+        }
+    for (; slot < SPK_NCOL; slot++) Xil_Out32(KAL_SPK_COL(slot), spk_dark ? 0u : 0xFFFFFFu);
+}
+
+/* 時刻を進める。毎フレーム COMMIT の前に呼ぶ (256 で 1 周)。
+ * 配色エディタで SPARK を選んでいる間は、0.6 秒周期で点を消したり出したりする (点滅) */
 static void SpkTick(void)
 {
     Xil_Out32(KAL_SPK_TIME, (u32)lround(sim_time * SPK_SPEED / TWO_PI_D * 256.0) & 0xFF);
+    const int dark = ed_on && ed_kind == KIND_SPARK && fmod(sim_time, 0.6) < 0.3;
+    if (dark != spk_dark) {
+        spk_dark = dark;
+        SpkColors();
+    }
 }
 
 static int InitDP(void)

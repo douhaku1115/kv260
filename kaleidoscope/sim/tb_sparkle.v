@@ -28,8 +28,17 @@ module tb_sparkle;
   reg [15:0] k;
   wire [8:0] r, g, b;
 
+  // 色の表 16 個 (段7b)。tools/tb_sparkle_check.py が spk_cols.hex に書く
+  reg [23:0] tc [0:15];
+  initial $readmemh("spk_cols.hex", tc);
+  wire [16*24-1:0] cols;
+  genvar gi;
+  generate for (gi = 0; gi < 16; gi = gi + 1) begin : g_cols
+    assign cols[gi*24 +: 24] = tc[gi];
+  end endgenerate
+
   sparkle dut (.clk(clk), .cx(cx), .cy(cy), .en(en), .lv(lv), .dens(dens), .k(k),
-               .base(base), .flash(flash), .tphase(tphase),
+               .base(base), .flash(flash), .tphase(tphase), .cols(cols),
                .out_r(r), .out_g(g), .out_b(b));
 
   integer i, bad, nz;

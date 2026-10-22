@@ -39,8 +39,10 @@ M24 = 0xFFFFFF
 
 OFF0, OFFK = 13107, 154     # 点の位置 = 0.2 + 0.6*ox/255 (Q16)
 
-# 色 (色の番号 0〜3)。白を 2 つにして白を多めにする
-COLORS = [(255, 255, 255), (255, 255, 255), (255, 224, 140), (191, 217, 255)]
+# 色の表 (色の番号 0〜15)。段7b から PS が AXI で書く (0x1F0〜0x2E0)。
+# 既定 (電源投入時) は段7 の 4 色 (白を 2 つにして白を多めに) の繰り返し
+COLORS4 = [(255, 255, 255), (255, 255, 255), (255, 224, 140), (191, 217, 255)]
+COLORS = [COLORS4[i % 4] for i in range(16)]
 
 # 減衰の表: exp(-i/64)。i は (距離/点の半径)^2 の 64 倍
 FALL_LUT = [int(round(255.0 * math.exp(-i / 64.0))) for i in range(256)]
@@ -70,7 +72,7 @@ def params_for_zoom(zoom, gap_px=7.0, dot_px=0.75, h=720, focal=0.85, z_cell=12.
     return lv, k
 
 
-def sparkle(cx, cy, en, lv, dens, k, base, flash, tphase):
+def sparkle(cx, cy, en, lv, dens, k, base, flash, tphase, cols=None):
     """cx, cy は整数の配列 (符号付き Q15)。戻りは (r, g, b) の整数配列"""
     cx = np.asarray(cx, dtype=np.int64)
     cy = np.asarray(cy, dtype=np.int64)
@@ -95,7 +97,7 @@ def sparkle(cx, cy, en, lv, dens, k, base, flash, tphase):
     offy = OFF0 + ((h >> 16) & 0xFF) * OFFK
     ph = e2 & 0xFF
     rate = (e2 >> 8) & 3
-    csel = (e2 >> 10) & 3
+    csel = (e2 >> 10) & 15
     # P5
     dx = frx - offx
     dy = fry - offy
@@ -112,7 +114,7 @@ def sparkle(cx, cy, en, lv, dens, k, base, flash, tphase):
     amt = np.minimum((fall * s) >> 7, 511)
     amt = np.where(have & (en != 0), amt, 0)
     # P10
-    col = np.array(COLORS, dtype=np.int64)[csel]
+    col = np.array(COLORS if cols is None else cols, dtype=np.int64)[csel]
     r = (amt * col[..., 0]) >> 8
     g = (amt * col[..., 1]) >> 8
     bb = (amt * col[..., 2]) >> 8

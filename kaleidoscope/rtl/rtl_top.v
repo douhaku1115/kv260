@@ -54,6 +54,7 @@ module rtl_top
    input wire [7:0]         p_spk_base,
    input wire [7:0]         p_spk_flash,
    input wire [7:0]         p_spk_tphase,
+   input wire [16*24-1:0]   p_spk_cols,      // きらめき層の点の色の表 16 個 (段7b)
 
    // ピースの表の書き込みと描き直し (段5d-7)
    input wire               p_draw_req,     // 描き直しの開始 (1 クロック)
@@ -148,7 +149,7 @@ module rtl_top
   sparkle #(.FALL_FILE("spk_fall.hex"), .TW_FILE("spk_tw.hex")) spk_i
     (.clk(clkv), .cx(spk_cx), .cy(spk_cy),
      .en(p_spk_en), .lv(p_spk_lv), .dens(p_spk_dens), .k(p_spk_k),
-     .base(p_spk_base), .flash(p_spk_flash), .tphase(p_spk_tphase),
+     .base(p_spk_base), .flash(p_spk_flash), .tphase(p_spk_tphase), .cols(p_spk_cols),
      .out_r(spk_r), .out_g(spk_g), .out_b(spk_b));
 
   // ピース描画の状態 (セルの口の振り分けで使うので先に宣言する)

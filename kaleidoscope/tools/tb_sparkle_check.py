@@ -44,6 +44,10 @@ def main():
     F.write_luts(os.path.join(WORK, "spk_fall.hex"), os.path.join(WORK, "spk_tw.hex"))
     q = coords()
     rng = random.Random(11)
+    # 色の表 (段7b)。16 個すべて違う色にして、表の引き方の間違いも見つける
+    cols = [(rng.randrange(256), rng.randrange(256), rng.randrange(256)) for _ in range(16)]
+    with open(os.path.join(WORK, "spk_cols.hex"), "w") as f:
+        f.write("\n".join("%02x%02x%02x" % c for c in cols) + "\n")
     lines = []
     lit = 0
     # 設定は段の途中で使われる (dens は P4、k は P7 など)。実機では 1 フレームの間
@@ -60,7 +64,7 @@ def main():
                             F.params_for_zoom(2.5)[1]])
             base, flash, tph = rng.randrange(256), rng.randrange(256), rng.randrange(256)
         skip = 1 if i % BLOCK >= BLOCK - F.LAT else 0
-        r, g, b = F.sparkle([cx], [cy], en, lv, dens, k, base, flash, tph)
+        r, g, b = F.sparkle([cx], [cy], en, lv, dens, k, base, flash, tph, cols)
         r, g, b = int(r[0]), int(g[0]), int(b[0])
         lit += (r | g | b) != 0
         v = (skip << 131) | ((cx & 0x3FFFF) << 113) | ((cy & 0x3FFFF) << 95) | (en << 94) | (lv << 91) | \

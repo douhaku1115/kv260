@@ -6,7 +6,8 @@
 //  (scope_pipe の O1、Q15 で 1 画素の 1/256 まである) の上に格子を敷き、
 //  マスごとに光る点を 1 つ置いて、画面の画素の細かさで描く。
 //
-//    ・点の有無・マスの中の位置・光る時刻・色はマスの番号のハッシュで決める
+//    ・点の有無・マスの中の位置・光る時刻・色はマスの番号のハッシュで決める。
+//      色は PS が書く 16 個の表 (cols) から選ぶ (段7b。段7 は白・金・淡い青の直書き)
 //    ・点の大きさは k (PS が模様の大きさから計算) で画面の画素に合わせる。
 //      模様を大きくしても点は大きくならない
 //    ・格子の細かさ lv も PS が模様の大きさで選び、画面上の点の間隔をほぼ一定にする
@@ -31,6 +32,7 @@ module sparkle
    input  wire [7:0]         base,          // いつも光っている明るさ (128 = 1.0)
    input  wire [7:0]         flash,         // キラッと光るとき足す明るさ (128 = 1.0)
    input  wire [7:0]         tphase,        // 時刻 (256 で 1 周)
+   input  wire [16*24-1:0]   cols,          // 点の色の表 16 個 {R,G,B}。点ごとにハッシュで選ぶ
    output reg  [8:0]         out_r, out_g, out_b   // 足し込む明るさ 0〜510
    );
 
@@ -94,7 +96,8 @@ module sparkle
   reg        have4;
   reg [16:0] offx4, offy4;
   reg [7:0]  ph4;
-  reg [1:0]  rate4, csel4;
+  reg [1:0]  rate4;
+  reg [3:0]  csel4;
   reg [15:0] frx4, fry4;
   always @(posedge clk) begin
     have4 <= en && (h4[7:0] < dens);
@@ -102,7 +105,7 @@ module sparkle
     offy4 <= OFF0 + oy4;
     ph4   <= e4[7:0];
     rate4 <= e4[9:8];
-    csel4 <= e4[11:10];
+    csel4 <= e4[13:10];
     frx4  <= frx3;  fry4 <= fry3;
   end
 
@@ -111,7 +114,7 @@ module sparkle
   reg signed [17:0] dx5, dy5;
   reg [7:0]  t5;
   reg        have5;
-  reg [1:0]  csel5;
+  reg [3:0]  csel5;
   always @(posedge clk) begin
     dx5   <= $signed({2'b00, frx4}) - $signed({1'b0, offx4});
     dy5   <= $signed({2'b00, fry4}) - $signed({1'b0, offy4});
@@ -127,7 +130,7 @@ module sparkle
   reg [19:0] d2s6;
   reg [7:0]  tw6;
   reg        have6;
-  reg [1:0]  csel6;
+  reg [3:0]  csel6;
   always @(posedge clk) begin
     d2s6  <= d2[35:16];
     tw6   <= tw_lut[t5];
@@ -141,7 +144,7 @@ module sparkle
   reg [17:0] idx7;
   reg [8:0]  s7;
   reg        have7;
-  reg [1:0]  csel7;
+  reg [3:0]  csel7;
   always @(posedge clk) begin
     idx7  <= ag[35:18];
     s7    <= {1'b0, base} + {1'b0, fl[15:8]};
@@ -153,7 +156,7 @@ module sparkle
   reg [7:0]  fall8;
   reg [8:0]  s8;
   reg        have8;
-  reg [1:0]  csel8;
+  reg [3:0]  csel8;
   always @(posedge clk) begin
     fall8 <= (idx7 < 18'd256) ? fall_lut[idx7[7:0]] : 8'd0;
     s8    <= s7;
@@ -161,24 +164,17 @@ module sparkle
     csel8 <= csel7;
   end
 
-  // ---- P9: 明るさ = fall * s >> 7 を 511 で切る ----
+  // ---- P9: 明るさ = fall * s >> 7 を 511 で切る。色の表を引く ----
   wire [16:0] am = fall8 * s8;
   reg [8:0]  amt9;
-  reg [1:0]  csel9;
+  reg [23:0] col9;
   always @(posedge clk) begin
-    amt9  <= !have8 ? 9'd0 : (am[16:7] > 10'd511) ? 9'd511 : am[15:7];
-    csel9 <= csel8;
+    amt9 <= !have8 ? 9'd0 : (am[16:7] > 10'd511) ? 9'd511 : am[15:7];
+    col9 <= cols[csel8*24 +: 24];
   end
 
   // ---- P10: 色を掛ける ----
-  reg [7:0] cr, cg, cb;
-  always @(*) begin
-    case (csel9)
-      2'd2:    begin cr = 8'd255; cg = 8'd224; cb = 8'd140; end   // 金
-      2'd3:    begin cr = 8'd191; cg = 8'd217; cb = 8'd255; end   // 淡い青
-      default: begin cr = 8'd255; cg = 8'd255; cb = 8'd255; end   // 白
-    endcase
-  end
+  wire [7:0]  cr = col9[23:16], cg = col9[15:8], cb = col9[7:0];
   wire [16:0] rm = amt9 * cr;
   wire [16:0] gm = amt9 * cg;
   wire [16:0] bmc = amt9 * cb;

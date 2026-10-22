@@ -110,6 +110,9 @@ module kaleido_axi_slave #(
     output reg  [7:0]                      v_spk_base,
     output reg  [7:0]                      v_spk_flash,
     output reg  [7:0]                      v_spk_tphase,
+    //   0x1F0〜0x2E0 SPK_COL0〜15  点の色の表 {R, G, B} (24bit)。点ごとにハッシュで 16 個から選ぶ。
+    //   PS は 8 色を割合に応じて 16 個へ振り分けて書く (割合は 1/16 刻み)
+    output reg  [16*24-1:0]                v_spk_cols,
 
     // 画面に出す文字。映像側から読む (書き込みは AXI 側、読み出しは映像側の
     // 単純デュアルポート RAM。PS が書いた文字がそのまま画面に出る)
@@ -161,6 +164,14 @@ module kaleido_axi_slave #(
         spk_regs[1] = 16'd0;
         spk_regs[2] = 16'd0;
         spk_regs[3] = 16'd0;
+    end
+    // 点の色の表 (0x1F0 = 31 番から 16 個)。既定は段7 の 4 色 (白・白・金・淡い青) の繰り返し
+    localparam [6:0] SPKC_BASE = 7'd31;
+    reg [23:0] spkc_regs [0:15];
+    integer ci;
+    initial begin
+        for (ci = 0; ci < 16; ci = ci + 1)
+            spkc_regs[ci] = (ci % 4 == 2) ? 24'hFFE08C : (ci % 4 == 3) ? 24'hBFD9FF : 24'hFFFFFF;
     end
 
     // 電源投入時の既定値: ポイント数 8、3枚鏡、回転なし
@@ -265,6 +276,8 @@ module kaleido_axi_slave #(
                 regs[wr_unit] <= S_AXI_WDATA[19:0];
             else if (wr_unit >= SPK_BASE && wr_unit < SPK_BASE + 7'd4)   // 0x1B0〜0x1E0
                 spk_regs[wr_unit[1:0] - SPK_BASE[1:0]] <= S_AXI_WDATA[15:0];
+            else if (wr_unit >= SPKC_BASE && wr_unit < SPKC_BASE + 7'd16)  // 0x1F0〜0x2E0
+                spkc_regs[wr_unit - SPKC_BASE] <= S_AXI_WDATA[23:0];
             else if (wr_unit >= TEXT_BASE && wr_unit < TEXT_BASE + TEXT_WORDS) begin
                 text_ram[{tw_idx, 2'd0}]         <= S_AXI_WDATA[7:0];
                 text_ram[{tw_idx, 2'd0} + 3'd1]  <= S_AXI_WDATA[15:8];
@@ -391,8 +404,11 @@ module kaleido_axi_slave #(
         v_vx2 = 18'h0646B; v_vy2 = 18'h30D93;
         v_spk_en = 1'b0;  v_spk_lv = 3'd5;  v_spk_dens = 8'd0;  v_spk_k = 16'd0;
         v_spk_base = 8'd0;  v_spk_flash = 8'd0;  v_spk_tphase = 8'd0;
+        for (j = 0; j < 16; j = j + 1)
+            v_spk_cols[j*24 +: 24] = (j % 4 == 2) ? 24'hFFE08C : (j % 4 == 3) ? 24'hBFD9FF : 24'hFFFFFF;
     end
 
+    integer cl;
     always @(posedge clkv) begin
         if (load) begin
             v_mirror2  <= regs[0][0];
@@ -416,6 +432,8 @@ module kaleido_axi_slave #(
             v_spk_base   <= spk_regs[2][7:0];
             v_spk_flash  <= spk_regs[2][15:8];
             v_spk_tphase <= spk_regs[3][7:0];
+            for (cl = 0; cl < 16; cl = cl + 1)
+                v_spk_cols[cl*24 +: 24] <= spkc_regs[cl];
         end
     end
 
