@@ -12,8 +12,9 @@
 //   $2000-$3FFF  PPU のレジスタ (8 番地ごとにミラー)
 //   $4014        OAM DMA (書き込みで 256 バイトを OAM へ)
 //   $4016        コントローラ 1 (書: bit0 = 取り込み合図 / 読: 1 回に 1 ボタン、上位は $40)
-//   $4017        コントローラ 2 (未接続: $40)
-//   $4000-$401F  そのほかは APU (段F。いまは 0 を返す)
+//   $4017        読: コントローラ 2 (未接続: $40) / 書: APU のフレームカウンタ
+//   $4000-$4013, $4015  APU (apu.v)。$4015 の読みは APU の状態
+//   $6000-$7FFF  PRG-RAM 8KB (blargg のテストは $6000 に結果を書く)
 //   $8000-$FFFF  PRG 32KB。prg16=1 なら 16KB を折り返す (NROM-128)
 //
 // PS 側 (AXI) からは:
@@ -39,6 +40,8 @@ module nes_core #(
     output wire [7:0]  pix_y,
     output wire [5:0]  pix_c,
     output wire [31:0] ppu_frames,
+    // 音 (符号付き 16bit、cpu_ce ごとに更新)
+    output wire signed [15:0] audio,
     // PS から PRG へ書き込み
     input  wire        prg_we,
     input  wire [12:0] prg_waddr,    // 語番号 (1 語 = 4 バイト)
@@ -74,6 +77,7 @@ module nes_core #(
     reg  [7:0]  din;
 
     wire        ppu_nmi;
+    wire        apu_irq;
 
     // ---------------- OAM DMA ($4014) ----------------
     // $4014 に書いた次のサイクルから、バスを DMA が持つ (その間 CPU の ce を止める)。
@@ -84,10 +88,33 @@ module nes_core #(
     reg [1:0]  dma_wait;
     reg [7:0]  dma_page, dma_idx, dma_data;
 
-    // バス (CPU か DMA)
-    wire [15:0] addr = dma_act ? (dma_rw ? 16'h2004 : {dma_page, dma_idx}) : c_addr;
+    // DMC のサンプル読み: バスを 4 サイクル借りる (3 サイクル待ち + 読み。実機の 4 サイクル停止に合わせる)
+    reg         dmc_act = 1'b0;
+    reg  [1:0]  dmc_cnt;
+    wire        dmc_req;
+    wire [15:0] dmc_addr;
+
+    // バス (OAM DMA か DMC か CPU)
+    wire [15:0] addr = dma_act ? (dma_rw ? 16'h2004 : {dma_page, dma_idx}) : dmc_act ? dmc_addr : c_addr;
     wire [7:0]  dout = dma_act ? dma_data : c_dout;
-    wire        we   = dma_act ? dma_rw   : c_we;
+    wire        we   = dma_act ? dma_rw   : dmc_act ? 1'b0 : c_we;
+
+    wire        dmc_ack = cpu_ce && dmc_act && dmc_cnt == 2'd3;   // このクロックの din が読んだ値
+    always @(posedge clk) begin
+        if (!run)
+            dmc_act <= 1'b0;
+        else if (cpu_ce) begin
+            if (!dmc_act) begin
+                // OAM DMA 中と、OAM DMA が始まるクロックは避ける
+                if (dmc_req && !dma_act && !(we && addr == 16'h4014)) begin
+                    dmc_act <= 1'b1; dmc_cnt <= 2'd0;
+                end
+            end else begin
+                dmc_cnt <= dmc_cnt + 2'd1;
+                if (dmc_cnt == 2'd3) dmc_act <= 1'b0;
+            end
+        end
+    end
 
     always @(posedge clk) begin
         if (!run)
@@ -115,8 +142,8 @@ module nes_core #(
     end
 
     cpu6502 cpu
-      (.clk(clk), .rst(!run), .ce(cpu_ce && !dma_act), .addr(c_addr), .dout(c_dout), .we(c_we), .din(din),
-       .nmi(ppu_nmi), .irq(1'b0), .sync(cpu_sync),
+      (.clk(clk), .rst(!run), .ce(cpu_ce && !dma_act && !dmc_act), .addr(c_addr), .dout(c_dout), .we(c_we), .din(din),
+       .nmi(ppu_nmi), .irq(apu_irq), .sync(cpu_sync),
        .dbg_pc(dbg_pc), .dbg_a(), .dbg_x(), .dbg_y(), .dbg_s(), .dbg_p());
 
     assign cpu_addr = addr;
@@ -186,14 +213,40 @@ module nes_core #(
         end
     end
 
+    // ---------------- APU ($4000-$4013, $4015, $4017) ----------------
+    // $4014 (OAM DMA) と $4016 (コントローラ) は APU に渡さない
+    wire        sel_apu = (addr[15:5] == 11'h200) && (addr[4:0] != 5'h14) && (addr[4:0] != 5'h16);
+    wire [7:0]  apu_status;
+
+    apu apu0
+      (.clk(clk), .rst(!run), .ce(cpu_ce),
+       .reg_addr(addr[4:0]), .reg_wr(cpu_ce && we && sel_apu), .reg_wdata(dout),
+       .rd_4015(cpu_ce && !we && addr == 16'h4015),
+       .status(apu_status), .irq(apu_irq),
+       .dmc_req(dmc_req), .dmc_addr(dmc_addr), .dmc_ack(dmc_ack), .dmc_data(din),
+       .sample(audio),
+       .p1_out(), .p2_out(), .tri_out(), .noi_out(), .dmc_out());
+
+    // ---------------- PRG-RAM 8KB ($6000-$7FFF) ----------------
+    (* ram_style = "block" *) reg [7:0] prgram [0:8191];
+    reg [7:0] prgram_q;
+    initial for (wi = 0; wi < 8192; wi = wi + 1) prgram[wi] = 8'h00;
+    wire sel_prgram = (addr[15:13] == 3'b011);
+    always @(posedge clk) begin
+        if (cpu_ce && we && sel_prgram) prgram[addr[12:0]] <= dout;
+        prgram_q <= prgram[addr[12:0]];
+    end
+
     // ---------------- 読みの選択 ----------------
     reg [15:0] addr_d;
     always @(posedge clk) addr_d <= addr;       // RAM の読み遅れに合わせる
     always @(*) begin
         if (addr_d[15:13] == 3'b000) din = wram_q;
         else if (addr_d[15:13] == 3'b001) din = ppu_rdata;
+        else if (addr_d == 16'h4015) din = apu_status;
         else if (addr_d == 16'h4016) din = {7'b0100000, pad_sh[0]};
         else if (addr_d == 16'h4017) din = 8'h40;
+        else if (addr_d[15:13] == 3'b011) din = prgram_q;
         else if (addr_d[15])         din = prg_byte;
         else                         din = 8'h00;
     end

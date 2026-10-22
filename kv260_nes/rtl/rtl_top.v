@@ -5,7 +5,7 @@
 // NES の画面 256x240 を 3 倍 (768x720) にして 1280x720 の中央 (X=256) に出す。
 // 画面バッファ (nes_fb) の色番号を nes_palette で RGB にする。
 // 段A では PS が AXI で画面バッファに直接書く。段D 以降は PPU が書く。
-// 音は Pmod I2S2 (J2) へ。段A は i2s_tx の固定トーン (約 762Hz) で配線確認だけ。
+// 音は Pmod I2S2 (J2) へ。APU (nes_core 内) の音を mclk 側に渡して i2s_tx で送る。
 //
 // 【AXI マップ (ベース 0xA0000000, 256KB)】 レジスタは 0x10 刻み
 //   0x00000 CTRL  (RW) bit0=1 で CPU 実行 (0 でリセット保持) / bit1=1 で PRG 16KB 折り返し
@@ -79,6 +79,7 @@ module rtl_top
   wire [7:0]  pix_x, pix_y;
   wire [5:0]  pix_c;
   wire [31:0] ppu_frames;
+  wire signed [15:0] audio;
 
   nes_core core
     (
@@ -95,6 +96,7 @@ module rtl_top
      .pix_y      (pix_y),
      .pix_c      (pix_c),
      .ppu_frames (ppu_frames),
+     .audio      (audio),
      .prg_we     (wr_prg),
      .prg_waddr  (bus_wr_addr[14:2]),
      .prg_wdata  (bus_wr_data),
@@ -248,12 +250,33 @@ module rtl_top
   end
 
   // ------------------------------------------------------------
-  // 音 (段A: 固定トーン)
+  // 音 (APU → Pmod I2S2)
   // ------------------------------------------------------------
+  // clk 側: 1024 クロック (約 10us) ごとに値を止めて、トグルで知らせる
+  // mclk 側: トグルを 2 段で受け、変わったら値を取る (値はその間止まっているので安全)
+  reg  [9:0]  aud_div = 10'd0;
+  reg  signed [15:0] aud_hold = 16'sd0;
+  reg         aud_tgl = 1'b0;
+  always @(posedge clk) begin
+    aud_div <= aud_div + 10'd1;
+    if (aud_div == 10'd0) begin
+      aud_hold <= audio;
+      aud_tgl  <= ~aud_tgl;
+    end
+  end
+
+  (* ASYNC_REG = "TRUE" *) reg [2:0] aud_sync = 3'd0;
+  reg signed [15:0] aud_m = 16'sd0;
+  always @(posedge mclk) begin
+    aud_sync <= {aud_sync[1:0], aud_tgl};
+    if (aud_sync[2] != aud_sync[1]) aud_m <= aud_hold;
+  end
+
   i2s_tx i2s0
     (
      .mclk   (mclk),
      .rst_n  (resetn),
+     .ext_sample (aud_m),
      .mclk_o (pmod_mclk),
      .sclk   (pmod_sclk),
      .lrck   (pmod_lrck),

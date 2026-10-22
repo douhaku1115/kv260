@@ -14,7 +14,8 @@ set rtl_top_name rtl_top
 set rtl_files [list \
     rtl/rtl_top.v rtl/nes_axi_slave.v rtl/nes_fb.v rtl/nes_palette.v \
     rtl/cdc_synchronizer.v rtl/shift_register.v rtl/vga_iface.v \
-    rtl/i2s_tx.v rtl/sine_lut.hex]
+    rtl/nes_core.v rtl/cpu6502.v rtl/ppu.v rtl/apu.v \
+    rtl/i2s_tx.v rtl/apu_pulse.hex rtl/apu_tnd.hex]
 set project_name project_1
 set project_dir  project_1
 set design_name  design_1
@@ -35,7 +36,7 @@ add_files -fileset constrs_1 -norecurse pins.xdc
 add_files -fileset constrs_1 -norecurse timings.xdc
 set_property used_in_synthesis false [get_files timings.xdc]
 add_files -fileset sources_1 -norecurse $rtl_files
-set_property file_type {Memory Initialization Files} [get_files sine_lut.hex]
+set_property file_type {Memory Initialization Files} [get_files {apu_pulse.hex apu_tnd.hex}]
 
 set_property board_connections $som_connection [current_project]
 

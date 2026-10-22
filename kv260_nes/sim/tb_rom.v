@@ -64,8 +64,12 @@ module tb_rom;
     @(posedge clk); prg_we <= 0; chr_we <= 0;
     @(posedge clk); run <= 1;
 
+    // blargg の新しいテストは $6000 = 状態 ($80 実行中 / $00 合格 / 他は失敗番号)、
+    // $6001-$6003 = DE B0 61 (目印)、$6004〜 = 結果の文章。目印があって実行中でなければ早く終える
     last = 0;
-    while (ppu_frames < cfg[1]) begin
+    while (ppu_frames < cfg[1] &&
+           !(core.prgram[1] == 8'hDE && core.prgram[2] == 8'hB0 && core.prgram[3] == 8'h61 &&
+             core.prgram[0] != 8'h80)) begin
       @(posedge clk);
       if (ppu_frames != last && ppu_frames % 10 == 0) begin
         $display("frame %0d PC=%h", ppu_frames, pc);
@@ -73,6 +77,16 @@ module tb_rom;
       last = ppu_frames;
     end
     repeat (100) @(posedge clk);
+
+    if (core.prgram[1] == 8'hDE && core.prgram[2] == 8'hB0 && core.prgram[3] == 8'h61) begin
+      $display("$6000 status = %h", core.prgram[0]);
+      $write("$6004 text: ");
+      for (i = 4; i < 1000 && core.prgram[i] != 8'h00; i = i + 1) begin
+        ch = core.prgram[i];
+        if (ch == 8'h0A) $write(" / "); else $write("%c", ch);
+      end
+      $write("\n");
+    end
 
     for (y = 0; y < 30; y = y + 1) begin
       $write("|");
