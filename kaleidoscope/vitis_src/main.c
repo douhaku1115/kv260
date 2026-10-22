@@ -93,7 +93,14 @@ static int   set_points     = 8;      /* 3〜12 */
 static int   set_mirror2    = 0;      /* 0 = 3枚鏡, 1 = 2枚鏡 */
 static float set_zoom       = 1.0f;   /* 0.5〜2.5 */
 static float set_autorotate = 0.35f;  /* 0〜1。参照実装の既定値 */
+/* 往復モード (r キー)。set_rev 秒ごとに自動回転の向きを反転する (0 = 切)。
+ * 目標の速さの符号を変えるだけで、筒は StepSim の式で滑らかに減速して逆へ回り出し、
+ * 油は粘りで遅れて付いてくるので渦ができる */
+static int    set_rev     = 0;        /* 0 / 5 / 10 / 20 [秒] */
+static double sim_rev_t   = 0.0;      /* 今の向きになってからの時間 */
+static double sim_rev_dir = 1.0;      /* +1 / -1 */
 static int   set_text_on    = 1;      /* 操作一覧をモニターに出すか */
+static int   txt_keys       = 0;      /* モニターの文字をキーボードの並びの絵にするか (h / エディタでは /) */
 static float set_viscosity  = 0.5f;   /* 粘り 0〜1。参照実装の既定値 (まだキーは無い) */
 
 /* 筒の回転角 [rad]。PL の COS_T/SIN_T (セルの回転) と物理演算の重力の向きの両方に使う */
@@ -174,6 +181,9 @@ static int  ed_on = 0;                 /* 配色エディタを出している�
 static int  ed_kind = 0;               /* 直している種類 (cset[] の番号。気泡は飛ばす) */
 static int  ed_col  = 0;               /* 直している色の番号 0 〜 KCOLS-1 */
 static char ed_msg[12] = "";           /* 保存した・SD が無い などをエディタの 1 行目に出す */
+/* 300 フレームごとの描き直し回数・物理演算の時間をシリアルに出すか。
+ * キー一覧が流れて読めなくなるので普段は 0。測るときだけ 1 にする */
+#define SHOW_STATS 0
 /* 物理演算の内訳の時間 (移動・押し合い・壁)。300 フレームぶん足して平均を出す */
 static XTime  t_move_sum, t_push_sum, t_wall_sum;
 static u32    n_pair_sum, n_hit_sum;   /* 調べた組 / 実際に重なっていた組 */
@@ -330,6 +340,7 @@ int main(void)
         SpkTick();
         Xil_Out32(KAL_COMMIT, 1);     /* ここまでの値を次のフレーム先頭で一括反映 */
         if (frames - rep_frames >= 300) {
+          if (SHOW_STATS) {
             xil_printf("描き直し %u 回 / %u フレーム  物理 最大 %u us  表 最大 %u us\r\n",
                        (unsigned)(redraws - rep_redraws), (unsigned)(frames - rep_frames),
                        (unsigned)(t_sim_max * 1000000 / COUNTS_PER_SECOND),
@@ -341,6 +352,7 @@ int main(void)
                        (unsigned)(t_push_sum * 1000000 / COUNTS_PER_SECOND / nf),
                        (unsigned)(t_wall_sum * 1000000 / COUNTS_PER_SECOND / nf),
                        (unsigned)(n_pair_sum / nf), (unsigned)(n_hit_sum / nf));
+          }
             t_move_sum = t_push_sum = t_wall_sum = 0;
             n_pair_sum = n_hit_sum = 0;
             rep_frames = frames;
@@ -385,29 +397,31 @@ static int uart_getchar_nb(void)
    フレーム同期を圧迫して取りこぼしの原因になる。 */
 static void ShowSettings(void)
 {
-    xil_printf("ポイント %2d  ミラー %d  大きさ %3d  回転 %3d  粘り %3d  色 %s%s\r\n",
+    xil_printf("ポイント %2d  ミラー %d  大きさ %3d  回転 %3d  往復 %2d秒  粘り %3d  色 %s%s\r\n",
                set_points, set_mirror2 ? 2 : 3,
                (int)(set_zoom * 100.0f + 0.5f),
                (int)(set_autorotate * 100.0f + 0.5f),
+               set_rev,
                (int)(set_viscosity * 100.0f + 0.5f),
                cset_name,
                (set_points > 10) ? "  ※11以上は反射19回。K=16では外側が崩れる" : "");
 }
 
+/* キーの一覧はキーボードの並びで出す (どのキーがどこにあるか分かるように)。
+ * Tera Term の横幅 80 桁に収める (日本語は 1 文字 2 桁)。空いているキーは空白で詰める */
 static void ShowHelp(void)
 {
-    xil_printf("\r\n--- キー (Shift 不要) ---\r\n");
-    xil_printf("  q w  ポイント数 3〜12\r\n");
-    xil_printf("  m    ミラー 3枚/2枚\r\n");
-    xil_printf("  a s  大きさ %d〜%d\r\n", (int)(ZOOM_MIN*100), (int)(ZOOM_MAX*100));
-    xil_printf("  z x  回転の速さ 0〜100\r\n");
-    xil_printf("  v b  油の粘り 0〜100 (小さいほどサラサラ)\r\n");
-    xil_printf("  e    かき混ぜる\r\n");
-    xil_printf("  j l  筒を手で左/右に回す (押している間)\r\n");
-    xil_printf("  i    画面の一覧を出す/消す\r\n");
-    xil_printf("  c    色の組み合わせを切り替える (%d 通り)\r\n", NPALETTES);
-    xil_printf("  p    配色エディタ (種類ごとに 8 色と割合。SD に保存)\r\n");
-    xil_printf("  0    初期設定    h  この一覧\r\n");
+    xil_printf("\r\n\r\n\r\n--- キー (Shift 不要。キーボードの並び) ---\r\n");   /* 空行 2 つで流れる表示と区切る */
+    xil_printf("                                                        [0]初期設定\r\n");
+    xil_printf(" [q]ポイント- [w]ポイント+ [e]かき混ぜ [r]往復        [i]画面一覧 [p]配色\r\n");
+    xil_printf("  [a]小さく [s]大きく                  [h]この一覧 [j]左回し   [l]右回し\r\n");
+    xil_printf("   [z]回転遅く [x]回転速く [c]色の組 [v]サラサラ [b]ネバネバ   [m]鏡2/3枚\r\n");
+    xil_printf("  r 往復: 切→5秒→10秒→20秒→切   c 色の組: %d 通り   j l は押している間だけ\r\n",
+               NPALETTES);
+    xil_printf("  p 配色エディタ (中で / を押すとエディタのキーが出る)\r\n");
+    xil_printf("  h はモニターの文字もキーの並びの絵にする (もう一度 h で戻る)。絵の略語:\r\n");
+    xil_printf("    P±ポイント MX混ぜる RV往復 TX画面一覧 ED配色 Z±大きさ KYこの絵 <<>>手で回す\r\n");
+    xil_printf("    S±回転 CL色の組 V±粘り MR鏡 RS初期設定\r\n");
     ShowSettings();
 }
 
@@ -444,6 +458,13 @@ static void HandleKey(int c)
     case 'x': case '.': case '>':
         if (set_autorotate < 0.999f) set_autorotate += 0.05f; break;
 
+    /* 往復モード: 切 → 5 秒 → 10 秒 → 20 秒 → 切 */
+    case 'r':
+        set_rev = (set_rev == 0) ? 5 : (set_rev == 5) ? 10 : (set_rev == 10) ? 20 : 0;
+        sim_rev_t = 0.0;
+        if (set_rev == 0) sim_rev_dir = 1.0;   /* 切ったら元の向きに戻す */
+        break;
+
     /* 油の粘り (段6) */
     case 'v': if (set_viscosity > 0.001f) set_viscosity -= 0.1f; break;
     case 'b': if (set_viscosity < 0.999f) set_viscosity += 0.1f; break;
@@ -460,15 +481,17 @@ static void HandleKey(int c)
     case 'c': LoadPreset((set_palette + 1) % NPALETTES); SpkSet(); break;
 
     /* 配色エディタを出す */
-    case 'p': ed_on = 1; ed_msg[0] = '\0'; UpdateText(); ShowEditHelp(); return;
+    case 'p': ed_on = 1; ed_msg[0] = '\0'; txt_keys = 0; UpdateText(); ShowEditHelp(); return;
 
     case '0':
         set_points = 8; set_mirror2 = 0; set_zoom = 1.0f; set_autorotate = 0.35f;
+        set_rev = 0;  sim_rev_t = 0.0;  sim_rev_dir = 1.0;
         set_viscosity = 0.5f;  LoadPreset(0);
         spk_amount = 45;  spk_bright = 100;  spk_size = 75;    /* SpkSet は KalSetGeometry から */
         geom = 1;
         break;
-    case 'h': case '?': ShowHelp(); return;
+    /* シリアルに一覧を出し、モニターの文字もキーの並びの絵と切り替える */
+    case 'h': case '?': txt_keys = !txt_keys; UpdateText(); ShowHelp(); return;
     default: xil_printf("(割り当て無し)\r\n"); return;
     }
 
@@ -677,7 +700,11 @@ static void StepSim(double dt)
         sim_key_turn_left -= dt;
         if (sim_key_turn_left <= 0.0) sim_key_turn = 0.0;
     }
-    const double target = set_autorotate * 0.6 + sim_key_turn;
+    if (set_rev > 0) {
+        sim_rev_t += dt;
+        if (sim_rev_t >= set_rev) { sim_rev_t -= set_rev; sim_rev_dir = -sim_rev_dir; }
+    }
+    const double target = set_autorotate * 0.6 * sim_rev_dir + sim_key_turn;
     sim_tube_vel += (target - sim_tube_vel)
                     * (1.0 - exp(-dt * (sim_key_turn != 0.0 ? 4.0 : 1.2)));
     sim_tube_angle += sim_tube_vel * dt;
@@ -910,6 +937,7 @@ static void LoadPreset(int n)
  *     S.BEAD ...
  *     SPARK ...                  (きらめき層の点。段7b)
  *     SPKPARAM 45 100 75         (きらめき層の量 [%]・明るさ [%]・大きさ [画素 x100])
+ *     SETTING 6 3 130 50 10 30   (ポイント・ミラー・大きさ・回転・往復 [秒]・粘り。無ければ変えない)
  * 1 行 = 種類の名前 + 「色 (RRGGBB の 16 進)/割合 [%]」が 8 つ。書いていない種類は今の色のまま。
  * SD を挿し替えても追従するように、保存・読み込みのたびにつなぎ直す。
  * 書き込み・読み込みは数 ms〜数十 ms かかるので、その間は映像の歩調から外れる (キーを押したときだけ) */
@@ -949,6 +977,11 @@ static int SdSave(int slot)
     /* きらめき層の量 [%]・明るさ [%]・大きさ [画素 x100] */
     n += snprintf(sd_buf + n, sizeof(sd_buf) - n, "SPKPARAM %d %d %d\r\n",
                   spk_amount, spk_bright, spk_size);
+    /* 模様の設定 (画面の一覧と同じ数): ポイント・ミラー・大きさ・回転・往復 [秒]・粘り */
+    n += snprintf(sd_buf + n, sizeof(sd_buf) - n, "SETTING %d %d %d %d %d %d\r\n",
+                  set_points, set_mirror2 ? 2 : 3, (int)(set_zoom * 100.0f + 0.5f),
+                  (int)(set_autorotate * 100.0f + 0.5f), set_rev,
+                  (int)(set_viscosity * 100.0f + 0.5f));
     if (f_open(&sd_fil, path, FA_CREATE_ALWAYS | FA_WRITE) != FR_OK) return -2;
     UINT bw = 0;
     FRESULT r = f_write(&sd_fil, sd_buf, (UINT)n, &bw);
@@ -978,6 +1011,22 @@ static const char *ParseEntry(const char *p, u8 rgb[3], u8 *rate)
     return p;
 }
 
+/* 空白区切りの 10 進数を n 個まで読む。戻り値は読めた数 */
+static int ParseInts(const char *p, int *v, int n)
+{
+    int i = 0;
+    while (i < n) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p < '0' || *p > '9') break;
+        v[i] = 0;
+        while (*p >= '0' && *p <= '9') v[i] = v[i] * 10 + (*p++ - '0');
+        i++;
+    }
+    return i;
+}
+
+static int ClampI(int v, int lo, int hi) { return (v < lo) ? lo : (v > hi) ? hi : v; }
+
 /* 戻り値: 読めた種類の数 (1 以上), -1 = SD が無い/読めない, -2 = ファイルが無い,
  *         -3 = 読めない, -4 = 中身に種類の行が無い */
 static int SdLoad(int slot)
@@ -1001,21 +1050,23 @@ static int SdLoad(int slot)
         while (*e && *e != '\n') e++;
         const char save = *e;
         *e = '\0';
-        if (strncmp(s, "SPKPARAM ", 9) == 0) {           /* きらめき層の量・明るさ・大きさ */
-            int v[3], i = 0;
-            const char *p = s + 9;
-            while (i < 3) {
-                while (*p == ' ') p++;
-                if (*p < '0' || *p > '9') break;
-                v[i] = 0;
-                while (*p >= '0' && *p <= '9') v[i] = v[i] * 10 + (*p++ - '0');
-                i++;
-            }
-            if (i == 3) {
-                spk_amount = (v[0] > 100) ? 100 : v[0];
-                spk_bright = (v[1] > 200) ? 200 : v[1];
-                spk_size   = (v[2] < 50) ? 50 : (v[2] > 200) ? 200 : v[2];
-            }
+        int v[6];
+        if (strncmp(s, "SPKPARAM ", 9) == 0 && ParseInts(s + 9, v, 3) == 3) {   /* きらめき層 */
+            spk_amount = ClampI(v[0], 0, 100);
+            spk_bright = ClampI(v[1], 0, 200);
+            spk_size   = ClampI(v[2], 50, 200);
+        }
+        /* 模様の設定。この行が無い古いファイルは設定を変えない。鏡の法線などは呼び手が
+         * KalSetGeometry で書き直す。値はキーで動く刻みに丸める (5 / 10 刻みからずれないように) */
+        if (strncmp(s, "SETTING ", 8) == 0 && ParseInts(s + 8, v, 6) == 6) {
+            set_points     = ClampI(v[0], 3, 12);
+            set_mirror2    = (v[1] == 2);
+            set_zoom       = ClampI((v[2] + 2) / 5 * 5, (int)(ZOOM_MIN * 100.0f + 0.5f),
+                                    (int)(ZOOM_MAX * 100.0f + 0.5f)) / 100.0f;
+            set_autorotate = ClampI((v[3] + 2) / 5 * 5, 0, 100) / 100.0f;
+            set_rev        = (v[4] == 5 || v[4] == 10 || v[4] == 20) ? v[4] : 0;
+            set_viscosity  = ClampI((v[5] + 5) / 10 * 10, 0, 100) / 100.0f;
+            sim_rev_t = 0.0;  sim_rev_dir = 1.0;
         }
         for (int k = 0; k < NCSET && *s != '#'; k++) {
             if (!KIND_EDITABLE(k)) continue;
@@ -1073,15 +1124,19 @@ static void ShowEdit(void)
 
 static void ShowEditHelp(void)
 {
-    xil_printf("\r\n--- 配色エディタ (p で閉じる) ---\r\n");
-    xil_printf("  q w  種類 (BEAD S.BEAD GLASS GLITTER STONE HEX ROD BLOB MOON SPARK)\r\n");
-    xil_printf("       選んだ種類のピースが点滅する。SPARK はきらめき層の点 (点が消えたり出たりする)\r\n");
-    xil_printf("  a s  色の番号 1〜%d\r\n", KCOLS);
-    xil_printf("  e d  赤 +/-   r f  緑 +/-   t g  青 +/-   (%d ずつ)\r\n", ED_RGB_STEP);
-    xil_printf("  y h  割合 +/- (%d%% ずつ。0 の色は使わない)\r\n", ED_RATE_STEP);
-    xil_printf("  SPARK のとき  u j  量 +/-   i k  明るさ +/-   o l  大きさ +/-\r\n");
-    xil_printf("  c    組み込みの組を写す (今の直しは消える)\r\n");
-    xil_printf("  1〜4 SD の KPAL1〜4.TXT に保存   5〜8 KPAL1〜4.TXT を読み込む\r\n");
+    /* ShowHelp と同じくキーボードの並びで出す */
+    xil_printf("\r\n\r\n\r\n--- 配色エディタのキー (キーボードの並び。p で閉じる。/ でこの一覧) ---\r\n");
+    xil_printf(" [1]保存1 [2]保存2 [3]保存3 [4]保存4 [5]読込1 [6]読込2 [7]読込3 [8]読込4\r\n");
+    xil_printf("  [q]種類< [w]種類> [e]赤+ [r]緑+ [t]青+ [y]割合+ [u]量+ [i]明+ [o]大+ [p]閉じる\r\n");
+    xil_printf("   [a]色< [s]色> [d]赤- [f]緑- [g]青- [h]割合- [j]量- [k]明- [l]大-\r\n");
+    xil_printf("                      [c]組を写す\r\n");
+    xil_printf("  種類: BEAD S.BEAD GLASS GLITTER STONE HEX ROD BLOB MOON SPARK (選んだ種類が点滅)\r\n");
+    xil_printf("  色< > は色の番号 1〜%d。赤緑青は %d ずつ。割合は %d%% ずつ (0 の色は使わない)\r\n",
+               KCOLS, ED_RGB_STEP, ED_RATE_STEP);
+    xil_printf("  量 明(明るさ) 大(大きさ) は SPARK のときだけ。c は組み込みの組を写す (直しは消える)\r\n");
+    xil_printf("  保存・読込は SD の KPAL1〜4.TXT\r\n");
+    xil_printf("  / はモニターの文字もキーの並びの絵にする (もう一度 / で戻る)。絵の略語:\r\n");
+    xil_printf("    S1〜4保存 L1〜4読込 K種類 C色の番号 RGB色 %%割合 N量 L明るさ Z大きさ EX閉じる CP組を写す\r\n");
     ShowEdit();
 }
 
@@ -1128,9 +1183,11 @@ static void EditKey(int c)
         break;
     case '5': case '6': case '7': case '8':
         SdMessage("LOADED", c - '4', SdLoad(c - '4'));
+        KalSetGeometry();                  /* SETTING の行でポイント・ミラー・大きさが変わる */
         break;
-    case 'p': ed_on = 0; UpdateText(); ShowHelp(); return;
-    case '?': ShowEditHelp(); return;      /* h は割合 - に使うので一覧は ? だけ */
+    case 'p': ed_on = 0; txt_keys = 0; UpdateText(); ShowHelp(); return;
+    /* h は割合 - に使うので一覧は / と ? (/ は Shift 不要)。モニターもキーの並びの絵と切り替える */
+    case '/': case '?': txt_keys = !txt_keys; UpdateText(); ShowEditHelp(); return;
     default: xil_printf("(割り当て無し)\r\n"); return;
     }
     SpkSet();                              /* きらめき層の色・量・明るさ・大きさ (COMMIT は下の UpdateText) */
@@ -1228,6 +1285,37 @@ static void EditText(void)
     }
 }
 
+/* キーボードの 1 段ぶんを 2 行に描く。row にキーの文字、row+1 に働き (2 文字)。
+ * 1 キー 3 桁で並べ、段ごとに off 桁ずらして本物のキーボードの斜めの並びに似せる。
+ * lab[i] が NULL のキーは働きが無いので描かない */
+static void KeyRow(int row, int off, const char *keys, const char *const *lab)
+{
+    for (int i = 0; keys[i]; i++) {
+        if (!lab[i]) continue;
+        txt[row][off + 3 * i] = keys[i];
+        TxtPut(row + 1, off + 3 * i, lab[i]);
+    }
+}
+
+/* キーボードの並びの絵 (32 桁 x 8 行)。h (エディタでは /) で操作一覧と入れ替わる。
+ * 2 文字の略語の意味はシリアルの一覧 (日本語) に出る */
+static void KeyText(void)
+{
+    static const char *const n_num[10] = { 0,0,0,0,0,0,0,0,0, "RS" };
+    static const char *const n_q[10]   = { "P-","P+","MX","RV",0,0,0,"TX",0,"ED" };
+    static const char *const n_a[9]    = { "Z-","Z+",0,0,0,"KY","<<",0,">>" };
+    static const char *const n_z[7]    = { "S-","S+","CL","V-","V+",0,"MR" };
+    static const char *const e_num[10] = { "S1","S2","S3","S4","L1","L2","L3","L4",0,0 };
+    static const char *const e_q[10]   = { "K<","K>","R+","G+","B+","%+","N+","L+","Z+","EX" };
+    static const char *const e_a[9]    = { "C<","C>","R-","G-","B-","%-","N-","L-","Z-" };
+    static const char *const e_z[7]    = { 0,0,"CP",0,0,0,0 };
+    const int e = ed_on;
+    KeyRow(0, 0, "1234567890", e ? e_num : n_num);
+    KeyRow(2, 1, "QWERTYUIOP", e ? e_q   : n_q);
+    KeyRow(4, 2, "ASDFGHJKL",  e ? e_a   : n_a);
+    KeyRow(6, 3, "ZXCVBNM",    e ? e_z   : n_z);
+}
+
 static void UpdateText(void)
 {
     int r, c, i;
@@ -1235,6 +1323,10 @@ static void UpdateText(void)
     for (r = 0; r < TXT_ROWS; r++)
         for (c = 0; c < TXT_COLS; c++) txt[r][c] = ' ';
 
+    if (txt_keys) {
+        KeyText();
+        goto put;
+    }
     if (ed_on) {
         EditText();
         goto put;
@@ -1244,7 +1336,10 @@ static void UpdateText(void)
     TxtPut(1, 2, "Q W   POINTS");  TxtNum(1, 24, set_points);
     TxtPut(2, 2, "M     MIRROR");  TxtNum(2, 24, set_mirror2 ? 2 : 3);
     TxtPut(3, 2, "A S   ZOOM");    TxtNum(3, 24, (int)(set_zoom * 100.0f + 0.5f));
-    TxtPut(4, 2, "Z X   SPIN");    TxtNum(4, 24, (int)(set_autorotate * 100.0f + 0.5f));
+    /* 回転の速さと往復モード (R REV の数字は反転の間隔 [秒]、切なら OFF) */
+    TxtPut(4, 2, "Z X SPIN");      TxtNum(4, 14, (int)(set_autorotate * 100.0f + 0.5f));
+    TxtPut(4, 17, "R REV");
+    if (set_rev > 0) TxtNum(4, 24, set_rev); else TxtPut(4, 22, "OFF");
     TxtPut(5, 2, "V B   THICK");   TxtNum(5, 24, (int)(set_viscosity * 100.0f + 0.5f));
     TxtPut(6, 2, "E STIR  J L TURN  P EDIT");
     TxtPut(7, 2, "0 RESET I HIDE C");
