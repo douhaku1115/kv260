@@ -628,11 +628,19 @@ typedef struct {
 } SimPart;
 
 static SimPart sp[NPARTS];          /* parts[] と同じ並び */
-static u16     solid[NPARTS];       /* 押し合いに加わるもの (cr > 0) の番号 */
+/* 押し合いに加わるもの (cr > 0) を、マス目に入る「小」と、入らない「大」に分ける。
+ * マスの一辺は「小の cr の最大の 2 倍」以上あれば、小どうしは同じマスか隣のマスにしか
+ * 当たらない。一辺を cr の最大 (色ガラス 0.042) で決めると粗くなり、
+ * 調べる組の 95% が空振りだった (16x16: 41 万組 / 23x23: 23 万組・1 フレーム)。
+ * そこで cr の上位約 5% (大、約 50 個) をマス目から外し、別に調べる (tools/cr_stats.py) */
+static u16     solid[NPARTS];       /* 小の番号 */
 static int     nsolid;
-/* 押し合いのマス目。筒の中 (-1〜1) を GRID_N x GRID_N に分ける。
- * 一辺 grid_size は SimInit で「cr の最大の 2 倍」以上に決める */
-#define GRID_N 16
+static u16     big[NPARTS];         /* 大の番号 */
+static int     nbig;
+static float   small_cr_max;        /* 小の cr の最大。大がどこまでのマスを見るかに使う */
+/* 押し合いのマス目。筒の中 (-1〜1) を GRID_N x GRID_N に分ける。一辺 2/32 = 0.0625 なので
+ * cr が 0.03125 以下のものが小 */
+#define GRID_N 32
 static double  grid_size;
 /* 押し合いに使う値だけをマス目の順に詰めた写し (float)。
  * 段6b で 2038 個にしたとき、sp[] (1 個 80 バイト) を番号でたどる形だと
@@ -641,6 +649,8 @@ static u16     cell_start[GRID_N * GRID_N + 1];  /* マス c の範囲は cell_s
 static u16     cell_fill[GRID_N * GRID_N];
 static u16     pk_idx[NPARTS];                   /* 詰めた位置 → sp[] の番号 */
 static float   pk_x[NPARTS], pk_y[NPARTS], pk_z[NPARTS], pk_cr[NPARTS];
+/* 大の写し (並びは big[] と同じ) */
+static float   bg_x[NPARTS], bg_y[NPARTS], bg_z[NPARTS], bg_cr[NPARTS];
 
 static int GridCell(const SimPart *p)
 {
@@ -671,10 +681,20 @@ static double rnd(void)
     rng_state ^= rng_state << 5;
     return (rng_state >> 8) * (1.0 / 16777216.0);
 }
+/* 同じ乱数の単精度版 (移動のループ用) */
+static inline float rndf(void)
+{
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return (rng_state >> 8) * (1.0f / 16777216.0f);
+}
 
 static void SimInit(void)
 {
-    nsolid = 0;
+    nsolid = nbig = 0;
+    small_cr_max = 0.0f;
+    grid_size = 2.0 / GRID_N;
     for (int i = 0; i < NPARTS; i++) {
         const Part *p = &parts[i];
         SimPart *s = &sp[i];
@@ -683,14 +703,44 @@ static void SimInit(void)
         s->rot = p->rot;  s->spin = 0.0;
         s->sink = type_sink[p->typ] * (0.75 + 0.5 * rnd());   /* rand(0.75, 1.25) */
         s->cr = p->r * type_cr[p->typ];
-        if (s->cr > 0.0) solid[nsolid++] = (u16)i;
-        if (2.0 * s->cr > grid_size) grid_size = 2.0 * s->cr;
+        if (s->cr > 0.0) {
+            if (2.0 * s->cr <= grid_size) {
+                solid[nsolid++] = (u16)i;
+                if ((float)s->cr > small_cr_max) small_cr_max = (float)s->cr;
+            } else {
+                big[nbig++] = (u16)i;
+            }
+        }
         order[i] = (u16)i;
     }
-    /* マス目が筒の中 (幅 2) を覆いきれるように */
-    if (grid_size < 2.0 / GRID_N) grid_size = 2.0 / GRID_N;
-    xil_printf("押し合いのマス: 一辺 %d/1000、当たり判定のあるピース %d 個\r\n",
-               (int)(grid_size * 1000.0), nsolid);
+    xil_printf("押し合いのマス: 一辺 %d/1000、小 %d 個 (マス目)、大 %d 個 (別に調べる)\r\n",
+               (int)(grid_size * 1000.0), nsolid, nbig);
+}
+
+/* 押し合いの 1 組。重なっていれば当たり判定の面積 (cr^2) の比で押し離す */
+static inline void PushPair(float *xa, float *ya, float za, float cra,
+                            float *xb, float *yb, float zb, float crb)
+{
+    n_pair_sum++;
+    if (fabsf(za - zb) > 0.45f) return;
+    const float dx = *xb - *xa, dy = *yb - *ya;
+    const float minD = cra + crb;
+    const float d2 = dx * dx + dy * dy;
+    if (d2 >= minD * minD || d2 == 0.0f) return;
+    n_hit_sum++;
+    const float d = sqrtf(d2);
+    const float ov = (minD - d) / d;
+    const float ma = cra * cra, mb = crb * crb;
+    const float m = ma + mb;
+    *xa -= dx * ov * mb / m;  *ya -= dy * ov * mb / m;
+    *xb += dx * ov * ma / m;  *yb += dy * ov * ma / m;
+}
+
+/* 座標をマスの番号 (1 方向) にする。筒の外は端のマスに入れる */
+static inline int GridIdx(float v)
+{
+    int g = (int)((v + 1.0f) / (float)grid_size);
+    return (g < 0) ? 0 : (g >= GRID_N) ? GRID_N - 1 : g;
 }
 
 static void StepSim(double dt)
@@ -721,30 +771,42 @@ static void StepSim(double dt)
     XTime ta, tb, tc, td;
     XTime_GetTime(&ta);
 
+    /* 移動は単精度で計算する (2038 個 x 2 回で倍精度だと 1.7ms)。状態 sp[] は倍精度のまま。
+     * 時刻の位相は倍精度で 2π に折り返してから渡す (時間がたっても sinf の精度が落ちない) */
+    const float fk = (float)k, fdt = (float)dt, fw = (float)wRel;
+    const float fgx = (float)gx, fgy = (float)gy, fthin = (float)thin;
+    const float ph_x = (float)fmod(t * 0.31, TWO_PI_D), ph_y = (float)fmod(t * 0.27, TWO_PI_D);
     for (int i = 0; i < NPARTS; i++) {
         SimPart *p = &sp[i];
         const int typ = parts[i].typ;
+        float x = (float)p->x, y = (float)p->y, vx = (float)p->vx, vy = (float)p->vy;
         /* 筒との回転差による渦 + ゆるい対流 (ラメほど流されやすい) + 沈降 */
-        const double drift = (typ == TYPE_GLITTER) ? 0.09 : 0.03;
-        const double tx = -wRel * p->y + drift * sin(p->y * 3.1 + t * 0.31)
-                          + gx * p->sink * thin + (rnd() - 0.5) * 0.02;
-        const double ty =  wRel * p->x + drift * cos(p->x * 2.7 - t * 0.27)
-                          + gy * p->sink * thin + (rnd() - 0.5) * 0.02;
-        p->vx += (tx - p->vx) * k;
-        p->vy += (ty - p->vy) * k;
-        p->x += p->vx * dt;
-        p->y += p->vy * dt;
+        const float drift = (typ == TYPE_GLITTER) ? 0.09f : 0.03f;
+        const float sink = (float)p->sink * fthin;
+        const float tx = -fw * y + drift * sinf(y * 3.1f + ph_x)
+                         + fgx * sink + (rndf() - 0.5f) * 0.02f;
+        const float ty =  fw * x + drift * cosf(x * 2.7f - ph_y)
+                         + fgy * sink + (rndf() - 0.5f) * 0.02f;
+        vx += (tx - vx) * fk;
+        vy += (ty - vy) * fk;
+        x += vx * fdt;
+        y += vy * fdt;
+        p->x = x;  p->y = y;  p->vx = vx;  p->vy = vy;
         if (typ != TYPE_BUBBLE) {
-            p->vz += ((rnd() - 0.5) * 0.5 - p->vz * 1.5) * dt;
-            p->z += p->vz * dt * 0.15;
-            if (p->z < 0.02) { p->z = 0.02; p->vz =  fabs(p->vz); }
-            if (p->z > 0.98) { p->z = 0.98; p->vz = -fabs(p->vz); }
+            float z = (float)p->z, vz = (float)p->vz;
+            vz += ((rndf() - 0.5f) * 0.5f - vz * 1.5f) * fdt;
+            z += vz * fdt * 0.15f;
+            if (z < 0.02f) { z = 0.02f; vz =  fabsf(vz); }
+            if (z > 0.98f) { z = 0.98f; vz = -fabsf(vz); }
+            p->z = z;  p->vz = vz;
         }
-        const double speed = sqrt(p->vx * p->vx + p->vy * p->vy);
-        const double cross = p->vx * gy - p->vy * gx;
-        const double sgn = (cross > 0.0) ? 1.0 : (cross < 0.0) ? -1.0 : 1.0;  /* sign(..||1) */
-        p->spin += (wRel * 0.8 - p->spin) * k;
-        p->rot += (p->spin + speed * 0.3 / parts[i].r * sgn) * dt;
+        const float speed = sqrtf(vx * vx + vy * vy);
+        const float cross = vx * fgy - vy * fgx;
+        const float sgn = (cross > 0.0f) ? 1.0f : (cross < 0.0f) ? -1.0f : 1.0f;  /* sign(..||1) */
+        float spin = (float)p->spin;
+        spin += (fw * 0.8f - spin) * fk;
+        p->spin = spin;
+        p->rot += (spin + speed * 0.3f / (float)parts[i].r * sgn) * fdt;
     }
 
     /* 押し合い。奥行きが離れていれば重なってよい。
@@ -773,6 +835,11 @@ static void StepSim(double dt)
             pk_x[k] = (float)s->x;  pk_y[k] = (float)s->y;
             pk_z[k] = (float)s->z;  pk_cr[k] = (float)s->cr;
         }
+        for (int j = 0; j < nbig; j++) {
+            const SimPart *s = &sp[big[j]];
+            bg_x[j] = (float)s->x;  bg_y[j] = (float)s->y;
+            bg_z[j] = (float)s->z;  bg_cr[j] = (float)s->cr;
+        }
         /* 同じマスの中と、隣のマスのうち片側半分 (右・左下・下・右下) だけを調べる。
          * 反対側の 4 マスは、相手のマスから見たときに調べられる */
         static const int nbr_dx[4] = { 1, -1, 0, 1 };
@@ -791,29 +858,40 @@ static void StepSim(double dt)
                             const int n = ny * GRID_N + nx;
                             b0 = cell_start[n];  b1 = cell_start[n + 1];
                         }
-                        for (int b = b0; b < b1; b++) {
-                            n_pair_sum++;
-                            if (fabsf(pk_z[a] - pk_z[b]) > 0.45f) continue;
-                            const float dx = pk_x[b] - pk_x[a], dy = pk_y[b] - pk_y[a];
-                            const float minD = pk_cr[a] + pk_cr[b];
-                            const float d2 = dx * dx + dy * dy;
-                            if (d2 >= minD * minD || d2 == 0.0f) continue;
-                            n_hit_sum++;
-                            const float d = sqrtf(d2);
-                            const float ov = (minD - d) / d;
-                            const float ma = pk_cr[a] * pk_cr[a], mb = pk_cr[b] * pk_cr[b];
-                            const float m = ma + mb;
-                            pk_x[a] -= dx * ov * mb / m;  pk_y[a] -= dy * ov * mb / m;
-                            pk_x[b] += dx * ov * ma / m;  pk_y[b] += dy * ov * ma / m;
-                        }
+                        for (int b = b0; b < b1; b++)
+                            PushPair(&pk_x[a], &pk_y[a], pk_z[a], pk_cr[a],
+                                     &pk_x[b], &pk_y[b], pk_z[b], pk_cr[b]);
                     }
                 }
             }
         }
+        /* 大と小。大の中心から「大の cr + 小の cr の最大」までにかかるマスを全部見る
+         * (cr 0.042 でも前後 2 マスずつ) */
+        for (int j = 0; j < nbig; j++) {
+            const float reach = bg_cr[j] + small_cr_max;
+            const int gx0 = GridIdx(bg_x[j] - reach), gx1 = GridIdx(bg_x[j] + reach);
+            const int gy0 = GridIdx(bg_y[j] - reach), gy1 = GridIdx(bg_y[j] + reach);
+            for (int gy = gy0; gy <= gy1; gy++)
+                for (int gx = gx0; gx <= gx1; gx++) {
+                    const int c = gy * GRID_N + gx;
+                    for (int b = cell_start[c]; b < cell_start[c + 1]; b++)
+                        PushPair(&bg_x[j], &bg_y[j], bg_z[j], bg_cr[j],
+                                 &pk_x[b], &pk_y[b], pk_z[b], pk_cr[b]);
+                }
+        }
+        /* 大どうしは全部の組 (50 個で約 1200 組) */
+        for (int j = 0; j < nbig; j++)
+            for (int j2 = j + 1; j2 < nbig; j2++)
+                PushPair(&bg_x[j], &bg_y[j], bg_z[j], bg_cr[j],
+                         &bg_x[j2], &bg_y[j2], bg_z[j2], bg_cr[j2]);
         /* 押し合いで動いた位置を戻す */
         for (int k = 0; k < nsolid; k++) {
             SimPart *s = &sp[pk_idx[k]];
             s->x = pk_x[k];  s->y = pk_y[k];
+        }
+        for (int j = 0; j < nbig; j++) {
+            SimPart *s = &sp[big[j]];
+            s->x = bg_x[j];  s->y = bg_y[j];
         }
     }
     /* 筒の内壁 */
