@@ -36,10 +36,11 @@ sys.path.insert(0, "tools")
 import ref_scope as R
 import seam_tables as ST
 
-P_F, P_B = 15, 18       # p, dir
+P_F, P_B = 15, 18       # p (光線は三角形の中にとどまるので ±4 で足りる)
+DIR_B = 20              # dir (段9: 傾けると slope が最大 6.75 になるので 18→20 ビット、±16)
 N_F, N_B = 16, 18       # 法線
 A_F, A_B = 14, 18       # a, wd
-D_F, D_B = 15, 18       # dn
+D_F, D_B = 15, 20       # dn (= dot(dir, n) なので dir と同じ 20 ビット)
 Q_F, Q_B = 14, 20       # t, remain
 
 RECIP_LUT_BITS = 9      # 逆数表 512 エントリ
@@ -74,14 +75,16 @@ def fx_div(a, dn):
         nbits = np.where(x > 0, b + 1, nbits)
         x = x >> 1
 
-    mant = (dn << 31) >> nbits                       # Q31 の [0.5,1)。最上位ビットは常に 1
+    # rtl/divq.v と同じく仮数を 18 ビット (mn) に切り詰めてから Q31 に並べる
+    mn = np.where(nbits <= 18, dn << np.maximum(18 - nbits, 0), dn >> np.maximum(nbits - 18, 0))
+    mant = mn << 13                                  # Q31 の [0.5,1)。最上位ビットは常に 1
     # 表は最上位ビットの「下」の 9 ビットで引く (m = 0.5 + idx/1024)
     idx = (mant >> (30 - RECIP_LUT_BITS)) & ((1 << RECIP_LUT_BITS) - 1)
     y0 = RECIP_LUT[idx]                              # Q RECIP_OUT_F
 
     # ニュートン1回:  y1 = y0 * (2 - mant*y0)
     my = (mant * y0) >> 31                           # Q RECIP_OUT_F
-    y1 = (y0 * ((2 << RECIP_OUT_F) - my)) >> RECIP_OUT_F
+    y1 = np.minimum((y0 * ((2 << RECIP_OUT_F) - my)) >> RECIP_OUT_F, (1 << 19) - 1)
 
     # 1/dn = y1 / 2^RECIP_OUT_F * 2^(D_F - nbits)
     # q = a / 2^A_F * (1/dn) * 2^Q_F
@@ -91,7 +94,70 @@ def fx_div(a, dn):
     return np.clip(q, 0, (1 << Q_B) - 1)
 
 
-def render(K=16):
+def view_matrix(tx, ty):
+    """参照実装 (ref/mirrorGeometry.js) の viewMatrix。列が r, up, f の 3x3 (rd = M @ (sx, sy, focal))"""
+    a = np.hypot(tx, ty)
+    s = 1.0 if a < 1e-6 else np.sin(a) / a
+    f = np.array([tx * s, ty * s, np.cos(a)])
+    r = np.array([f[2], 0.0, -f[0]])
+    r /= np.hypot(r[0], r[2])
+    up = np.cross(f, r)
+    return np.stack([r, up, f], axis=1)
+
+
+# 視線の傾き (段9)。slope = rd.xy / rd.z を画素ごとに作る (rtl/scope_pipe.v の setup S1〜S7)
+#   rd = r*sx + up*sy + f*focal、sx = hn/1440、sy = vn/1440 (hn = 2h-1279、vn = 719-2v。上向き正)
+#   1440 倍した  N = a*hn + b*vn + c  を x / y / z の 3 本作る。
+#     a, b: Q16 18 ビット (PS が渡す)、c: Q16 32 ビット (focal*1440 を含む。最大 2^28)
+#   dir = Nx / Nz は、Nz の仮数 24 ビットを逆数表 + ニュートン 1 回で 1/Nz にして掛ける。
+#   Nz <= 0 (後ろ向き) は黒。傾き 0 でもこの道を通る (kx の掛け算は使わない)
+CO_F = 16                 # 係数 a, b, c の小数部
+MN_B = 24                 # Nz を正規化した仮数のビット数
+NS_SH = 22                # Nx を Nz と同じだけ縮めるときの基準 (Nx_s = Nx >> (nb - NS_SH))
+NS_B = 27                 # Nx_s の幅 (符号付き)
+
+
+def view_coefs(view, focal):
+    """PS が書く 9 個の係数 (ax, bx, cx, ay, by, cy, az, bz, cz)"""
+    M = np.asarray(view, dtype=np.float64)
+    co = []
+    for row in range(3):                             # rd[row] = M[row,0]*sx + M[row,1]*sy + M[row,2]*focal
+        co += [int(round(M[row, 0] * (1 << CO_F))),
+               int(round(M[row, 1] * (1 << CO_F))),
+               int(round(M[row, 2] * focal * 1440 * (1 << CO_F)))]
+    return co
+
+
+def fx_slope(co, W, H):
+    """dir (Q P_F、DIR_B ビット) と「後ろ向き (Nz <= 0)」の印を返す"""
+    px, py = np.meshgrid(np.arange(W), np.arange(H))
+    hn = (2 * px - 1279).astype(np.int64)
+    vn = (719 - 2 * py).astype(np.int64)
+    N = [co[3*r] * hn + co[3*r+1] * vn + co[3*r+2] for r in range(3)]   # S1
+    Nz = N[2]
+    back = Nz <= 0
+    d = np.maximum(Nz, 1)
+    nb = np.zeros_like(d)                            # S2: 先頭 1 の位置 (1 始まり)
+    x = d.copy()
+    for b in range(31):
+        nb = np.where(x > 0, b + 1, nb)
+        x = x >> 1
+    # S3: 仮数 mn ∈ [2^23, 2^24) と、同じだけ縮めた Nx_s, Ny_s (27 ビットで飽和)
+    mn = np.where(nb <= MN_B, d << np.maximum(MN_B - nb, 0), d >> np.maximum(nb - MN_B, 0))
+    ns = [sat(np.where(nb >= NS_SH, n >> np.maximum(nb - NS_SH, 0), n << np.maximum(NS_SH - nb, 0)), NS_B)
+          for n in N[:2]]
+    y0 = RECIP_LUT[(mn >> (MN_B - 1 - RECIP_LUT_BITS)) & ((1 << RECIP_LUT_BITS) - 1)]   # S4
+    my = (mn * y0) >> MN_B                                                              # S5
+    y1 = np.minimum((y0 * ((2 << RECIP_OUT_F) - my)) >> RECIP_OUT_F, (1 << 19) - 1)    # S6
+    # S7: 1/Nz = y1 / 2^17 / 2^nb、Nx = Nx_s * 2^(nb-22) なので dir*2^15 = Nx_s*y1 / 2^24
+    sh = RECIP_OUT_F + NS_SH - P_F                   # = 24
+    return sat((ns[0] * y1) >> sh, DIR_B), sat((ns[1] * y1) >> sh, DIR_B), back
+
+
+TRACE = None              # (y, x) を入れると、その画素の段ごとの値を表示する (RTL 照合用)
+
+
+def render(K=16, view=None, focal=None):
     walls, verts = R.mirror_geometry(R.POINTS)
     VX = to_fx([v[0] for v in verts], P_F, P_B)
     VY = to_fx([v[1] for v in verts], P_F, P_B)
@@ -105,13 +171,16 @@ def render(K=16):
     spx = (px + 0.5 - 0.5 * W) / H
     spy = (0.5 * H - (py + 0.5)) / H
 
-    # 傾き 0 のときは slope = sp / focal (除算不要。PS が 1/focal を渡す)
-    slx = to_fx(spx / R.FOCAL, P_F, P_B)
-    sly = to_fx(spy / R.FOCAL, P_F, P_B)
+    focal = R.FOCAL if focal is None else focal
+    if view is None:
+        view = np.eye(3)
+    slx, sly, back = fx_slope(view_coefs(view, focal), W, H)
 
     zm = int(round(R.Z_MIRROR * (1 << 16)))
-    px_ = sat((slx * zm) >> 16, P_B)                 # p = slope * Z_MIRROR
-    py_ = sat((sly * zm) >> 16, P_B)
+    # p = slope * Z_MIRROR。三角形の外かを見るまでは DIR_B ビットで持つ (18 ビットだと巻き戻って
+    # 外の画素が内側に化ける)。内側なら 18 ビットに収まる
+    px_ = sat((slx * zm) >> 16, DIR_B)
+    py_ = sat((sly * zm) >> 16, DIR_B)
     dx, dy = slx.copy(), sly.copy()
 
     remain = np.full(px_.shape, int(round((R.Z_CELL - R.Z_MIRROR) * (1 << Q_F))), dtype=np.int64)
@@ -120,13 +189,22 @@ def render(K=16):
     done = np.zeros(px_.shape, dtype=bool)
 
     # 三角形の外 (筒の縁) は黒
-    black = np.zeros(px_.shape, dtype=bool)
+    black = back.copy()                              # 後ろ向きの視線も黒
     for w in range(3):
         dot = (px_ * NX[w] + py_ * NY[w]) >> (P_F + N_F - A_F)
         black |= dot > WD[w]
     done |= black
+    px_ = np.where(black, 0, px_)                    # 内側の画素は 18 ビットに収まっている
+    py_ = np.where(black, 0, py_)
+    global SETUP
+    SETUP = dict(px=px_.copy(), py=py_.copy(), dx=dx.copy(), dy=dy.copy())   # RTL 照合用
 
     for stage in range(K):
+        if TRACE is not None:
+            ty, tx = TRACE
+            print("段 %d: p=(%d,%d) d=(%d,%d) rm=%d nr=%d done=%d" % (
+                stage, px_[ty, tx], py_[ty, tx], dx[ty, tx], dy[ty, tx],
+                remain[ty, tx], nrefl[ty, tx], done[ty, tx]))
         a = np.stack([sat(WD[w] - ((px_ * NX[w] + py_ * NY[w]) >> (P_F + N_F - A_F)), A_B)
                       for w in range(3)], -1)
         dn = np.stack([sat((dx * NX[w] + dy * NY[w]) >> (P_F + N_F - D_F), D_B)
@@ -134,15 +212,16 @@ def render(K=16):
         a = np.maximum(a, 0)
         cand = dn > 0
 
-        # 最小の t を持つ壁を選ぶ (除算なし)
-        best = np.zeros(px_.shape, dtype=np.int64)
-        has = cand[..., 0].copy()
-        for w in (1, 2):
-            ab = np.take_along_axis(a, best[..., None], -1)[..., 0]
-            db = np.take_along_axis(dn, best[..., None], -1)[..., 0]
-            better = cand[..., w] & (~has | (a[..., w] * db < ab * dn[..., w]))
-            best = np.where(better, w, best)
-            has |= cand[..., w]
+        # 最小の t を持つ壁を選ぶ (除算なし)。同点の決め方まで rtl/scope_stage.v の T1 と同じ式
+        #   (光線が三角形の頂点にちょうど当たると 2 枚の t が等しくなる)
+        c0, c1, c2 = cand[..., 0], cand[..., 1], cand[..., 2]
+        t01 = a[..., 0] * dn[..., 1] < a[..., 1] * dn[..., 0]
+        t02 = a[..., 0] * dn[..., 2] < a[..., 2] * dn[..., 0]
+        t12 = a[..., 1] * dn[..., 2] < a[..., 2] * dn[..., 1]
+        sel0 = c0 & (~c1 | t01) & (~c2 | t02)
+        sel1 = ~sel0 & c1 & (~c0 | ~t01) & (~c2 | t12)
+        best = np.where(sel0, 0, np.where(sel1, 1, 2))
+        has = c0 | c1 | c2
 
         a_s = np.take_along_axis(a, best[..., None], -1)[..., 0]
         dn_s = np.take_along_axis(dn, best[..., None], -1)[..., 0]
@@ -181,15 +260,14 @@ def render(K=16):
         nsx = NX[best]
         nsy = NY[best]
         two_dn = dn_s << 1
-        ndx = sat(dx - ((two_dn * nsx) >> N_F), P_B)
-        ndy = sat(dy - ((two_dn * nsy) >> N_F), P_B)
+        ndx = sat(dx - ((two_dn * nsx) >> N_F), DIR_B)
+        ndy = sat(dy - ((two_dn * nsy) >> N_F), DIR_B)
         dx = np.where(hit, ndx, dx)
         dy = np.where(hit, ndy, dy)
         nrefl = np.where(hit, nrefl + 1, nrefl)
 
-    # 反射上限に達した画素も残りを進める
-    px_ = np.where(~done, sat(px_ + ((dx * remain) >> Q_F), P_B), px_)
-    py_ = np.where(~done, sat(py_ + ((dy * remain) >> Q_F), P_B), py_)
+    # 反射上限に達した画素は黒 (直進させると筒の外を引いて明るい筋になる。段9)
+    black |= ~done
 
     # セル座標 c = p / TUBE_R  ->  テクスチャ添字 (0..CELL_N-1)
     n = R.CELL_N
@@ -198,6 +276,10 @@ def render(K=16):
     cy = (py_ * inv_tr) >> 16
     ix = np.clip(((cx + (1 << P_F)) * n) >> (P_F + 1), 0, n - 1)
     iy = np.clip(((cy + (1 << P_F)) * n) >> (P_F + 1), 0, n - 1)
+
+    # RTL との照合用 (tools/tilt_tb.py)
+    global LAST
+    LAST = dict(cx=cx, cy=cy, nrefl=nrefl, seam=seam, black=black)
 
     cell = R.make_test_cell(n)
     col = cell[iy, ix]

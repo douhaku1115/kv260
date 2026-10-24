@@ -36,7 +36,7 @@
 /* ========== 万華鏡のレジスタ (kaleido_axi_slave、0x10 刻み) ========== */
 #define KAL_BASE      0xA0000000U
 #define KAL_CTRL      (KAL_BASE + 0x000)   /* bit0 = 2枚鏡 */
-#define KAL_KX        (KAL_BASE + 0x010)   /* 2^26 / (2*720*focal) */
+/* 0x010 は段8 までの KX (画角)。段9 で下の KAL_VIEW に置き換えた */
 #define KAL_Z_MIRROR  (KAL_BASE + 0x020)   /* Q16 */
 #define KAL_REMAIN0   (KAL_BASE + 0x030)   /* Q14 */
 #define KAL_INV_TR    (KAL_BASE + 0x040)   /* Q16 */
@@ -63,6 +63,9 @@
  * PS は配色エディタの SPARK の 8 色を、割合に応じて 16 個へ振り分けて書く (SpkColors) */
 #define KAL_SPK_COL(i) (KAL_BASE + 0x1F0 + (i)*0x10)
 #define SPK_NCOL      16
+/* 視線の向き (段9)。AX BX CX AY BY CY AZ BZ CZ の 9 語。rd*1440 = A*hn + B*vn + C。
+ * A, B は Q16、C は Q16 で 向き行列の 3 列目 * focal * 1440 (KalSetView) */
+#define KAL_VIEW(i)   (KAL_BASE + 0x2F0 + (i)*0x10)
 #define SPK_GAP_PX    7.0     /* 点と点の間隔のめやす [画面の画素] */
 #define SPK_BASE      26      /* 明るさ 100% のときの base (0.2 * 128) */
 #define SPK_FLASH     205     /* 明るさ 100% のときの flash (1.6 * 128) */
@@ -106,6 +109,17 @@ static int    auto_slot = 1;          /* 今読んでいる番号。起動時は
 static int   set_text_on    = 1;      /* 操作一覧をモニターに出すか */
 static int   txt_keys       = 0;      /* モニターの文字をキーボードの並びの絵にするか (h / エディタでは /) */
 static float set_viscosity  = 0.5f;   /* 粘り 0〜1。参照実装の既定値 (まだキーは無い) */
+
+/* 視線の傾き (段9)。参照実装 ref/mirrorGeometry.js の view と同じ。
+ * (tx, ty) の向きに |(tx,ty)| [rad] 傾ける。tx > 0 で右、ty > 0 で上を見る。
+ * キー (d g y n) を押すたびに勢い (vel) が付き、指数で減って止まる。f で真ん中へ戻る (homing) */
+#define TILT_MAX   0.9       /* 参照実装と同じ。これ以上は縁が黒く欠けるばかりになる */
+#define TILT_KICK  0.25      /* 1 回押したときに付く勢い [rad/s]。押し続け (キーリピート) で速くなる */
+#define TILT_VMAX  1.5       /* 勢いの上限 [rad/s] */
+static double view_tx = 0.0, view_ty = 0.0;
+static double view_vx = 0.0, view_vy = 0.0;
+static int    view_homing = 0;
+static int    view_dirty  = 0;   /* 傾きか大きさが変わった。次のフレームで KalSetView */
 
 /* 筒の回転角 [rad]。PL の COS_T/SIN_T (セルの回転) と物理演算の重力の向きの両方に使う */
 static double sim_tube_angle = 0.0;
@@ -218,6 +232,9 @@ static void RunDP(void);
 static void SetupVideoStream(void);
 static u32 TrainLink(void);
 static void KalSetGeometry(void);
+static void KalSetView(void);
+static void UpdateView(double dt);
+static void TiltKick(double dx, double dy);
 static void SpkSet(void);
 static void SpkTick(void);
 static int  uart_getchar_nb(void);
@@ -284,15 +301,16 @@ int main(void)
     /* ========== AXI の疎通確認 ==========
      * 書いた値が読み返せるか、PL のフレーム数が進んでいるかを見る。
      * 回らないときは、ここの出力で原因が分かる:
-     *   KX が 109655 でない      → 書き込みが届いていない
+     *   CZ が 80216064 でない    → 書き込みが届いていない (zoom 1.0、傾きなしのとき)
+     *                              (段8 までのビットストリームでは 0 が返る)
      *   FRAME_CNT が 0 のまま    → frame_start が立っていない、か読み出し経路
      *   FRAME_CNT が進む         → PL 側は正常。待ちループ以外が原因
      */
     xil_printf("--- AXI diag ---\r\n");
     for (int i = 0; i < 5; i++) {
-        xil_printf("  FRAME_CNT=%u  KX=%u  NX0=%u  COS=%u\r\n",
+        xil_printf("  FRAME_CNT=%u  CZ=%u  NX0=%u  COS=%u\r\n",
                    (unsigned)Xil_In32(KAL_FRAME_CNT),
-                   (unsigned)Xil_In32(KAL_KX),
+                   (unsigned)Xil_In32(KAL_VIEW(8)),
                    (unsigned)Xil_In32(KAL_WALL(0,0)),
                    (unsigned)Xil_In32(KAL_COS_T));
         usleep(100000);          /* 100ms = 6 フレームぶん */
@@ -361,6 +379,9 @@ int main(void)
             if (auto_t >= set_auto) { auto_t = 0.0;  AutoNext(); }
         }
 
+        UpdateView(dt);               /* 視線の傾き (段9)。動いていれば係数を書き直す */
+        if (view_dirty) KalSetView();
+
         Xil_Out32(KAL_COS_T, (u32)(s32)(cos(sim_tube_angle) * 32768.0));
         Xil_Out32(KAL_SIN_T, (u32)(s32)(sin(sim_tube_angle) * 32768.0));
         SpkTick();
@@ -407,15 +428,8 @@ static int uart_getchar_nb(void)
     return (int)(XUartPs_ReadReg(UART_BASE, XUARTPS_FIFO_OFFSET) & 0xFF);
 }
 
-/* ★ PL の scope_pipe の KX_SH と必ず合わせること ★
- *
- *   KX_SH = 12 のビットストリーム:  KX_NUM = 2^27,  zoom 下限 0.85
- *   KX_SH = 11 のビットストリーム:  KX_NUM = 2^26,  zoom 下限 0.50
- *
- * KX = KX_NUM/(1440*0.85*zoom) が 18bit (131071) を超えると模様が壊れる。
- * KX_SH=12 だと境界が zoom=0.837 で、実機でちょうどそこで崩れるのを確認した。
- * 合わせ忘れると画角がちょうど2倍ずれる。 */
-#define KX_NUM    67108864.0f    /* 2^26  … KX_SH = 11 用 (2026-09-19 以降) */
+/* 大きさ (zoom) の範囲。focal = 0.85 * zoom。段9 で画角は KalSetView の係数 C に入った。
+ * C は最大 0.85*2.5*1440*2^16 = 2.0e8 で 32 ビットに収まる */
 #define ZOOM_MIN  0.50f
 #define ZOOM_MAX  2.50f
 
@@ -442,6 +456,7 @@ static void ShowHelp(void)
     xil_printf(" [q]ポイント- [w]ポイント+ [e]混ぜる [r]往復 [t]構成 [i]一覧 [o]自動 [p]配色\r\n");
     xil_printf("  [a]小さく [s]大きく                  [h]この一覧 [j]左回し   [l]右回し\r\n");
     xil_printf("   [z]回転遅く [x]回転速く [c]色の組 [v]サラサラ [b]ネバネバ   [m]鏡2/3枚\r\n");
+    xil_printf("  視線: [d]左 [g]右 [y]上 [n]下 を見る (押すたびに勢いが付き、ゆっくり止まる) [f]まっすぐ\r\n");
     xil_printf("  r 往復: 切→5秒→10秒→20秒→切   c 色の組: %d 通り   j l は押している間だけ\r\n",
                NPALETTES);
     xil_printf("  t 構成: 全部→粒だけ→ガラスと石→ラメなし   i 画面の一覧を出す/消す\r\n");
@@ -451,6 +466,7 @@ static void ShowHelp(void)
     xil_printf("  h はモニターの文字もキーの並びの絵にする (もう一度 h で戻る)。絵の略語:\r\n");
     xil_printf("    P±ポイント MX混ぜる RV往復 TX画面一覧 ED配色 Z±大きさ KYこの絵 <<>>手で回す\r\n");
     xil_printf("    S±回転 CL色の組 V±粘り MR鏡 RS初期設定 AU自動 CM構成\r\n");
+    xil_printf("    TL TR TU TD 視線の左右上下 T0 まっすぐ\r\n");
     ShowSettings();
 }
 
@@ -512,6 +528,13 @@ static void HandleKey(int c)
     case 'j': SimTurn(+1.0);  return;
     case 'l': SimTurn(-1.0);  return;
 
+    /* 視線を傾ける (段9)。押すたびに勢いが付く。表示は変わらないので一覧は出し直さない */
+    case 'd': TiltKick(-1.0,  0.0); return;
+    case 'g': TiltKick(+1.0,  0.0); return;
+    case 'y': TiltKick( 0.0, +1.0); return;
+    case 'n': TiltKick( 0.0, -1.0); return;
+    case 'f': view_homing = 1;  view_vx = view_vy = 0.0;  return;
+
     /* 操作一覧をモニターに出す/消す */
     case 'i': set_text_on = !set_text_on; break;
 
@@ -528,6 +551,7 @@ static void HandleKey(int c)
         set_comp = 0;  SimLists();
         set_viscosity = 0.5f;  LoadPreset(0);
         spk_amount = 45;  spk_bright = 100;  spk_size = 75;    /* SpkSet は KalSetGeometry から */
+        view_homing = 1;  view_vx = view_vy = 0.0;               /* 視線もまっすぐへ戻す */
         geom = 1;
         break;
     /* シリアルに一覧を出し、モニターの文字もキーの並びの絵と切り替える */
@@ -1456,9 +1480,9 @@ static void KeyRow(int row, int off, const char *keys, const char *const *lab)
 static void KeyText(void)
 {
     static const char *const n_num[10] = { 0,0,0,0,0,0,0,0,0, "RS" };
-    static const char *const n_q[10]   = { "P-","P+","MX","RV","CM",0,0,"TX","AU","ED" };
-    static const char *const n_a[9]    = { "Z-","Z+",0,0,0,"KY","<<",0,">>" };
-    static const char *const n_z[7]    = { "S-","S+","CL","V-","V+",0,"MR" };
+    static const char *const n_q[10]   = { "P-","P+","MX","RV","CM","TU",0,"TX","AU","ED" };
+    static const char *const n_a[9]    = { "Z-","Z+","TL","T0","TR","KY","<<",0,">>" };
+    static const char *const n_z[7]    = { "S-","S+","CL","V-","V+","TD","MR" };
     static const char *const e_num[10] = { "S1","S2","S3","S4","L1","L2","L3","L4",0,0 };
     static const char *const e_q[10]   = { "K<","K>","R+","G+","B+","%+","N+","L+","Z+","EX" };
     static const char *const e_a[9]    = { "C<","C>","R-","G-","B-","%-","N-","L-","Z-" };
@@ -1558,8 +1582,7 @@ static void KalSetGeometry(void)
         Xil_Out32(KAL_VERT(v,1), (u32)(s32)(vy[v] * 32768.0f));  /* Q15 */
     }
 
-    /* 画角。kx = 2^27 / (2 * 画面の高さ * focal),  focal = 0.85 * zoom */
-    Xil_Out32(KAL_KX,       (u32)(KX_NUM / (1440.0f * 0.85f * set_zoom)));
+    KalSetView();                 /* 画角 (zoom) と視線の傾き。段9 で KX から置き換え */
     Xil_Out32(KAL_Z_MIRROR, (u32)(Z_MIRROR * 65536.0f));                 /* Q16 */
     Xil_Out32(KAL_REMAIN0,  (u32)((Z_CELL - Z_MIRROR) * 16384.0f));      /* Q14 */
     Xil_Out32(KAL_INV_TR,   (u32)(65536.0f / TUBE_R));                   /* Q16 */
@@ -1568,6 +1591,74 @@ static void KalSetGeometry(void)
     Xil_Out32(KAL_SIN_T,    0);
     SpkSet();
     Xil_Out32(KAL_COMMIT,   1);
+}
+
+/* ========== 視線の傾き (段9) ==========
+ * 参照実装 ref/mirrorGeometry.js の viewMatrix() と同じ向き行列を作り、PL の係数 9 個にする。
+ *   f  = (tx*s, ty*s, cos a)   a = |(tx,ty)|, s = sin(a)/a   … 見る向き (+z が筒の奥)
+ *   r  = normalize(f.z, 0, -f.x)                             … 画面の横 (水平のまま)
+ *   up = f × r                                               … 画面の縦
+ *   rd = r*sx + up*sy + f*focal   (sx = hn/1440, sy = vn/1440)
+ * PL は rd*1440 = A*hn + B*vn + C を作るので
+ *   A = r * 2^16,  B = up * 2^16,  C = f * focal * 1440 * 2^16    (x, y, z の 3 組)
+ * tools/fx_scope.py の view_coefs() と同じ式。 */
+static s32 RoundS32(double v) { return (s32)(v < 0.0 ? v - 0.5 : v + 0.5); }
+
+static void KalSetView(void)
+{
+    const double a = sqrt(view_tx * view_tx + view_ty * view_ty);
+    const double s = (a < 1e-6) ? 1.0 : sin(a) / a;
+    const double f[3] = { view_tx * s, view_ty * s, cos(a) };
+    const double rl = sqrt(f[2] * f[2] + f[0] * f[0]);
+    const double r[3] = { f[2] / rl, 0.0, -f[0] / rl };
+    const double up[3] = { f[1] * r[2] - f[2] * r[1],
+                           f[2] * r[0] - f[0] * r[2],
+                           f[0] * r[1] - f[1] * r[0] };
+    const double focal = 0.85 * set_zoom;
+
+    for (int k = 0; k < 3; k++) {
+        Xil_Out32(KAL_VIEW(k * 3 + 0), (u32)RoundS32(r[k]  * 65536.0));
+        Xil_Out32(KAL_VIEW(k * 3 + 1), (u32)RoundS32(up[k] * 65536.0));
+        Xil_Out32(KAL_VIEW(k * 3 + 2), (u32)RoundS32(f[k]  * focal * 1440.0 * 65536.0));
+    }
+    view_dirty = 0;               /* COMMIT は呼んだ側が書く */
+}
+
+/* キー 1 回ぶんの勢いを足す。dx, dy は ±1 (右・上が +) */
+static void TiltKick(double dx, double dy)
+{
+    view_homing = 0;
+    view_vx += dx * TILT_KICK;
+    view_vy += dy * TILT_KICK;
+    if (view_vx >  TILT_VMAX) view_vx =  TILT_VMAX;
+    if (view_vx < -TILT_VMAX) view_vx = -TILT_VMAX;
+    if (view_vy >  TILT_VMAX) view_vy =  TILT_VMAX;
+    if (view_vy < -TILT_VMAX) view_vy = -TILT_VMAX;
+}
+
+/* 毎フレーム。参照実装の updateView() と同じ (勢いは exp(-4t) で減り、戻るときは exp(-6t)) */
+static void UpdateView(double dt)
+{
+    if (view_homing) {
+        const double k = 1.0 - exp(-dt * 6.0);
+        view_tx -= view_tx * k;
+        view_ty -= view_ty * k;
+        if (sqrt(view_tx * view_tx + view_ty * view_ty) < 1e-3) {
+            view_tx = view_ty = 0.0;
+            view_homing = 0;
+        }
+        view_dirty = 1;
+    } else if (view_vx != 0.0 || view_vy != 0.0) {
+        view_tx += view_vx * dt;
+        view_ty += view_vy * dt;
+        const double d = sqrt(view_tx * view_tx + view_ty * view_ty);
+        if (d > TILT_MAX) { view_tx *= TILT_MAX / d;  view_ty *= TILT_MAX / d; }
+        const double fv = exp(-dt * 4.0);
+        view_vx *= fv;
+        view_vy *= fv;
+        if (fabs(view_vx) < 1e-3 && fabs(view_vy) < 1e-3) view_vx = view_vy = 0.0;
+        view_dirty = 1;
+    }
 }
 
 /* ========== きらめき層の設定 ==========

@@ -2,7 +2,7 @@
 //  divq — 万華鏡の光線追跡で使う除算  q = a / dn
 //
 //  a  : Q4.14  18bit 符号付き (0 以上)   壁までの距離の分子
-//  dn : Q3.15  18bit 符号付き (正)       光線方向と壁法線の内積
+//  dn : Q.15   D_W bit 符号付き (正)     光線方向と壁法線の内積 (段9 で 20bit)
 //  q  : Q6.14  Q_W bit 符号なし          交差までの媒介変数 (0〜11.9)
 //
 //  方式
@@ -27,13 +27,14 @@ module divq
     parameter Q_W = 20,          // q のビット幅
     parameter LUT_F = 17,        // 逆数表の小数ビット (Q1.17)
     parameter LUT_BITS = 9,      // 逆数表のアドレス幅 (512 エントリ)
-    parameter LUT_FILE = "recip_lut.hex"
+    parameter LUT_FILE = "recip_lut.hex",
+    parameter D_W = 18           // dn のビット幅 (段9 で 20。仮数は 18 ビットに切り詰める)
     )
   (
-   input wire               clk,
-   input wire signed [17:0] a,    // >= 0
-   input wire signed [17:0] dn,   // >  0
-   output wire [Q_W-1:0]    q
+   input wire                  clk,
+   input wire signed [17:0]    a,    // >= 0
+   input wire signed [D_W-1:0] dn,   // >  0
+   output wire [Q_W-1:0]       q
    );
 
   localparam LATENCY  = 6;
@@ -47,12 +48,12 @@ module divq
   // ---- P0: 先頭1の位置 nbits と正規化仮数 mn ----
   integer   i;
   reg [4:0] nb;
-  reg [17:0] dnu;
+  reg [D_W-1:0] dnu;
 
   always @* begin
-    dnu = dn[17] ? 18'd0 : dn[17:0];     // 負は来ない前提。来たら 0 扱い
+    dnu = dn[D_W-1] ? {D_W{1'b0}} : dn;  // 負は来ない前提。来たら 0 扱い
     nb  = 5'd0;
-    for (i = 0; i < 18; i = i + 1)
+    for (i = 0; i < D_W; i = i + 1)
       if (dnu[i]) nb = i[4:0] + 5'd1;    // 最上位の 1 の位置 (1 始まり)
   end
 
@@ -60,9 +61,14 @@ module divq
   reg [17:0] mn_0;
   reg [17:0] a_0;
 
+  // 18 ビットを超える dn は下位を切り捨てて仮数にする (tools/fx_scope.py の fx_div と同じ)
+  wire [D_W+17:0] dn_up = {18'd0, dnu} << (5'd18 - nb);
+  wire [D_W-1:0]  dn_dn = dnu >> (nb - 5'd18);
+
   always @(posedge clk) begin
     nbits_0 <= nb;
-    mn_0    <= (nb == 5'd0) ? 18'h20000 : (dnu << (5'd18 - nb));
+    mn_0    <= (nb == 5'd0)  ? 18'h20000 :
+               (nb <= 5'd18) ? dn_up[17:0] : dn_dn[17:0];
     a_0     <= a[17] ? 18'd0 : a;        // 負は 0 に丸める
   end
 

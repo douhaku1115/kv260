@@ -6,18 +6,21 @@
 //
 //  前段 (setup)
 //    sp    = 画面中心からの位置 (縦を 1 とした正規化座標)
-//    slope = sp / focal            … 視線が奥へ 1cm 進むごとの断面での移動
-//    p     = slope * Z_MIRROR      … 鏡の手前の端での位置
-//    三角形の外なら黒 (筒の縁)
+//    rd    = 視線の向き行列 * (sp, focal)       … 段9 で視線を傾けられるようにした
+//    slope = rd.xy / rd.z                      … 視線が奥へ 1cm 進むごとの断面での移動
+//    p     = slope * Z_MIRROR                  … 鏡の手前の端での位置
+//    三角形の外 (筒の縁) と、後ろ向きの視線 (rd.z <= 0) は黒
 //
 //  本体 (scope_stage を K 段)
 //    鏡に当たるたびに反射。remain (= Z_CELL - Z_MIRROR) を消費し切ったら終了。
+//    K 回反射してもまだ残りがある画素は黒 (段9。直進させると筒の外を引いて筋になる)
 //
 //  後段 (out)
 //    c  = p / TUBE_R   → セル画像の添字 (0 .. CELL_N-1)
 //
 //  遅延 LATENCY = SETUP_LAT + K*12 + OUT_LAT。
 //  vga_iface の PIXEL_DELAY をこれに合わせること。
+//  固定小数点の手順は tools/fx_scope.py と一対一 (照合は sim/tb_scope_pipe.v)。
 // ============================================================
 
 module scope_pipe
@@ -30,6 +33,7 @@ module scope_pipe
     parameter D_F      = 15,
     parameter Q_F      = 14,
     parameter Q_W      = 20,
+    parameter DW       = 20,     // dir のビット幅 (段9 で 18→20。p は 18 のまま)
     // 影のずらし量。参照実装の (0.012, -0.016) を添字に直したもの
     //   round(0.012 * CELL_N/2) = +2,  round(-0.016 * CELL_N/2) = -2  (CELL_N=256)
     parameter signed [7:0] SHADOW_X =  8'sd2,
@@ -44,8 +48,16 @@ module scope_pipe
    input wire [10:0]         count_h,
    input wire [10:0]         count_v,
 
-   // パラメータ (PS が AXI で書く。段2 では rtl_top が定数を与える)
-   input wire signed [17:0]  kx,        // 2^26 / (2 * VGA_HEIGHT * focal)
+   // パラメータ (PS が AXI で書く)
+   //   視線の向き (段9)。rd*1440 = (a*hn + b*vn + c) を x, y, z の 3 本。
+   //   hn = 2h-1279, vn = 719-2v。a, b は Q16 (向き行列の 1, 2 列目)、
+   //   c は Q16 で 向き行列の 3 列目 * focal * 1440 (focal = 0.85*zoom、最大 2^28)
+   input wire signed [17:0]  vax, vbx,
+   input wire signed [31:0]  vcx,
+   input wire signed [17:0]  vay, vby,
+   input wire signed [31:0]  vcy,
+   input wire signed [17:0]  vaz, vbz,
+   input wire signed [31:0]  vcz,
    input wire signed [17:0]  z_mirror,  // Q16  のぞき穴 → 鏡の手前の端 (cm)
    input wire [Q_W-1:0]      remain0,   // Q_F  Z_CELL - Z_MIRROR (cm)
    input wire signed [17:0]  inv_tube_r,// Q16  1 / TUBE_R
@@ -72,7 +84,7 @@ module scope_pipe
    output wire                 out_black
    );
 
-  localparam SETUP_LAT = 4;
+  localparam SETUP_LAT = 10;
   localparam STAGE_LAT = 12;
   localparam OUT_LAT   = 3;
   localparam LATENCY   = SETUP_LAT + K*STAGE_LAT + OUT_LAT;
@@ -100,82 +112,202 @@ module scope_pipe
     vn_0 <= 13'sd719 - $signed({2'b00, count_v}) * 2;
   end
 
-  // ============ setup S1: slope = sp / focal ============
-  //   slope_q15 = hn * kx >> KX_SH,  kx = 2^(P_F+KX_SH) / (2*VGA_HEIGHT*focal)
-  //
-  //   KX_SH = 11 にしてある。12 だと zoom を小さく (広角に) したとき
-  //   kx = 2^27/(1440*0.85*zoom) が 18bit (131071) を超えて模様が壊れる。
-  //   境界は zoom = 0.837 で、実機でちょうどそこで崩れるのを確認した。
-  //   11 なら zoom 0.5 でも kx = 109655 で収まる。
-  //   slope の分解能は Q15 のままなので精度は落ちない。
-  localparam KX_SH = 11;
+  // ============ setup S1: N = a*hn + b*vn + c  (rd の 1440 倍、Q16) ============
+  //   |N| は最大 3.3e8 (zoom 2.5) で 32 ビットに収まる
+  wire signed [31:0] nx_w = vax * hn_0 + vbx * vn_0 + vcx;
+  wire signed [31:0] ny_w = vay * hn_0 + vby * vn_0 + vcy;
+  wire signed [31:0] nz_w = vaz * hn_0 + vbz * vn_0 + vcz;
 
-  wire signed [30:0] slx_f = hn_0 * kx;
-  wire signed [30:0] sly_f = vn_0 * kx;
-
-  reg signed [17:0] slx_1, sly_1;
+  reg signed [31:0] nx_1, ny_1, nz_1;
 
   always @(posedge clk) begin
-    slx_1 <= $signed(slx_f[KX_SH+17 : KX_SH]);
-    sly_1 <= $signed(sly_f[KX_SH+17 : KX_SH]);
+    nx_1 <= nx_w;
+    ny_1 <= ny_w;
+    nz_1 <= nz_w;
   end
 
-  // ============ setup S2: p = slope * Z_MIRROR ============
-  wire signed [35:0] p0x_f = slx_1 * z_mirror;
-  wire signed [35:0] p0y_f = sly_1 * z_mirror;
+  // ============ setup S2: Nz の先頭 1 の位置 nb。Nz <= 0 は後ろ向き (黒) ============
+  wire        back_w = (nz_1 <= 0);
+  wire [30:0] dz_w   = back_w ? 31'd1 : nz_1[30:0];
 
-  reg signed [17:0] px_2, py_2, dx_2, dy_2;
-
-  always @(posedge clk) begin
-    px_2 <= $signed(p0x_f[33:16]);
-    py_2 <= $signed(p0y_f[33:16]);
-    dx_2 <= slx_1;
-    dy_2 <= sly_1;
+  integer   i;
+  reg [4:0] nb_w;
+  always @* begin
+    nb_w = 5'd0;
+    for (i = 0; i < 31; i = i + 1)
+      if (dz_w[i]) nb_w = i[4:0] + 5'd1;
   end
 
-  // ============ setup S3: 三角形の外か (筒の縁) ============
-  wire signed [35:0] q0 = px_2 * nx0 + py_2 * ny0;
-  wire signed [35:0] q1 = px_2 * nx1 + py_2 * ny1;
-  wire signed [35:0] q2 = px_2 * nx2 + py_2 * ny2;
-  wire black_w = ($signed(q0[SH_A+17:SH_A]) > wd0) |
-                 ($signed(q1[SH_A+17:SH_A]) > wd1) |
-                 ($signed(q2[SH_A+17:SH_A]) > wd2);
-
-  reg signed [17:0] px_3, py_3, dx_3, dy_3;
-  reg               bk_3;
+  reg signed [31:0] nx_2, ny_2;
+  reg [30:0]        dz_2;
+  reg [4:0]         nb_2;
+  reg               bk_2;
 
   always @(posedge clk) begin
-    px_3 <= px_2;  py_3 <= py_2;
-    dx_3 <= dx_2;  dy_3 <= dy_2;
-    bk_3 <= black_w;
+    nx_2 <= nx_1;  ny_2 <= ny_1;
+    dz_2 <= dz_w;
+    nb_2 <= nb_w;
+    bk_2 <= back_w;
+  end
+
+  // ============ setup S3: 仮数 mn ∈ [2^23, 2^24) と、同じだけ縮めた Nx_s, Ny_s ============
+  //   Nx_s = Nx >> (nb - 22)   (nb < 22 なら左シフト)。27 ビットで飽和
+  localparam MN_B  = 24;
+  localparam NS_SH = 22;
+  localparam NS_B  = 27;
+
+  wire [54:0] dz_up = {24'd0, dz_2} << (MN_B - nb_2);
+  wire [30:0] dz_dn = dz_2 >> (nb_2 - MN_B);
+  wire [MN_B-1:0] mn_w = (nb_2 <= MN_B) ? dz_up[MN_B-1:0] : dz_dn[MN_B-1:0];
+
+  wire signed [53:0] nxw = {{22{nx_2[31]}}, nx_2};
+  wire signed [53:0] nyw = {{22{ny_2[31]}}, ny_2};
+  wire signed [53:0] nxs_w = (nb_2 >= NS_SH) ? (nxw >>> (nb_2 - NS_SH)) : (nxw <<< (NS_SH - nb_2));
+  wire signed [53:0] nys_w = (nb_2 >= NS_SH) ? (nyw >>> (nb_2 - NS_SH)) : (nyw <<< (NS_SH - nb_2));
+
+  localparam signed [53:0] NS_MAX = (54'sd1 <<< (NS_B-1)) - 54'sd1;
+  localparam signed [53:0] NS_MIN = -(54'sd1 <<< (NS_B-1));
+
+  reg [MN_B-1:0]       mn_3;
+  reg signed [NS_B-1:0] nxs_3, nys_3;
+  reg                   bk_3;
+
+  always @(posedge clk) begin
+    mn_3  <= mn_w;
+    nxs_3 <= (nxs_w > NS_MAX) ? NS_MAX[NS_B-1:0] : (nxs_w < NS_MIN) ? NS_MIN[NS_B-1:0] : nxs_w[NS_B-1:0];
+    nys_3 <= (nys_w > NS_MAX) ? NS_MAX[NS_B-1:0] : (nys_w < NS_MIN) ? NS_MIN[NS_B-1:0] : nys_w[NS_B-1:0];
+    bk_3  <= bk_2;
+  end
+
+  // ============ setup S4: 逆数表 (divq と同じ表。最上位ビットの下 9 ビットで引く) ============
+  (* rom_style = "distributed" *)
+  reg [18:0] rlut [0:511];
+  initial $readmemh(LUT_FILE, rlut);
+
+  reg [18:0]            y0_4;
+  reg [MN_B-1:0]        mn_4;
+  reg signed [NS_B-1:0] nxs_4, nys_4;
+  reg                   bk_4;
+
+  always @(posedge clk) begin
+    y0_4  <= rlut[mn_3[MN_B-2 -: 9]];
+    mn_4  <= mn_3;
+    nxs_4 <= nxs_3;  nys_4 <= nys_3;
+    bk_4  <= bk_3;
+  end
+
+  // ============ setup S5: my = m * y0 (Q17) ============
+  wire [MN_B+18:0] mn_y0 = mn_4 * y0_4;
+
+  reg [19:0]            my_5;
+  reg [18:0]            y0_5;
+  reg signed [NS_B-1:0] nxs_5, nys_5;
+  reg                   bk_5;
+
+  always @(posedge clk) begin
+    my_5  <= {1'b0, mn_y0[MN_B+18 : MN_B]};
+    y0_5  <= y0_4;
+    nxs_5 <= nxs_4;  nys_5 <= nys_4;
+    bk_5  <= bk_4;
+  end
+
+  // ============ setup S6: ニュートン1回  y1 = y0 * (2 - m*y0)  (1/m、Q17) ============
+  wire [19:0] corr   = (20'd1 << 18) - my_5;
+  wire [38:0] y0corr = y0_5 * corr;
+  wire [21:0] y1_raw = y0corr >> 17;
+
+  reg [18:0]            y1_6;
+  reg signed [NS_B-1:0] nxs_6, nys_6;
+  reg                   bk_6;
+
+  always @(posedge clk) begin
+    y1_6  <= (y1_raw[21:19] != 3'd0) ? 19'h7FFFF : y1_raw[18:0];
+    nxs_6 <= nxs_5;  nys_6 <= nys_5;
+    bk_6  <= bk_5;
+  end
+
+  // ============ setup S7: slope = Nx_s * y1 >> 24  (Q15、DW ビットで飽和) ============
+  //   1/Nz = y1 / 2^17 / 2^nb、Nx = Nx_s * 2^(nb-22) なので slope*2^15 = Nx_s*y1 / 2^24
+  wire signed [NS_B+19:0] slx_f = nxs_6 * $signed({1'b0, y1_6});
+  wire signed [NS_B+19:0] sly_f = nys_6 * $signed({1'b0, y1_6});
+  wire signed [NS_B+19:0] slx_s = slx_f >>> 24;
+  wire signed [NS_B+19:0] sly_s = sly_f >>> 24;
+
+  localparam signed [NS_B+19:0] SL_MAX = (1 <<< (DW-1)) - 1;
+  localparam signed [NS_B+19:0] SL_MIN = -(1 <<< (DW-1));
+
+  reg signed [DW-1:0] slx_7, sly_7;
+  reg                 bk_7;
+
+  always @(posedge clk) begin
+    slx_7 <= (slx_s > SL_MAX) ? SL_MAX[DW-1:0] : (slx_s < SL_MIN) ? SL_MIN[DW-1:0] : slx_s[DW-1:0];
+    sly_7 <= (sly_s > SL_MAX) ? SL_MAX[DW-1:0] : (sly_s < SL_MIN) ? SL_MIN[DW-1:0] : sly_s[DW-1:0];
+    bk_7  <= bk_6;
+  end
+
+  // ============ setup S8: p = slope * Z_MIRROR ============
+  //   三角形の外かを見るまでは DW ビットで持つ (18 ビットだと巻き戻って外の画素が内側に化ける)。
+  //   z_mirror < 1 なので |p| < 2^(DW-1) に収まる
+  wire signed [DW+17:0] p0x_f = slx_7 * z_mirror;
+  wire signed [DW+17:0] p0y_f = sly_7 * z_mirror;
+
+  reg signed [DW-1:0] px_8, py_8, dx_8, dy_8;
+  reg                 bk_8;
+
+  always @(posedge clk) begin
+    px_8 <= $signed(p0x_f[DW+15:16]);
+    py_8 <= $signed(p0y_f[DW+15:16]);
+    dx_8 <= slx_7;
+    dy_8 <= sly_7;
+    bk_8 <= bk_7;
+  end
+
+  // ============ setup S9: 三角形の外か (筒の縁) ============
+  //   内積は 4 ビット広く取って比べる (|p| が 16 近いとき Q4.14 からあふれる)
+  wire signed [DW+18:0] q0 = px_8 * nx0 + py_8 * ny0;
+  wire signed [DW+18:0] q1 = px_8 * nx1 + py_8 * ny1;
+  wire signed [DW+18:0] q2 = px_8 * nx2 + py_8 * ny2;
+  wire black_w = bk_8 |
+                 ($signed(q0[SH_A+21:SH_A]) > wd0) |
+                 ($signed(q1[SH_A+21:SH_A]) > wd1) |
+                 ($signed(q2[SH_A+21:SH_A]) > wd2);
+
+  reg signed [17:0]   px_9, py_9;
+  reg signed [DW-1:0] dx_9, dy_9;
+  reg                 bk_9;
+
+  always @(posedge clk) begin
+    px_9 <= px_8[17:0];  py_9 <= py_8[17:0];     // 内側なら 18 ビットに収まる
+    dx_9 <= dx_8;        dy_9 <= dy_8;
+    bk_9 <= black_w;
   end
 
   // ============ 本体: scope_stage を K 段 ============
-  wire signed [17:0] s_px   [0:K];
-  wire signed [17:0] s_py   [0:K];
-  wire signed [17:0] s_dx   [0:K];
-  wire signed [17:0] s_dy   [0:K];
-  wire [Q_W-1:0]     s_rm   [0:K];
-  wire [4:0]         s_nr   [0:K];
-  wire [15:0]        s_sm   [0:K];
-  wire               s_done [0:K];
-  wire               s_bk   [0:K];
+  wire signed [17:0]   s_px   [0:K];
+  wire signed [17:0]   s_py   [0:K];
+  wire signed [DW-1:0] s_dx   [0:K];
+  wire signed [DW-1:0] s_dy   [0:K];
+  wire [Q_W-1:0]       s_rm   [0:K];
+  wire [4:0]           s_nr   [0:K];
+  wire [15:0]          s_sm   [0:K];
+  wire                 s_done [0:K];
+  wire                 s_bk   [0:K];
 
-  assign s_px[0]   = px_3;
-  assign s_py[0]   = py_3;
-  assign s_dx[0]   = dx_3;
-  assign s_dy[0]   = dy_3;
+  assign s_px[0]   = px_9;
+  assign s_py[0]   = py_9;
+  assign s_dx[0]   = dx_9;
+  assign s_dy[0]   = dy_9;
   assign s_rm[0]   = remain0;
   assign s_nr[0]   = 5'd0;
   assign s_sm[0]   = 16'd32768;          // seam = 1.0 (Q15)
-  assign s_done[0] = bk_3;
-  assign s_bk[0]   = bk_3;
+  assign s_done[0] = bk_9;
+  assign s_bk[0]   = bk_9;
 
   genvar g;
   generate
     for (g = 0; g < K; g = g + 1) begin: stage
       scope_stage #(.P_F(P_F), .N_F(N_F), .A_F(A_F), .D_F(D_F),
-                    .Q_F(Q_F), .Q_W(Q_W), .INV_E2(inv_e2(g)),
+                    .Q_F(Q_F), .Q_W(Q_W), .DW(DW), .INV_E2(inv_e2(g)),
                     .LUT_FILE(LUT_FILE), .SEAM_LUT_FILE(SEAM_LUT_FILE))
       u (.clk(clk),
          .nx0(nx0), .ny0(ny0), .wd0(wd0),
@@ -196,11 +328,10 @@ module scope_pipe
     end
   endgenerate
 
-  // 反射上限に達してまだ残りがある画素は、最後にまとめて直進させる
-  wire signed [37:0] fdx = s_dx[K] * $signed({1'b0, s_rm[K]});
-  wire signed [37:0] fdy = s_dy[K] * $signed({1'b0, s_rm[K]});
-  wire signed [17:0] fpx = s_done[K] ? s_px[K] : s_px[K] + $signed(fdx[Q_F+17:Q_F]);
-  wire signed [17:0] fpy = s_done[K] ? s_py[K] : s_py[K] + $signed(fdy[Q_F+17:Q_F]);
+  // K 回反射してもまだ残りがある画素は黒 (段9)
+  wire signed [17:0] fpx = s_px[K];
+  wire signed [17:0] fpy = s_py[K];
+  wire               fbk = s_bk[K] | ~s_done[K];
 
   // ============ out O0: セル上の位置を2つ作る ============
   //   手前層  c  = p / TUBE_R
@@ -208,8 +339,8 @@ module scope_pipe
   //
   //   光線を正規化していないので、参照実装の dir*sl*CELL_GAP は
   //   そのまま我々の dir*CELL_GAP になる。この視差が2層の立体感を作る。
-  wire signed [35:0] gx = s_dx[K] * cell_gap;          // Q15 * Q16 = Q31
-  wire signed [35:0] gy = s_dy[K] * cell_gap;
+  wire signed [DW+17:0] gx = s_dx[K] * cell_gap;       // Q15 * Q16 = Q31
+  wire signed [DW+17:0] gy = s_dy[K] * cell_gap;
   wire signed [17:0] bpx = fpx + $signed(gx[33:16]);
   wire signed [17:0] bpy = fpy + $signed(gy[33:16]);
 
@@ -230,7 +361,7 @@ module scope_pipe
     cyb_o <= $signed(cyb_f[33:16]);
     nr_o  <= s_nr[K];
     sm_o  <= s_sm[K];
-    bk_o  <= s_bk[K];
+    bk_o  <= fbk;
   end
 
   // ============ out O1: セルを回す ============

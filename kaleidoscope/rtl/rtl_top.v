@@ -13,14 +13,14 @@
 //  (実測: 平均差 8.9 → 16.5)。
 //
 //  経路と遅延 (count_h/count_v から video_color まで)
-//    scope_pipe   199 クロック  (setup 4 + 16段 x 12 + out 3)
+//    scope_pipe   205 クロック  (setup 10 + 16段 x 12 + out 3)
 //    cell_dbuf      2 クロック  (段5d-7 で二重バッファに。遅延は同じ)
 //    影で奥層を暗くする  1 クロック
 //    α合成          1 クロック
 //    きらめき層を待つ  5 クロック  (段7。sparkle は c から 10 クロックかかる)
 //    減光 (きらめきを足してから) 1 クロック
 //    周辺減光+合わせ目 1 クロック
-//    ------------------------- 合計 210  → vga_iface の PIXEL_DELAY
+//    ------------------------- 合計 216  → vga_iface の PIXEL_DELAY
 //
 //  鏡の形・画角・セルの回転は kaleido_axi_slave から受け取る。
 // ============================================================
@@ -32,7 +32,13 @@ module rtl_top
    input wire         resetn,
 
    // 万華鏡のパラメータ (kaleido_axi_slave から。すべて映像クロック領域で確定済み)
-   input wire signed [17:0] p_kx,
+   // 視線の向き (段9)。rd*1440 = a*hn + b*vn + c  (scope_pipe の説明を参照)
+   input wire signed [17:0] p_vax, p_vbx,
+   input wire signed [31:0] p_vcx,
+   input wire signed [17:0] p_vay, p_vby,
+   input wire signed [31:0] p_vcy,
+   input wire signed [17:0] p_vaz, p_vbz,
+   input wire signed [31:0] p_vcz,
    input wire signed [17:0] p_z_mirror,
    input wire [19:0]        p_remain0,
    input wire signed [17:0] p_inv_tr,
@@ -85,12 +91,12 @@ module rtl_top
   localparam signed [17:0] KVIG     = 18'sd9830;    // 0.3 Q15  周辺減光の強さ
   localparam signed [17:0] CELL_GAP = 18'sd22938;   // 0.35 cm Q16  手前層 → 奥層
 
-  localparam SCOPE_LAT = 4 + K*12 + 3;                  // = 199
+  localparam SCOPE_LAT = 10 + K*12 + 3;                 // = 205 (段9 で setup 4→10)
   // きらめき層 (sparkle) は scope_pipe の out_cx (out_fx より 1 クロック早い) から
   // 10 クロックで出る。α 合成の出力 (out_fx から 4 クロック) より 5 クロック遅いので、
   // 色の流れを SPK_D クロック待たせて揃える
   localparam SPK_D     = 5;
-  localparam TOTAL_LAT = SCOPE_LAT + 2 + 1 + 1 + SPK_D + 1 + 1; // = 210
+  localparam TOTAL_LAT = SCOPE_LAT + 2 + 1 + 1 + SPK_D + 1 + 1; // = 216
 
   // ---- リセット同期 ----
   wire reset, resetv;
@@ -127,7 +133,10 @@ module rtl_top
   scope_i
     (.clk(clkv),
      .count_h(count_h), .count_v(count_v),
-     .kx(p_kx), .z_mirror(p_z_mirror), .remain0(p_remain0), .inv_tube_r(p_inv_tr),
+     .vax(p_vax), .vbx(p_vbx), .vcx(p_vcx),
+     .vay(p_vay), .vby(p_vby), .vcy(p_vcy),
+     .vaz(p_vaz), .vbz(p_vbz), .vcz(p_vcz),
+     .z_mirror(p_z_mirror), .remain0(p_remain0), .inv_tube_r(p_inv_tr),
      .cos_t(p_cos_t), .sin_t(p_sin_t), .cell_gap(CELL_GAP),
      .nx0(p_nx0), .ny0(p_ny0), .wd0(p_wd0),
      .nx1(p_nx1), .ny1(p_ny1), .wd1(p_wd1),
@@ -288,7 +297,7 @@ module rtl_top
   end
 
   // ============ nrefl / seam / black を合成の遅れに合わせる ============
-  //   scope_pipe の出力 (199) から、使うところまで遅らせる
+  //   scope_pipe の出力 (205) から、使うところまで遅らせる
   //   段7 からはきらめき層を待つ SPK_D クロックぶん長い
   localparam NR_AT = 3 + SPK_D;     // 減光の段で使う位置
   localparam BK_AT = 4 + SPK_D;     // 出力の段で使う位置
@@ -400,7 +409,7 @@ module rtl_top
     vq_v <= (vig[30:15] >= 16'd32768) ? 16'd0 : (16'd32768 - vig[30:15]);
 
   // vq を色の最終段まで遅らせる (自身の 4 クロックぶんを差し引く)
-  localparam VQ_DELAY = TOTAL_LAT - 2 - 4;                 // = 199
+  localparam VQ_DELAY = TOTAL_LAT - 2 - 4;                 // = 210
   reg [15:0] vqd [0:VQ_DELAY-1];
   integer i;
   always @(posedge clkv) begin

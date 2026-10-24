@@ -35,6 +35,8 @@ module scope_stage
     parameter D_F = 15,          // dn の小数ビット
     parameter Q_F = 14,          // q, remain の小数ビット
     parameter Q_W = 20,          // q, remain のビット幅
+    parameter DW  = 20,          // dir と dn のビット幅 (段9: 視線を傾けると |dir| が 6.75 まで
+                                 //   増えるので 18→20。p は三角形の中にとどまるので 18 のまま)
     // 鏡の合わせ目
     parameter INV_E2 = 71111,    // round(2^6 / (0.03 + 0.004*段番号)^2)
     parameter DV2_F = 22,        // dv^2 の小数ビット
@@ -59,7 +61,7 @@ module scope_stage
 
    // 入力 (1画素/クロック)
    input wire signed [17:0]      in_px, in_py,
-   input wire signed [17:0]      in_dx, in_dy,
+   input wire signed [DW-1:0]    in_dx, in_dy,
    input wire [Q_W-1:0]          in_remain,
    input wire [4:0]              in_nrefl,
    input wire [15:0]             in_seam,
@@ -68,7 +70,7 @@ module scope_stage
 
    // 出力
    output wire signed [17:0]     out_px, out_py,
-   output wire signed [17:0]     out_dx, out_dy,
+   output wire signed [DW-1:0]   out_dx, out_dy,
    output wire [Q_W-1:0]         out_remain,
    output wire [4:0]             out_nrefl,
    output wire [15:0]            out_seam,
@@ -87,9 +89,9 @@ module scope_stage
   wire signed [35:0] pn0 = in_px * nx0 + in_py * ny0;
   wire signed [35:0] pn1 = in_px * nx1 + in_py * ny1;
   wire signed [35:0] pn2 = in_px * nx2 + in_py * ny2;
-  wire signed [35:0] dn0f = in_dx * nx0 + in_dy * ny0;
-  wire signed [35:0] dn1f = in_dx * nx1 + in_dy * ny1;
-  wire signed [35:0] dn2f = in_dx * nx2 + in_dy * ny2;
+  wire signed [DW+18:0] dn0f = in_dx * nx0 + in_dy * ny0;
+  wire signed [DW+18:0] dn1f = in_dx * nx1 + in_dy * ny1;
+  wire signed [DW+18:0] dn2f = in_dx * nx2 + in_dy * ny2;
 
   // 部分選択は符号無しになるので $signed で戻すこと (符号付き演算にならず化ける)
   wire signed [17:0] a0_w = wd0 - $signed(pn0[SH_A+17 : SH_A]);
@@ -97,8 +99,9 @@ module scope_stage
   wire signed [17:0] a2_w = wd2 - $signed(pn2[SH_A+17 : SH_A]);
 
   reg signed [17:0] a0_0, a1_0, a2_0;
-  reg signed [17:0] d0_0, d1_0, d2_0;
-  reg signed [17:0] px_0, py_0, dx_0, dy_0;
+  reg signed [DW-1:0] d0_0, d1_0, d2_0;
+  reg signed [17:0] px_0, py_0;
+  reg signed [DW-1:0] dx_0, dy_0;
   reg [Q_W-1:0]     rm_0;
   reg [4:0]         nr_0;
   reg [15:0]        sm_0;
@@ -108,9 +111,9 @@ module scope_stage
     a0_0 <= a0_w[17] ? 18'sd0 : a0_w;     // a は 0 以上に丸める
     a1_0 <= a1_w[17] ? 18'sd0 : a1_w;
     a2_0 <= a2_w[17] ? 18'sd0 : a2_w;
-    d0_0 <= $signed(dn0f[SH_D+17 : SH_D]);
-    d1_0 <= $signed(dn1f[SH_D+17 : SH_D]);
-    d2_0 <= $signed(dn2f[SH_D+17 : SH_D]);
+    d0_0 <= $signed(dn0f[SH_D+DW-1 : SH_D]);
+    d1_0 <= $signed(dn1f[SH_D+DW-1 : SH_D]);
+    d2_0 <= $signed(dn2f[SH_D+DW-1 : SH_D]);
     px_0 <= in_px;  py_0 <= in_py;
     dx_0 <= in_dx;  dy_0 <= in_dy;
     rm_0 <= in_remain;
@@ -126,12 +129,12 @@ module scope_stage
   wire c2 = (d2_0 > 0);
 
   // t_i < t_j  <=>  a_i * dn_j < a_j * dn_i
-  wire signed [35:0] m01 = a0_0 * d1_0;
-  wire signed [35:0] m10 = a1_0 * d0_0;
-  wire signed [35:0] m02 = a0_0 * d2_0;
-  wire signed [35:0] m20 = a2_0 * d0_0;
-  wire signed [35:0] m12 = a1_0 * d2_0;
-  wire signed [35:0] m21 = a2_0 * d1_0;
+  wire signed [DW+17:0] m01 = a0_0 * d1_0;
+  wire signed [DW+17:0] m10 = a1_0 * d0_0;
+  wire signed [DW+17:0] m02 = a0_0 * d2_0;
+  wire signed [DW+17:0] m20 = a2_0 * d0_0;
+  wire signed [DW+17:0] m12 = a1_0 * d2_0;
+  wire signed [DW+17:0] m21 = a2_0 * d1_0;
   wire t01 = (m01 < m10);     // t0 < t1
   wire t02 = (m02 < m20);     // t0 < t2
   wire t12 = (m12 < m21);     // t1 < t2
@@ -141,9 +144,11 @@ module scope_stage
   wire sel2 = ~sel0 & ~sel1 & c2;
   wire has  = c0 | c1 | c2;
 
-  reg signed [17:0] as_1, ds_1, nsx_1, nsy_1;
+  reg signed [17:0] as_1, nsx_1, nsy_1;
+  reg signed [DW-1:0] ds_1;
   reg               bot_1, has_1;
-  reg signed [17:0] px_1, py_1, dx_1, dy_1;
+  reg signed [17:0] px_1, py_1;
+  reg signed [DW-1:0] dx_1, dy_1;
   reg [Q_W-1:0]     rm_1;
   reg [4:0]         nr_1;
   reg [15:0]        sm_1;
@@ -168,26 +173,26 @@ module scope_stage
   // ============ 除算 q = a/dn を開始 (6クロック) ============
   wire [Q_W-1:0] q_div;
 
-  divq #(.A_F(A_F), .D_F(D_F), .Q_F(Q_F), .Q_W(Q_W), .LUT_FILE(LUT_FILE))
+  divq #(.A_F(A_F), .D_F(D_F), .Q_F(Q_F), .Q_W(Q_W), .LUT_FILE(LUT_FILE), .D_W(DW))
   divq_i (.clk(clk), .a(as_1), .dn(ds_1), .q(q_div));
 
   // ============ T2: 打ち切り判定と、打ち切る画素の直進 ============
   //   t >= remain  <=>  a << SH_OV >= remain * dn
-  wire [37:0] rm_dn = rm_1 * $unsigned(ds_1[17] ? 18'd0 : ds_1);
-  wire [37:0] a_sh  = {20'd0, $unsigned(as_1)} << SH_OV;
+  wire [Q_W+DW-1:0] rm_dn = rm_1 * $unsigned(ds_1[DW-1] ? {DW{1'b0}} : ds_1);
+  wire [Q_W+DW-1:0] a_sh  = {{(Q_W+DW-18){1'b0}}, $unsigned(as_1)} << SH_OV;
   wire        over  = (a_sh >= rm_dn);
   wire        fin   = ~dn_1 & (~has_1 | over);
   wire        hit   = ~dn_1 & has_1 & ~over;
 
-  wire signed [37:0] dxr = dx_1 * $signed({1'b0, rm_1});
-  wire signed [37:0] dyr = dy_1 * $signed({1'b0, rm_1});
+  wire signed [Q_W+DW:0] dxr = dx_1 * $signed({1'b0, rm_1});
+  wire signed [Q_W+DW:0] dyr = dy_1 * $signed({1'b0, rm_1});
 
   // 打ち切る画素は残り距離ぶん直進させてしまう
   wire signed [17:0] px_fin = px_1 + $signed(dxr[Q_F+17 : Q_F]);
   wire signed [17:0] py_fin = py_1 + $signed(dyr[Q_F+17 : Q_F]);
 
   // 除算の遅延に合わせて DIV_LAT 段ぶん持ち回す
-  localparam CW = 18*4 + Q_W + 5 + 16 + 3 + 18*3 + 1;   // 持ち回すビット幅
+  localparam CW = 18*2 + DW*2 + Q_W + 5 + 16 + 3 + DW + 18*2 + 1;   // 持ち回すビット幅
 
   wire [CW-1:0] carry_in = {
     (fin ? px_fin : px_1), (fin ? py_fin : py_1),
@@ -208,38 +213,57 @@ module scope_stage
       carry[k] <= carry[k-1];
   end
 
-  wire [CW-1:0]      c = carry[DIV_LAT-1];
-  wire signed [17:0] px_c  = c[CW-1     -: 18];
-  wire signed [17:0] py_c  = c[CW-19    -: 18];
-  wire signed [17:0] dx_c  = c[CW-37    -: 18];
-  wire signed [17:0] dy_c  = c[CW-55    -: 18];
-  wire [Q_W-1:0]     rm_c  = c[CW-73    -: Q_W];
-  wire [4:0]         nr_c  = c[CW-73-Q_W -: 5];
-  wire [15:0]        sm_c  = c[CW-78-Q_W -: 16];
-  wire               dn_c  = c[CW-94-Q_W];
-  wire               bk_c  = c[CW-95-Q_W];
-  wire               hit_c = c[CW-96-Q_W];
-  wire signed [17:0] ds_c  = c[CW-97-Q_W  -: 18];
-  wire signed [17:0] nsx_c = c[CW-115-Q_W -: 18];
-  wire signed [17:0] nsy_c = c[CW-133-Q_W -: 18];
-  wire               bot_c = c[0];
+  // 上の連結と同じ順に切り出す (O_* は各欄の最上位ビットの位置)
+  localparam O_PX  = CW - 1;
+  localparam O_PY  = O_PX  - 18;
+  localparam O_DX  = O_PY  - 18;
+  localparam O_DY  = O_DX  - DW;
+  localparam O_RM  = O_DY  - DW;
+  localparam O_NR  = O_RM  - Q_W;
+  localparam O_SM  = O_NR  - 5;
+  localparam O_DN  = O_SM  - 16;
+  localparam O_DS  = O_DN  - 3;
+  localparam O_NSX = O_DS  - DW;
+  localparam O_NSY = O_NSX - 18;
+
+  wire [CW-1:0]        c = carry[DIV_LAT-1];
+  wire signed [17:0]   px_c  = c[O_PX  -: 18];
+  wire signed [17:0]   py_c  = c[O_PY  -: 18];
+  wire signed [DW-1:0] dx_c  = c[O_DX  -: DW];
+  wire signed [DW-1:0] dy_c  = c[O_DY  -: DW];
+  wire [Q_W-1:0]       rm_c  = c[O_RM  -: Q_W];
+  wire [4:0]           nr_c  = c[O_NR  -: 5];
+  wire [15:0]          sm_c  = c[O_SM  -: 16];
+  wire                 dn_c  = c[O_DN];
+  wire                 bk_c  = c[O_DN - 1];
+  wire                 hit_c = c[O_DN - 2];
+  wire signed [DW-1:0] ds_c  = c[O_DS  -: DW];
+  wire signed [17:0]   nsx_c = c[O_NSX -: 18];
+  wire signed [17:0]   nsy_c = c[O_NSY -: 18];
+  wire                 bot_c = c[0];
 
   // ============ T8: 交点まで進めて反射させる ============
-  wire signed [37:0] dxq = dx_c * $signed({1'b0, q_div});
-  wire signed [37:0] dyq = dy_c * $signed({1'b0, q_div});
+  wire signed [Q_W+DW:0] dxq = dx_c * $signed({1'b0, q_div});
+  wire signed [Q_W+DW:0] dyq = dy_c * $signed({1'b0, q_div});
   wire signed [17:0] px_hit = px_c + $signed(dxq[Q_F+17 : Q_F]);
   wire signed [17:0] py_hit = py_c + $signed(dyq[Q_F+17 : Q_F]);
 
   // dir = dir - 2 * dn * n
-  wire signed [18:0] two_dn = {ds_c, 1'b0};
-  wire signed [36:0] rx = two_dn * nsx_c;
-  wire signed [36:0] ry = two_dn * nsy_c;
-  wire signed [17:0] dx_ref = dx_c - $signed(rx[N_F+17 : N_F]);
-  wire signed [17:0] dy_ref = dy_c - $signed(ry[N_F+17 : N_F]);
+  wire signed [DW:0]    two_dn = {ds_c, 1'b0};
+  wire signed [DW+18:0] rx = two_dn * nsx_c;
+  wire signed [DW+18:0] ry = two_dn * nsy_c;
+  // 飽和させる (tools/fx_scope.py と同じ)。傾けた縁の画素で ±16 を越えることがある
+  wire signed [DW+18:0] dx_rw = dx_c - (rx >>> N_F);
+  wire signed [DW+18:0] dy_rw = dy_c - (ry >>> N_F);
+  localparam signed [DW+18:0] DMAX = (1 <<< (DW-1)) - 1;
+  localparam signed [DW+18:0] DMIN = -(1 <<< (DW-1));
+  wire signed [DW-1:0] dx_ref = (dx_rw > DMAX) ? DMAX[DW-1:0] : (dx_rw < DMIN) ? DMIN[DW-1:0] : dx_rw[DW-1:0];
+  wire signed [DW-1:0] dy_ref = (dy_rw > DMAX) ? DMAX[DW-1:0] : (dy_rw < DMIN) ? DMIN[DW-1:0] : dy_rw[DW-1:0];
 
   wire kill = hit_c & bot_c & mirror2;   // 2枚鏡で底辺に当たったら黒
 
-  reg signed [17:0] px_s0, py_s0, dx_s0, dy_s0;
+  reg signed [17:0] px_s0, py_s0;
+  reg signed [DW-1:0] dx_s0, dy_s0;
   reg [Q_W-1:0]     rm_s0;
   reg [4:0]         nr_s0;
   reg [15:0]        sm_s0;
@@ -275,7 +299,8 @@ module scope_stage
   wire [38:0] qsh    = qmin >> SH_DV2;         // Q DV2_F
 
   reg [17:0] dv2_s1;
-  reg signed [17:0] px_s1, py_s1, dx_s1, dy_s1;
+  reg signed [17:0] px_s1, py_s1;
+  reg signed [DW-1:0] dx_s1, dy_s1;
   reg [Q_W-1:0]     rm_s1;
   reg [4:0]         nr_s1;
   reg [15:0]        sm_s1;
@@ -300,7 +325,8 @@ module scope_stage
        (u2[23:U2_F] != 0) ? {SEAM_LUT_BITS{1'b1}} : u2[U2_F-1 -: SEAM_LUT_BITS];
 
   reg [8:0] f_s2;
-  reg signed [17:0] px_s2, py_s2, dx_s2, dy_s2;
+  reg signed [17:0] px_s2, py_s2;
+  reg signed [DW-1:0] dx_s2, dy_s2;
   reg [Q_W-1:0]     rm_s2;
   reg [4:0]         nr_s2;
   reg [15:0]        sm_s2;
@@ -317,7 +343,8 @@ module scope_stage
   // ============ 合わせ目 S3: seam に掛ける ============
   wire [24:0] sm_mul = sm_s2 * f_s2;
 
-  reg signed [17:0] px_o, py_o, dx_o, dy_o;
+  reg signed [17:0] px_o, py_o;
+  reg signed [DW-1:0] dx_o, dy_o;
   reg [Q_W-1:0]     rm_o;
   reg [4:0]         nr_o;
   reg [15:0]        sm_o;

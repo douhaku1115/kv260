@@ -156,7 +156,7 @@ connect_bd_net [get_bd_pins proc_sys_reset_0/peripheral_aresetn] [get_bd_pins ${
 
 # ---- AXI スレーブ ↔ rtl_top (映像クロック領域で確定したパラメータ) ----
 connect_bd_net [get_bd_pins ${rtl_top_instance}/frame_start] [get_bd_pins ${axi_slave_instance}/frame_start]
-foreach sig {kx z_mirror remain0 inv_tr cos_t sin_t nx0 ny0 wd0 nx1 ny1 wd1 nx2 ny2 wd2 vx0 vy0 vx1 vy1 vx2 vy2 mirror2 text_on spk_en spk_lv spk_dens spk_k spk_base spk_flash spk_tphase spk_cols} {
+foreach sig {vax vbx vcx vay vby vcy vaz vbz vcz z_mirror remain0 inv_tr cos_t sin_t nx0 ny0 wd0 nx1 ny1 wd1 nx2 ny2 wd2 vx0 vy0 vx1 vy1 vx2 vy2 mirror2 text_on spk_en spk_lv spk_dens spk_k spk_base spk_flash spk_tphase spk_cols} {
   connect_bd_net [get_bd_pins ${axi_slave_instance}/v_$sig] [get_bd_pins ${rtl_top_instance}/p_$sig]
 }
 # 画面に出す文字: rtl_top がアドレスを出し、AXI スレーブの中の RAM が返す

@@ -24,7 +24,9 @@ module tb_scope;
   wire        frame_start;
 
   // ---- パラメータ (AXI スレーブの初期値を使う) ----
-  wire signed [17:0] p_kx, p_z_mirror, p_inv_tr, p_cos_t, p_sin_t;
+  wire signed [17:0] p_vax, p_vbx, p_vay, p_vby, p_vaz, p_vbz;
+  wire signed [31:0] p_vcx, p_vcy, p_vcz;
+  wire signed [17:0] p_z_mirror, p_inv_tr, p_cos_t, p_sin_t;
   wire [19:0]        p_remain0;
   wire signed [17:0] p_nx0, p_ny0, p_wd0, p_nx1, p_ny1, p_wd1, p_nx2, p_ny2, p_wd2;
   wire signed [17:0] p_vx0, p_vy0, p_vx1, p_vy1, p_vx2, p_vy2;
@@ -40,7 +42,9 @@ module tb_scope;
      .S_AXI_ARADDR(11'd0), .S_AXI_ARPROT(3'd0), .S_AXI_ARVALID(1'b0), .S_AXI_ARREADY(),
      .S_AXI_RDATA(), .S_AXI_RRESP(), .S_AXI_RVALID(), .S_AXI_RREADY(1'b0),
      .clkv(clk), .frame_start(frame_start),
-     .v_kx(p_kx), .v_z_mirror(p_z_mirror), .v_remain0(p_remain0), .v_inv_tr(p_inv_tr),
+     .v_vax(p_vax), .v_vbx(p_vbx), .v_vcx(p_vcx), .v_vay(p_vay), .v_vby(p_vby), .v_vcy(p_vcy),
+     .v_vaz(p_vaz), .v_vbz(p_vbz), .v_vcz(p_vcz),
+     .v_z_mirror(p_z_mirror), .v_remain0(p_remain0), .v_inv_tr(p_inv_tr),
      .v_cos_t(p_cos_t), .v_sin_t(p_sin_t),
      .v_nx0(p_nx0), .v_ny0(p_ny0), .v_wd0(p_wd0),
      .v_nx1(p_nx1), .v_ny1(p_ny1), .v_wd1(p_wd1),
@@ -53,7 +57,9 @@ module tb_scope;
 
   rtl_top dut
     (.clk(clk), .clkv(clk), .resetn(resetn),
-     .p_kx(p_kx), .p_z_mirror(p_z_mirror), .p_remain0(p_remain0), .p_inv_tr(p_inv_tr),
+     .p_vax(p_vax), .p_vbx(p_vbx), .p_vcx(p_vcx), .p_vay(p_vay), .p_vby(p_vby), .p_vcy(p_vcy),
+     .p_vaz(p_vaz), .p_vbz(p_vbz), .p_vcz(p_vcz),
+     .p_z_mirror(p_z_mirror), .p_remain0(p_remain0), .p_inv_tr(p_inv_tr),
      .p_cos_t(p_cos_t), .p_sin_t(p_sin_t),
      .p_nx0(p_nx0), .p_ny0(p_ny0), .p_wd0(p_wd0),
      .p_nx1(p_nx1), .p_ny1(p_ny1), .p_wd1(p_wd1),

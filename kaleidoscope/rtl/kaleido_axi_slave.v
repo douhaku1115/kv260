@@ -7,7 +7,7 @@
 //
 //  【レジスタマップ】
 //    0x000  CTRL        bit0 = mirror2 (1 = 2枚鏡)  bit1 = 文字を出す
-//    0x010  KX          2^26 / (2 * 720 * focal)        画角
+//    0x010  (空き)      段8 までは KX (画角)。段9 で下の VIEW に置き換えた
 //    0x020  Z_MIRROR    Q16  のぞき穴 → 鏡の手前の端 (cm)
 //    0x030  REMAIN0     Q14  Z_CELL - Z_MIRROR (cm)
 //    0x040  INV_TUBE_R  Q16  1 / 筒の半径
@@ -34,6 +34,10 @@
 //                       読むと bit0 = 描き直しの途中 (段5d-7)。
 //                       ★ bit0 が 0 になってから表を書き、DRAW_REQ を書くこと。
 //                         描いている途中に表を書き換えると、描きかけが混ざる
+//
+//    0x2F0〜0x370  VIEW  視線の向き (段9)。AX BX CX AY BY CY AZ BZ CZ の順に 9 語。
+//                       rd*1440 = A*hn + B*vn + C (x, y, z)。A, B は Q16 (18bit)、
+//                       C は Q16 で 向き行列の 3 列目 * focal * 1440 (32bit)。COMMIT で取り込む
 //
 //    0x400 + i*0x10   画面に出す文字 (i = 0〜63)。1 ワードに 4 文字。
 //                     下位バイトが左端。32 桁 x 8 行 = 256 文字。
@@ -83,7 +87,12 @@ module kaleido_axi_slave #(
     // ---- 映像クロック領域 ----
     input  wire                            clkv,
     input  wire                            frame_start,  // フレーム先頭で 1 クロック
-    output reg  [17:0]                     v_kx,
+    output reg  [17:0]                     v_vax, v_vbx,     // 視線の向き (段9、0x2F0〜)
+    output reg  [31:0]                     v_vcx,
+    output reg  [17:0]                     v_vay, v_vby,
+    output reg  [31:0]                     v_vcy,
+    output reg  [17:0]                     v_vaz, v_vbz,
+    output reg  [31:0]                     v_vcz,
     output reg  [17:0]                     v_z_mirror,
     output reg  [19:0]                     v_remain0,
     output reg  [17:0]                     v_inv_tr,
@@ -172,6 +181,19 @@ module kaleido_axi_slave #(
     initial begin
         for (ci = 0; ci < 16; ci = ci + 1)
             spkc_regs[ci] = (ci % 4 == 2) ? 24'hFFE08C : (ci % 4 == 3) ? 24'hBFD9FF : 24'hFFFFFF;
+    end
+
+    // 視線の向き (段9)。0x2F0 = 47 番から 9 個。既定は傾きなし、focal 0.85
+    //   AX = BY = 1.0 (Q16)、CZ = 0.85 * 1440 * 2^16 = 80216064
+    localparam [6:0] VIEW_BASE = 7'd47;
+    localparam [31:0] VIEW_CZ0 = 32'd80216064;
+    reg [31:0] view_regs [0:8];
+    integer vi;
+    initial begin
+        for (vi = 0; vi < 9; vi = vi + 1) view_regs[vi] = 32'd0;
+        view_regs[0] = 32'd65536;          // AX
+        view_regs[4] = 32'd65536;          // BY
+        view_regs[8] = VIEW_CZ0;           // CZ
     end
 
     // 電源投入時の既定値: ポイント数 8、3枚鏡、回転なし
@@ -278,6 +300,8 @@ module kaleido_axi_slave #(
                 spk_regs[wr_unit[1:0] - SPK_BASE[1:0]] <= S_AXI_WDATA[15:0];
             else if (wr_unit >= SPKC_BASE && wr_unit < SPKC_BASE + 7'd16)  // 0x1F0〜0x2E0
                 spkc_regs[wr_unit - SPKC_BASE] <= S_AXI_WDATA[23:0];
+            else if (wr_unit >= VIEW_BASE && wr_unit < VIEW_BASE + 7'd9)   // 0x2F0〜0x370
+                view_regs[wr_unit - VIEW_BASE] <= S_AXI_WDATA;
             else if (wr_unit >= TEXT_BASE && wr_unit < TEXT_BASE + TEXT_WORDS) begin
                 text_ram[{tw_idx, 2'd0}]         <= S_AXI_WDATA[7:0];
                 text_ram[{tw_idx, 2'd0} + 3'd1]  <= S_AXI_WDATA[15:8];
@@ -364,6 +388,8 @@ module kaleido_axi_slave #(
                 axi_rdata <= {31'd0, busy_a | req_pend};
             else if (rd_unit < NREG-1)
                 axi_rdata <= {12'd0, regs[rd_unit]};
+            else if (rd_unit >= VIEW_BASE && rd_unit < VIEW_BASE + 7'd9)
+                axi_rdata <= view_regs[rd_unit - VIEW_BASE];
             else
                 axi_rdata <= 32'd0;
         end
@@ -390,7 +416,9 @@ module kaleido_axi_slave #(
     initial begin
         v_mirror2  = 1'b0;
         v_text_on  = 1'b0;
-        v_kx       = 18'd54828;
+        v_vax = 18'd65536;  v_vbx = 18'd0;      v_vcx = 32'd0;
+        v_vay = 18'd0;      v_vby = 18'd65536;  v_vcy = 32'd0;
+        v_vaz = 18'd0;      v_vbz = 18'd0;      v_vcz = VIEW_CZ0;
         v_z_mirror = 18'd19661;
         v_remain0  = 20'd194970;
         v_inv_tr   = 18'd29127;
@@ -413,7 +441,9 @@ module kaleido_axi_slave #(
         if (load) begin
             v_mirror2  <= regs[0][0];
             v_text_on  <= regs[0][1];
-            v_kx       <= regs[1][17:0];
+            v_vax <= view_regs[0][17:0];  v_vbx <= view_regs[1][17:0];  v_vcx <= view_regs[2];
+            v_vay <= view_regs[3][17:0];  v_vby <= view_regs[4][17:0];  v_vcy <= view_regs[5];
+            v_vaz <= view_regs[6][17:0];  v_vbz <= view_regs[7][17:0];  v_vcz <= view_regs[8];
             v_z_mirror <= regs[2][17:0];
             v_remain0  <= regs[3];
             v_inv_tr   <= regs[4][17:0];

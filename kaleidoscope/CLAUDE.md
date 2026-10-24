@@ -87,6 +87,9 @@ KV260（Kria K26 SOM / Zynq UltraScale+ MPSoC）で、オイル万華鏡の映�
       描き直し 30 → 20Hz（PL の描画は 1 個約 14.4µs の実測）。WNS +2.464ns / BRAM 69.1% / 合成 48 分
       ★ gen_pparts.py は合成が読む rtl/pparts.hex を書く。合成中は読み終わってから回す
 - [x] 段8c: おまかせモード（o。KPAL の設定＋色の組・構成を乱数で、大きさは今のまま）・構成の切り替え（t）（2026-10-24 実機）
+- [x] 段9: 視線の傾き（d g y n、f でまっすぐ）（2026-10-24 実機）。KX を廃止し係数 9 個（0x2F0〜）で
+      slope = rd.xy/rd.z を割り算。dir/dn 20bit、16 回で打ち切った画素は黒。WNS +2.590ns / LUT 69.09% / 合成 48 分
+      ★ モデル tools/fx_scope.py と RTL は全画素一致。照合は `bash sim/run_tilt.sh <傾き> <方向> <間引き>`
 - [ ] Step 6: 仕上げ
 
 進んだらこのチェックを更新すること。詳しい状態は README.md の「段階」を見る。
@@ -302,7 +305,9 @@ grep -A 40 "Max Delay Paths" <impl>/design_1_wrapper_timing_summary_routed.rpt  
 ### 部分選択は符号無しになる
 `wd - pn[34:17]` は符号無し演算になって化ける。`$signed(pn[34:17])` と書くこと。
 
-### kx が 18bit に入らない（2026-09-19 に再修正）
+### kx が 18bit に入らない（2026-09-19 に再修正。★段9 で kx は廃止、以下は経緯）
+段9 からは PS が視線の係数 9 個（`KalSetView`、AXI 0x2F0〜0x370）を書き、画角は係数 C に入る。
+C は最大 0.85*2.5*1440*2^16 = 2.0e8 で 32bit に収まる。
 `slope = sp/focal` の係数 `kx = 2^(15+KX_SH)/(2*720*focal)` が 18bit を超えると
 模様が壊れる。**現在は `KX_SH = 11`（`scope_pipe.v`）/ `KX_NUM = 2^26`（`main.c`）**。
 `KX_SH = 12` にしていたときは zoom 0.837 以下で崩れるのを実機で確認した。
@@ -311,7 +316,7 @@ grep -A 40 "Max Delay Paths" <impl>/design_1_wrapper_timing_summary_routed.rpt  
 ## パイプライン遅延（変えたら vga_iface の PIXEL_DELAY も直す）
 
 ```
-scope_pipe : SETUP 4 + K*STAGE 12 + OUT 3    K=16 なら 199
+scope_pipe : SETUP 10 + K*STAGE 12 + OUT 3   K=16 なら 205 (段9 で SETUP 4→10)
 セル読み    : 2   (段5d-1 で cell_mem → cell_uram。段数は同じ)
 減光        : 1
 2層合成     : 1
@@ -319,7 +324,7 @@ scope_pipe : SETUP 4 + K*STAGE 12 + OUT 3    K=16 なら 199
 周辺減光    : 1
 文字        : 1
 --------------------------------
-TOTAL_LAT  : 210   → vga_iface の PIXEL_DELAY
+TOTAL_LAT  : 216   → vga_iface の PIXEL_DELAY
 ```
 
 `rtl_top.v` の `TOTAL_LAT` が唯一の基準。周辺減光 `vq` と画面の文字は
