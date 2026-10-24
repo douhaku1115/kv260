@@ -15,13 +15,13 @@ module tb_apu;
 
   reg         run = 0;
   reg         prg_we = 0;
-  reg  [12:0] prg_waddr = 0;
+  reg  [15:0] prg_waddr = 0;
   reg  [31:0] prg_wdata = 0;
   wire signed [15:0] audio;
 
   nes_core core
-    (.clk(clk), .run(run), .prg16(1'b0), .mirror_v(1'b0), .pad(8'd0),
-     .chr_we(1'b0), .chr_waddr(13'd0), .chr_wdata(8'd0),
+    (.clk(clk), .run(run), .cart(16'h0100), .pad(8'd0),
+     .chr_we(1'b0), .chr_waddr(17'd0), .chr_wdata(8'd0),
      .pix_we(), .pix_x(), .pix_y(), .pix_c(), .ppu_frames(), .audio(audio),
      .prg_we(prg_we), .prg_waddr(prg_waddr), .prg_wdata(prg_wdata),
      .wram_raddr(11'd0), .wram_rdata(),

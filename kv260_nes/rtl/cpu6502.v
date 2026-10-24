@@ -56,6 +56,9 @@ module cpu6502 (
     reg        carry;                            // 添字加算の桁上がり
     reg [1:0]  ik;                               // 割り込みの種類
     reg        nmi_d, nmi_pend;
+    // 割り込みは「命令の最後の 1 つ前のサイクルの終わり」で見る (実機と同じ)。
+    // 毎サイクルの終わりに記録し、命令の最後 (fetch_at) では 1 サイクル前の記録を使う
+    reg        nmi_s, irq_s;
 
     localparam IK_BRK = 2'd0, IK_IRQ = 2'd1, IK_NMI = 2'd2, IK_RST = 2'd3;
 
@@ -162,9 +165,9 @@ module cpu6502 (
     task fetch_at(input [15:0] ad);
         begin
             addr <= ad; we <= 1'b0; st <= S_OP;
-            if (nmi_pend) begin
+            if (nmi_s) begin
                 ik <= IK_NMI; nmi_pend <= 1'b0; pc <= ad; sync <= 1'b0;
-            end else if (irq && !fi) begin
+            end else if (irq_s) begin
                 ik <= IK_IRQ; pc <= ad; sync <= 1'b0;
             end else begin
                 ik <= IK_BRK; pc <= ad + 16'd1; sync <= 1'b1;
@@ -271,13 +274,15 @@ module cpu6502 (
             fn <= 1'b0; fv <= 1'b0; fd <= 1'b0; fi <= 1'b1; fz <= 1'b0; fc <= 1'b0;
             addr <= 16'd0; we <= 1'b0; dout <= 8'd0; sync <= 1'b0;
             st <= S_OP; ik <= IK_RST; op <= 8'h00;
-            nmi_d <= 1'b0; nmi_pend <= 1'b0;
+            nmi_d <= 1'b0; nmi_pend <= 1'b0; nmi_s <= 1'b0; irq_s <= 1'b0;
         end else begin
             // NMI の立ち上がりを覚える (ce に関係なく)
             nmi_d <= nmi;
             if (nmi && !nmi_d) nmi_pend <= 1'b1;
 
             if (ce) begin
+                nmi_s <= nmi_pend;
+                irq_s <= irq && !fi;
                 case (st)
                 // ---- 取り出し終了 ----
                 S_OP: begin

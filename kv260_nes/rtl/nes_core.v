@@ -15,7 +15,7 @@
 //   $4017        読: コントローラ 2 (未接続: $40) / 書: APU のフレームカウンタ
 //   $4000-$4013, $4015  APU (apu.v)。$4015 の読みは APU の状態
 //   $6000-$7FFF  PRG-RAM 8KB (blargg のテストは $6000 に結果を書く)
-//   $8000-$FFFF  PRG 32KB。prg16=1 なら 16KB を折り返す (NROM-128)
+//   $8000-$FFFF  PRG (最大 256KB)。8KB 窓 4 つをマッパー (mapper.v) のバンク番号で選ぶ
 //
 // PS 側 (AXI) からは:
 //   PRG に 1 語 = 4 バイトで書き込む (CPU が止まっている間に)
@@ -27,12 +27,11 @@ module nes_core #(
 )(
     input  wire        clk,
     input  wire        run,          // 0 = CPU をリセットのまま止める
-    input  wire        prg16,        // 1 = PRG 16KB を折り返す
-    input  wire        mirror_v,     // 1 = ネームテーブル垂直ミラー
+    input  wire [15:0] cart,         // カートリッジの設定 (AXI の CTRL [15:0]、mapper.v 参照)
     input  wire [7:0]  pad,          // コントローラ 1 (1 = 押下) [0]A [1]B [2]Select [3]Start [4]上 [5]下 [6]左 [7]右
     // PS から CHR へ書き込み (1 バイトずつ)
     input  wire        chr_we,
-    input  wire [12:0] chr_waddr,
+    input  wire [16:0] chr_waddr,    // CHR 全体 128KB の番地
     input  wire [7:0]  chr_wdata,
     // 画素の出力 (画面バッファへ)
     output wire        pix_we,
@@ -44,7 +43,7 @@ module nes_core #(
     output wire signed [15:0] audio,
     // PS から PRG へ書き込み
     input  wire        prg_we,
-    input  wire [12:0] prg_waddr,    // 語番号 (1 語 = 4 バイト)
+    input  wire [15:0] prg_waddr,    // PRG 全体 256KB の語番号 (1 語 = 4 バイト)
     input  wire [31:0] prg_wdata,    // [7:0] が若い番地
     // PS から内蔵 RAM を読む (1 クロック遅れ)
     input  wire [10:0] wram_raddr,
@@ -78,6 +77,11 @@ module nes_core #(
 
     wire        ppu_nmi;
     wire        apu_irq;
+    wire        ppu_a12;        // PPU のアドレス線 A12 → マッパー (MMC3 のライン数え)
+    wire [19:0] prg_banks;      // マッパー → PRG (8KB 窓 x 4)
+    wire [55:0] chr_banks;      // マッパー → PPU (1KB 窓 x 8)
+    wire [1:0]  map_mirror;
+    wire        map_irq;
 
     // ---------------- OAM DMA ($4014) ----------------
     // $4014 に書いた次のサイクルから、バスを DMA が持つ (その間 CPU の ce を止める)。
@@ -143,7 +147,7 @@ module nes_core #(
 
     cpu6502 cpu
       (.clk(clk), .rst(!run), .ce(cpu_ce && !dma_act && !dmc_act), .addr(c_addr), .dout(c_dout), .we(c_we), .din(din),
-       .nmi(ppu_nmi), .irq(apu_irq), .sync(cpu_sync),
+       .nmi(ppu_nmi), .irq(apu_irq | map_irq), .sync(cpu_sync),
        .dbg_pc(dbg_pc), .dbg_a(), .dbg_x(), .dbg_y(), .dbg_s(), .dbg_p());
 
     assign cpu_addr = addr;
@@ -159,7 +163,7 @@ module nes_core #(
        .reg_rd(cpu_ce && !we && sel_ppu),
        .reg_wr(cpu_ce && we && sel_ppu),
        .reg_wdata(dout), .reg_rdata(ppu_rdata), .nmi(ppu_nmi),
-       .mirror_v(mirror_v),
+       .mirror(map_mirror), .chr_banks(chr_banks), .chr_ram(cart[3]), .a12(ppu_a12),
        .chr_axi_we(chr_we), .chr_axi_addr(chr_waddr), .chr_axi_data(chr_wdata),
        .pix_we(pix_we), .pix_x(pix_x), .pix_y(pix_y), .pix_c(pix_c),
        .frame_cnt(ppu_frames));
@@ -183,14 +187,23 @@ module nes_core #(
     always @(posedge clk)
         wram_rdata <= wram[wram_raddr];
 
-    // ---------------- PRG 32KB (1 語 = 4 バイト) ----------------
-    (* ram_style = "block" *) reg [31:0] prg [0:8191];
+    // ---------------- マッパー ----------------
+    mapper map0
+      (.clk(clk), .rst(!run), .ce(cpu_ce), .cfg(cart),
+       .wr(cpu_ce && we && addr[15]), .addr(addr), .wdata(dout),
+       .ppu_ce(ppu_ce), .a12(ppu_a12),
+       .prg_banks(prg_banks), .chr_banks(chr_banks), .mirror(map_mirror), .irq(map_irq));
+
+    // ---------------- PRG 256KB (1 語 = 4 バイト) ----------------
+    // $8000-$FFFF の 8KB 窓 addr[14:13] ごとに、マッパーのバンク番号 + 窓の中 addr[12:0]
+    (* ram_style = "block" *) reg [31:0] prg [0:65535];
     reg [31:0] prg_q;
     reg [1:0]  prg_bsel;
-    wire [14:0] prg_a = prg16 ? {1'b0, addr[13:0]} : addr[14:0];
+    wire [4:0]  prg_bank = prg_banks[addr[14:13]*5 +: 5];
+    wire [17:0] prg_a    = {prg_bank, addr[12:0]};
     always @(posedge clk) begin
         if (prg_we) prg[prg_waddr] <= prg_wdata;
-        prg_q    <= prg[prg_a[14:2]];
+        prg_q    <= prg[prg_a[17:2]];
         prg_bsel <= prg_a[1:0];
     end
     wire [7:0] prg_byte = prg_q[prg_bsel*8 +: 8];

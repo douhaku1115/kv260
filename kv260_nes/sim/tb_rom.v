@@ -13,9 +13,11 @@ module tb_rom;
   always #5 clk = ~clk;
 
   reg         run = 0;
-  reg  [31:0] cfg [0:3];   // ミラー / フレーム数 / ボタン / 押すフレーム (rom_prep.py が作る)
+  // ミラー / フレーム数 / ボタン / 押すフレーム / ボタン2 / フレーム2 (rom_prep.py が作る)
+  reg  [31:0] cfg [0:5];
   reg         prg_we = 0, chr_we = 0;
-  reg  [12:0] prg_waddr = 0, chr_waddr = 0;
+  reg  [15:0] prg_waddr = 0;
+  reg  [16:0] chr_waddr = 0;
   reg  [31:0] prg_wdata = 0;
   reg  [7:0]  chr_wdata = 0;
   wire        pix_we;
@@ -23,11 +25,12 @@ module tb_rom;
   wire [5:0]  pix_c;
   wire [31:0] ppu_frames, cpu_cycles;
   wire [15:0] pc;
-  // コントローラ: 指定フレームから 5 フレームだけ押す
-  wire [7:0]  pad = (ppu_frames >= cfg[3] && ppu_frames < cfg[3] + 5) ? cfg[2][7:0] : 8'd0;
+  // コントローラ: 指定フレームから 5 フレームだけ押す (2 回まで)
+  wire [7:0]  pad = ((ppu_frames >= cfg[3] && ppu_frames < cfg[3] + 5) ? cfg[2][7:0] : 8'd0)
+                  | ((ppu_frames >= cfg[5] && ppu_frames < cfg[5] + 5) ? cfg[4][7:0] : 8'd0);
 
   nes_core core
-    (.clk(clk), .run(run), .prg16(1'b0), .mirror_v(cfg[0][2]), .pad(pad),
+    (.clk(clk), .run(run), .cart(cfg[0][15:0]), .pad(pad),
      .chr_we(chr_we), .chr_waddr(chr_waddr), .chr_wdata(chr_wdata),
      .pix_we(pix_we), .pix_x(pix_x), .pix_y(pix_y), .pix_c(pix_c), .ppu_frames(ppu_frames),
      .prg_we(prg_we), .prg_waddr(prg_waddr), .prg_wdata(prg_wdata),
@@ -38,14 +41,27 @@ module tb_rom;
   reg [5:0] scr [0:61439];
   always @(posedge clk) if (pix_we) scr[{pix_y, pix_x}] <= pix_c;
 
+  // 画面が止まったら早く終える: 1 フレームの画素から作る値 (hacc) が、描画中のまま 30 フレーム同じなら終了
+  // (Holy Mapperel のように結果を出したあと同じ画面を出し続けるテスト向け)
+  reg [31:0] hacc = 0, hprev = 0, hsame = 0, hframe = 0;
+  always @(posedge clk) begin
+    if (pix_we) hacc <= {hacc[30:0], hacc[31]} ^ {pix_y, pix_x, 10'd0, pix_c};
+    if (ppu_frames != hframe) begin
+      hframe <= ppu_frames;
+      hsame  <= (hacc == hprev && core.ppu0.rendering) ? hsame + 1 : 0;
+      hprev  <= hacc;
+      hacc   <= 0;
+    end
+  end
+
   // 色表
   reg  [5:0]  pidx = 0;
   wire [23:0] prgb;
   reg  [23:0] ptab [0:63];
   nes_palette pref (.clk(clk), .idx(pidx), .rgb(prgb));
 
-  reg [31:0] prg32 [0:8191];
-  reg [7:0]  chr8  [0:8191];
+  reg [31:0] prg32 [0:65535];   // PRG 256KB まで
+  reg [7:0]  chr8  [0:131071];  // CHR 128KB まで (CHR-RAM なら 0 のまま)
   reg [5:0]  c;
   reg [7:0]  ch;
   integer i, f, x, y, last;
@@ -54,20 +70,28 @@ module tb_rom;
     for (i = 0; i < 64; i = i + 1) begin
       pidx = i; @(posedge clk); @(posedge clk); #1 ptab[i] = prgb;
     end
+    // ROM より後ろは 0 (読ませないが、x を BRAM に入れないため)
+    for (i = 0; i < 65536;  i = i + 1) prg32[i] = 32'd0;
+    for (i = 0; i < 131072; i = i + 1) chr8[i]  = 8'd0;
     $readmemh("rom_cfg.hex", cfg);
     $readmemh("rom_prg.hex", prg32);
     $readmemh("rom_chr.hex", chr8);
-    for (i = 0; i < 8192; i = i + 1) begin
+    $display("CTRL=%h (マッパー %0d, PRG %0dKB, CHR %0dKB%s)", cfg[0][15:0], cfg[0][7:4],
+             (cfg[0][11:8] + 1) * 16, (cfg[0][15:12] + 1) * 8, cfg[0][3] ? " RAM" : "");
+    for (i = 0; i < 65536; i = i + 1) begin
       @(posedge clk); prg_we <= 1; prg_waddr <= i; prg_wdata <= prg32[i];
-      chr_we <= 1; chr_waddr <= i; chr_wdata <= chr8[i];
     end
-    @(posedge clk); prg_we <= 0; chr_we <= 0;
+    @(posedge clk); prg_we <= 0;
+    for (i = 0; i < 131072; i = i + 1) begin
+      @(posedge clk); chr_we <= 1; chr_waddr <= i; chr_wdata <= chr8[i];
+    end
+    @(posedge clk); chr_we <= 0;
     @(posedge clk); run <= 1;
 
     // blargg の新しいテストは $6000 = 状態 ($80 実行中 / $00 合格 / 他は失敗番号)、
     // $6001-$6003 = DE B0 61 (目印)、$6004〜 = 結果の文章。目印があって実行中でなければ早く終える
     last = 0;
-    while (ppu_frames < cfg[1] &&
+    while (ppu_frames < cfg[1] && hsame < 30 &&
            !(core.prgram[1] == 8'hDE && core.prgram[2] == 8'hB0 && core.prgram[3] == 8'h61 &&
              core.prgram[0] != 8'h80)) begin
       @(posedge clk);
@@ -106,7 +130,8 @@ module tb_rom;
         $fwrite(f, "%0d %0d %0d\n", ptab[c][23:16], ptab[c][15:8], ptab[c][7:0]);
       end
     $fclose(f);
-    $display("DONE frames=%0d PC=%h CYC=%0d", ppu_frames, pc, cpu_cycles);
+    $display("DONE frames=%0d PC=%h CYC=%0d%s", ppu_frames, pc, cpu_cycles,
+             hsame >= 30 ? " (画面が 30 フレーム不変で終了)" : "");
     $finish;
   end
 endmodule

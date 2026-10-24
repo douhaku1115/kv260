@@ -16,12 +16,12 @@ module tb_pad;
   reg         run = 0;
   reg  [7:0]  pad = 0;
   reg         prg_we = 0;
-  reg  [12:0] prg_waddr = 0;
+  reg  [15:0] prg_waddr = 0;
   reg  [31:0] prg_wdata = 0;
 
   nes_core core
-    (.clk(clk), .run(run), .prg16(1'b0), .mirror_v(1'b0), .pad(pad),
-     .chr_we(1'b0), .chr_waddr(13'd0), .chr_wdata(8'd0),
+    (.clk(clk), .run(run), .cart(16'h0100), .pad(pad),
+     .chr_we(1'b0), .chr_waddr(17'd0), .chr_wdata(8'd0),
      .pix_we(), .pix_x(), .pix_y(), .pix_c(), .ppu_frames(),
      .prg_we(prg_we), .prg_waddr(prg_waddr), .prg_wdata(prg_wdata),
      .wram_raddr(11'd0), .wram_rdata(),
@@ -29,7 +29,6 @@ module tb_pad;
 
   reg [31:0] prg32 [0:8191];
   integer i, err;
-
   task check(input [7:0] p);
     reg [7:0] c0, e;
     begin
@@ -71,7 +70,8 @@ module tb_pad;
 
   initial begin
     #50_000_000;
-    $display("FAIL timeout");
+    $display("FAIL timeout PC=%h prg_banks=%h chr_banks=%h mirror=%h",
+             core.dbg_pc, core.prg_banks, core.chr_banks, core.map_mirror);
     $finish;
   end
 endmodule

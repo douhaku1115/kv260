@@ -14,7 +14,7 @@ set rtl_top_name rtl_top
 set rtl_files [list \
     rtl/rtl_top.v rtl/nes_axi_slave.v rtl/nes_fb.v rtl/nes_palette.v \
     rtl/cdc_synchronizer.v rtl/shift_register.v rtl/vga_iface.v \
-    rtl/nes_core.v rtl/cpu6502.v rtl/ppu.v rtl/apu.v \
+    rtl/nes_core.v rtl/cpu6502.v rtl/ppu.v rtl/apu.v rtl/mapper.v \
     rtl/i2s_tx.v rtl/apu_pulse.hex rtl/apu_tnd.hex]
 set project_name project_1
 set project_dir  project_1

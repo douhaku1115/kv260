@@ -13,15 +13,21 @@
  * UART は「押した」しか届かないので、押したら KEY_HOLD_FRAMES フレーム押しっぱなしにする。
  * 押し続けると端末のキーリピートで保持が延びる。
  *
+ * 押し続けが要るゲーム用に、PC の tools/nes_pad.py が「'P' + 押下状態 1 バイト」を送る
+ * (並びは PAD と同じ)。受けた状態はそのまま押下とし、PAD_TIMEOUT_FRAMES 届かなければ離したとみなす。
+ *
  * AXI マップ (0xA0000000, 256KB)。レジスタは 0x10 刻み:
- *   0x00000 CTRL  (RW)  bit0=1 実行 (0 でリセット保持) / bit2=1 垂直ミラー
+ *   0x00000 CTRL  (RW)  bit0=1 実行 (0 でリセット保持) / bit2=1 垂直ミラー / bit3=1 CHR-RAM
+ *                       [7:4] マッパー番号 / [11:8] PRG の 16KB 個数-1 / [15:12] CHR の 8KB 個数-1
+ *                       (bit0 以外は rom_data.h の ROM_CTRL をそのまま書く)
  *   0x00010 ID    (R)   0x4E455301
  *   0x00020 PAD   (RW)  [0]A [1]B [2]Select [3]Start [4]上 [5]下 [6]左 [7]右 (1 = 押下)
  *   0x00030 FRAME (R)   映像のフレーム数
  *   0x00040 PC    (R)   CPU の PC
  *   0x00060 PFRM  (R)   PPU のフレーム数
- *   0x20000〜     PRG   (W)  1 語 = 4 バイト
- *   0x30000〜     CHR   (W)  1 語 = 1 バイト
+ *   0x00070 LOAD  (RW)  書き込み窓の位置 [2:0] = PRG の 32KB 単位 / [7:4] = CHR の 8KB 単位
+ *   0x20000〜     PRG   (W)  32KB の窓。1 語 = 4 バイト
+ *   0x30000〜     CHR   (W)  8KB の窓。1 語 = 1 バイト
  */
 
 #include "xil_printf.h"
@@ -38,6 +44,7 @@
 
 #define UART_BASE        0xFF010000U   /* KV260 USB-UART = UART_1 */
 #define KEY_HOLD_FRAMES  12            /* キー 1 回でボタンを押しておくフレーム数 */
+#define PAD_TIMEOUT_FRAMES 30          /* 'P' の状態がこのフレーム数届かなければ 0 に戻す */
 
 #ifndef SDT
 #define DPPSU_DEVICE_ID   XPAR_PSU_DP_DEVICE_ID
@@ -56,11 +63,11 @@
 #define NES_FRAME    (NES_BASE + 0x00030)
 #define NES_PC       (NES_BASE + 0x00040)
 #define NES_PFRM     (NES_BASE + 0x00060)
+#define NES_LOAD     (NES_BASE + 0x00070)
 #define NES_PRG      (NES_BASE + 0x20000)
 #define NES_CHR      (NES_BASE + 0x30000)
 
 #define CTRL_RUN     0x1U
-#define CTRL_MIRV    0x4U
 
 /* PAD のビット */
 #define BTN_A      0x01
@@ -93,15 +100,28 @@ static int uart_getchar_nb(void)
 /* CPU を止めて ROM を書き、走らせ直す (CPU が止まっている間に書く約束) */
 static void nes_load_and_run(void)
 {
-    u32 ctrl = ROM_MIRROR_V ? CTRL_MIRV : 0;
-    Xil_Out32(NES_CTRL, ctrl);                          /* bit0=0: リセット保持 */
-    for (int i = 0; i < 32768; i += 4)
-        Xil_Out32(NES_PRG + (u32)i,
-                  rom_prg[i] | (rom_prg[i + 1] << 8) | (rom_prg[i + 2] << 16) | ((u32)rom_prg[i + 3] << 24));
-    for (int i = 0; i < 8192; i++)
-        Xil_Out32(NES_CHR + (u32)i * 4, rom_chr[i]);
+    Xil_Out32(NES_CTRL, ROM_CTRL);                      /* bit0=0: リセット保持 */
+
+    /* PRG: 32KB の窓ずつ。16KB の ROM は 2 回並べて 32KB 埋める
+     * (マッパー無しの段F までのハードは 32KB をそのまま読むため。段G 以降は折り返すので害はない) */
+    u32 prg_total = (ROM_PRG_SIZE < 32768) ? 32768 : ROM_PRG_SIZE;
+    for (u32 base = 0; base < prg_total; base += 32768) {
+        Xil_Out32(NES_LOAD, base / 32768);
+        for (u32 i = 0; i < 32768; i += 4) {
+            u32 s = (base + i) % ROM_PRG_SIZE;
+            Xil_Out32(NES_PRG + i, rom_prg[s] | (rom_prg[s + 1] << 8) | (rom_prg[s + 2] << 16)
+                                   | ((u32)rom_prg[s + 3] << 24));
+        }
+    }
+    /* CHR-ROM: 8KB の窓ずつ (CHR-RAM なら書かない) */
+    for (u32 base = 0; base < ROM_CHR_SIZE; base += 8192) {
+        Xil_Out32(NES_LOAD, (base / 8192) << 4);
+        for (u32 i = 0; i < 8192; i++)
+            Xil_Out32(NES_CHR + i * 4, rom_chr[base + i]);
+    }
+    Xil_Out32(NES_LOAD, 0);
     Xil_Out32(NES_PAD, 0);
-    Xil_Out32(NES_CTRL, ctrl | CTRL_RUN);
+    Xil_Out32(NES_CTRL, ROM_CTRL | CTRL_RUN);
 }
 
 /* キーボード文字 → ボタン (対応なしは 0) */
@@ -136,18 +156,23 @@ int main(void)
     RunDP();
 
     nes_load_and_run();
-    xil_printf("ROM %s loaded (%s mirror)\r\n", ROM_NAME, ROM_MIRROR_V ? "vertical" : "horizontal");
+    xil_printf("ROM %s loaded (CTRL=%04x PRG=%d CHR=%d)\r\n", ROM_NAME, ROM_CTRL, ROM_PRG_SIZE, ROM_CHR_SIZE);
     xil_printf("keys: x/k=A z/j=B space=Select Enter=Start arrows/wasd=dir r=reset\r\n");
 
     int hold[8] = {0};     /* ボタンごとの残りフレーム数 */
     int esc = 0;           /* 矢印キー ESC [ A〜D の読み途中 (0=なし 1=ESC 2=ESC[) */
     int n = 0;
+    int pstate = 0;        /* 1 = 'P' の次 (状態バイト待ち) */
+    u32 direct = 0;        /* nes_pad.py から来た押下状態 */
+    int direct_age = 0;    /* 最後に状態が来てからのフレーム数 */
 
     /* 約 60Hz */
     while (1) {
         int c;
         while ((c = uart_getchar_nb()) >= 0) {
             int b = 0;
+            if (pstate) { pstate = 0; direct = (u32)c & 0xFF; direct_age = 0; continue; }
+            if (c == 'P') { pstate = 1; continue; }
             if (esc == 1) { esc = (c == '[') ? 2 : 0; continue; }
             if (esc == 2) {
                 esc = 0;
@@ -168,7 +193,9 @@ int main(void)
                 if (b & (1 << i)) hold[i] = KEY_HOLD_FRAMES;
         }
 
-        u32 pad = 0;
+        if (direct_age < PAD_TIMEOUT_FRAMES) direct_age++;
+        else                                 direct = 0;
+        u32 pad = direct;
         for (int i = 0; i < 8; i++)
             if (hold[i] > 0) { pad |= 1U << i; hold[i]--; }
         Xil_Out32(NES_PAD, pad);

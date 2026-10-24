@@ -1,40 +1,63 @@
 # KV260 NES (ファミコン)
 
-KV260 の PL に NES を Verilog で自作する。6502 CPU・PPU (画面)・APU (音) をすべて PL に置く。
+KV260 の PL に NES を Verilog で自作する。6502 CPU・PPU (画面)・APU (音)・マッパーをすべて PL に置き、
+PS (ベアメタル C) は ROM の書き込みとキー入力の中継だけを行う。
 映像は HDMI (PS の Live Video)、音は Pmod I2S2 (J2)、入力は UART のキー。
 
-ROM はテスト ROM (nestest / blargg) と、無料公開の自作ゲーム (NROM = マッパー0) を使う。
-市販ゲームの ROM はリポジトリに入れない。
+ROM はテスト ROM (nestest / blargg / Holy Mapperel) と、無料公開の自作ゲーム
+(pinobatch の Thwaite・Concentration Room、GPL-3.0) を使う。ROM はリポジトリに入れない (`roms/` は git 外)。
 
 ## 段
 
 | 段 | 内容 | 状態 |
 |---|---|---|
-| A | 画面バッファ 256x240 を 3 倍で HDMI に表示、I2S2 の固定トーン | sim PASS・合成前 |
-| B | 6502 CPU (公式命令)。nestest のログと 1 命令ずつ照合 | sim で 5003 命令・サイクル数まで一致 |
-| C | CPU を実機へ。PRG を AXI で書き込み nestest を実行 | |
-| D | PPU (背景・スクロール・NMI・スプライト) | |
-| E | コントローラ ($4016) と UART キー | |
-| F | APU (矩形波 2・三角波・ノイズ・DMC) → I2S2 | |
-| G | マッパー追加 (任意) | |
+| A | 画面バッファ 256x240 を 3 倍で HDMI に表示 | sim PASS |
+| B | 6502 CPU (公式命令)。nestest のログと 1 命令ずつ照合 | 5003 命令・サイクル数まで一致 |
+| C | CPU + RAM + PRG。AXI で PRG を書き nestest を実行 | 結果 $02/$03 = 00 |
+| D | PPU (背景・スクロール・NMI・スプライト・0 番ヒット・OAM DMA) | sprite_hit_tests 11 本 PASS |
+| E | コントローラ ($4016/$4017) と UART キー | tb_pad PASS |
+| F | APU (矩形波 2・三角波・ノイズ・DMC) → I2S2、PRG-RAM | apu_test 8 本 PASS。合成済・**実機 HDMI で Thwaite 表示** |
+| G | マッパー 0/1/2/3/4/7、PRG 256KB・CHR 128KB | Holy Mapperel 13 本・mmc3_test 4 本 PASS。合成済・実機で Thwaite と MMC3 のテスト ROM 表示 |
 
-## 構成 (段A)
+## 構成
 
 ```
-PS (ベアメタル C)
-  │ AXI4-Lite (0xA0000000, 256KB)
-  ▼
+PS (A53 ベアメタル C, vitis_src/main.c)
+  ├ HDMI 初期化 (InitDP / RunDP。kv260_chip8 から流用)
+  ├ ROM (rom_data.h) を AXI で PL の PRG/CHR へ書く → CTRL bit0=1 で実行
+  └ UART のキー → PAD レジスタ (12 フレーム押し続ける)
+        │ AXI4-Lite  0xA0000000〜 256KB
+        ▼
 nes_axi_slave ── 単純なバス ──► rtl_top
-                                 ├ レジスタ (CTRL / ID / PAD / FRAME)
-                                 ├ nes_fb      画面バッファ 256x240 x 6bit (4 バンク = x%4)
-                                 ├ nes_palette 色番号 → RGB
-                                 ├ vga_iface   1280x720 のタイミング
-                                 └ i2s_tx      Pmod I2S2 へ固定トーン (12.5MHz)
+                                 ├ レジスタ
+                                 ├ nes_core ─┬ cpu6502  6502 CPU
+                                 │           ├ ppu      画面
+                                 │           ├ apu      音
+                                 │           ├ mapper   バンク切替
+                                 │           └ 内蔵 RAM 2KB / PRG-RAM 8KB / PRG 256KB / CHR 128KB / VRAM 2KB
+                                 ├ nes_fb      画面バッファ 256x240 x 6bit
+                                 ├ nes_palette 64 色 → RGB
+                                 ├ vga_iface   1280x720 (74.25MHz)
+                                 └ i2s_tx      Pmod I2S2 (mclk 12.5MHz)
 ```
 
-- 表示: 256x240 を縦横 3 倍 (768x720) にして X=256 から。外側は暗い灰色
-- 3 で割る計算は `n*683 >> 11` (n < 768 で floor(n/3) と一致。sim で全数確認)
-- 映像クロック (74.25MHz) と NES 側 (100MHz) は画面バッファの 2 クロック RAM で切り離す
+- 表示: 256x240 を縦横 3 倍 (768x720) にして X=256 から。外側は暗い灰色。
+  3 で割る計算は `n*683 >> 11` (n < 768 で floor(n/3) と一致。sim で全数確認)。
+- NES 側 (100MHz) と映像側 (74.25MHz) は画面バッファで切り離す。
+- 音: APU の 16bit を 1024 クロックごとに保持し、トグル + 3 段 FF で mclk 側へ渡す。
+- 時間: すべて 100MHz で動かし、クロック許可で刻む。ppu_ce = 5.3693MHz (位相積算)、cpu_ce = その 3 回に 1 回。
+
+## CPU から見たメモリ
+
+| 番地 | 中身 |
+|---|---|
+| $0000-$1FFF | 内蔵 RAM 2KB (ミラー) |
+| $2000-$3FFF | PPU レジスタ |
+| $4000-$4013, $4015 | APU |
+| $4014 | OAM DMA (513/514 サイクル CPU を止める) |
+| $4016 / $4017 | コントローラ / APU フレームカウンタ |
+| $6000-$7FFF | PRG-RAM 8KB |
+| $8000-$FFFF | PRG。8KB の窓 4 つをマッパーのバンク番号で選ぶ |
 
 ## AXI マップ (0xA0000000)
 
@@ -42,45 +65,103 @@ nes_axi_slave ── 単純なバス ──► rtl_top
 
 | 番地 | 名前 | 中身 |
 |---|---|---|
-| 0x00000 | CTRL | 段C で NES のリセット解除に使う |
+| 0x00000 | CTRL | bit0 実行 (0 でリセット保持) / bit2 垂直ミラー / bit3 CHR-RAM / [7:4] マッパー番号 / [11:8] PRG 16KB 個数-1 / [15:12] CHR 8KB 個数-1 |
 | 0x00010 | ID | 0x4E455301 (読み専用) |
-| 0x00020 | PAD | コントローラ (段E) |
-| 0x00030 | FRAME | 映像のフレーム数 (読み専用) |
-| 0x10000〜0x1EFFC | FB | 語番号 = y*64 + x/4。[5:0]=x, [13:8]=x+1, [21:16]=x+2, [29:24]=x+3 |
+| 0x00020 | PAD | [0]A [1]B [2]Select [3]Start [4]上 [5]下 [6]左 [7]右 |
+| 0x00030 | FRAME | 映像のフレーム数 |
+| 0x00040 | PC | CPU の PC (観測用) |
+| 0x00050 | CYC | CPU の経過サイクル数 |
+| 0x00060 | PFRM | PPU のフレーム数 |
+| 0x00070 | LOAD | 書き込み窓の位置 [2:0] PRG 32KB 単位 / [7:4] CHR 8KB 単位 |
+| 0x08000〜 | WRAM | 内蔵 RAM の読み出し (1 語 1 バイト) |
+| 0x10000〜 | FB | 画面バッファ (段A のテスト用) |
+| 0x20000〜0x27FFC | PRG | 32KB の窓。1 語 = 4 バイト |
+| 0x30000〜0x37FFC | CHR | 8KB の窓。1 語 = 1 バイト |
 
-## ファイル
+CTRL の bit0 以外は `tools/rom2c.py` が作る `ROM_CTRL` をそのまま書く。
 
-| ファイル | 中身 |
+## 各ブロックの要点
+
+- **cpu6502.v**: 命令ごとのサイクル数が実機と同じ (ページまたぎ・分岐・空読み/空書きも)。10 進モード無し、非公式命令は 2 サイクルの NOP。
+  NMI / IRQ は命令の最後の 1 つ前のサイクルの終わりで見る (実機と同じ)。
+- **ppu.v**: 背景の読み出し・シフト・スクロールの時刻は olcNES と同じ。スプライトはドット 65〜128 で評価、257〜320 で模様読み、321 で表示中へ。
+  列の比較は 9bit で引く (8bit だと X=255 付近が左端に折り返す)。アドレス線 A12 を mapper に出す。
+- **apu.v**: フレームカウンタのリセットは $4017 書込の 3〜4 サイクル後、IRQ は 29828〜29830。DMC はバスを 4 サイクル借りる。
+  出力は実機の非線形ミキサ (表引き) → ローパス約 18kHz → 直流除去約 70Hz。
+- **mapper.v**: 0 NROM / 1 MMC1 / 2 UxROM / 3 CNROM / 4 MMC3 / 7 AxROM。
+  MMC3 のライン割り込みは PPU の A12 の立ち上がりで数える (A12 が 10 ドット以上 0 のあとだけ。Mesen と同じ)。カウンタは新しい版 (Sharp) の動き。
+  WRAM の保護 (MMC1 の禁止ビット、MMC3 の読み出し専用) とバスの衝突は真似しない。
+
+## 検証 (sim)
+
+```
+bash sim/run_sim.sh <tb 名>
+```
+
+| tb | 中身 |
 |---|---|
-| `rtl/rtl_top.v` | トップ。レジスタ・表示・音 |
-| `rtl/nes_axi_slave.v` | AXI4-Lite → 単純なバス |
-| `rtl/nes_fb.v` | 画面バッファ |
-| `rtl/nes_palette.v` | 64 色の表 |
-| `rtl/vga_iface.v` ほか 2 本 | kv260_chip8 から流用 |
-| `rtl/i2s_tx.v`, `sine_lut.hex` | kv260_i2s2 から流用 |
-| `rtl/cpu6502.v` | 6502 CPU (サイクル数は実機と同じ、10 進モード無し) |
-| `sim/tb_stageA.v` | 段A の検証 |
-| `sim/tb_cpu_nestest.v` | 段B: nestest の正解ログと照合 |
-| `tools/nestest_prep.py` | nestest の ROM とログを hex に変換 (roms/ に置く) |
-| `sim/run_sim.sh` | `bash sim/run_sim.sh tb_stageA` |
-| `vivado.tcl` | プロジェクト生成・ビルド・XSA 出力 |
-| `vitis_src/main.c` | 段A の PS 側 |
+| tb_stageA | AXI で画面バッファを書き、映像 1 フレーム 921,600 画素を全照合 |
+| tb_cpu_nestest | nestest の正解ログと PC/A/X/Y/P/SP/CYC を照合 (`python tools/nestest_prep.py` が先) |
+| tb_nes_nestest | AXI だけで nestest を実行し $02/$03 を読む |
+| tb_ppu_nestest | nestest のメニュー画面を描く |
+| tb_pad | $4016/$4017 の読み出し (`tools/pad_test_gen.py`) |
+| tb_apu | 440Hz の周波数測定 (`tools/apu_test_gen.py`) |
+| tb_rom | 任意の ROM を回し、画面を PPM・ネームテーブルを文字で出す |
 
-## 検証
-
+tb_rom の使い方:
 ```
-bash sim/run_sim.sh tb_stageA
+python tools/rom_prep.py roms/xxx.nes [フレーム数] [ボタン(16進) フレーム [ボタン2 フレーム2]]
+bash sim/run_sim.sh tb_rom
+python tools/ppm2png.py sim/simbuild/frame.ppm sim/simbuild/frame.png 2
 ```
+blargg の $6000 の結果、または描画中に画面が 30 フレーム変わらなければ早く終わる。
+環境変数 `HEXDIR` / `SIMDIR` で置き場所を分ければ並列に回せる。
 
-AXI で ID 読み出し → 画面バッファ全体を書く → 映像 1 フレーム 921,600 画素を全部照合 → FRAME が増えるか。
+結果:
+- blargg sprite_hit_tests 01〜11、apu_test 1〜8: 全 PASS
+- Holy Mapperel 13 本: 全本でマッパー判定と PRG・IRQ・CHR が正常。
+  WRAM の桁だけ MMC1 = 5/1、MMC3 = 2 (保護機能を実装していないため)
+- blargg mmc3_test: 1・2・3・5 PASS。6 は古い版 (NEC) 用で対象外。
+  4 (scanline_timing) は小テスト 3 で不合格 = 割り込みが 1〜2 ドット遅い (1 ドット精度のテスト。原因未確認)。
+  CPU の割り込み受付を「命令の最後の 1 つ前のサイクル」に直して、1 サイクル早かったのは解消
+- Thwaite / Concentration Room: タイトル・導入場面が正しく描ける
 
-段B: `roms/` に nestest.nes と nestest.log を置き (christopherpow/nes-test-roms の other/)、
-`python tools/nestest_prep.py` → `bash sim/run_sim.sh tb_cpu_nestest`。
-
-★ テストベンチで、連結式の中で同じ関数を何度も呼ぶと xsim では x になる。変数に受けてから組む。
-
-## ビルド
+## 合成
 
 ```
 E:\vivado\2025.2\Vivado\bin\vivado.bat -mode batch -source E:/fpga/kria260/kv260_nes/vivado.tcl
 ```
+
+| | 段F | 段G |
+|---|---|---|
+| 所要時間 | 9 分 46 秒 | 11 分 52 秒 |
+| WNS / WHS | +2.948 / +0.016 | +1.436 / +0.017 |
+| LUT | 3301 | 3616 (3.09%) |
+| BRAM | 25 | 105.5 (73.3%) |
+| DSP | 2 | 2 |
+
+## 実機 (Vitis GUI を使わない)
+
+1. `python tools/rom2c.py roms/games/thwaite.nes` → `vitis_src/rom_data.h` (git 外)
+2. `bash tools/build_elf.sh` → `E:/Xilinx/project_vitis/kv260_nes/nes.elf` (kv260_chip8 の BSP で gcc を直接呼ぶ)
+3. XSA を `E:/Xilinx/project_vitis/kv260_nes/hw/` に展開し、
+   `python ../kaleidoscope/tools/make_psu_nousb.py hw/psu_init.tcl hw/psu_init_nousb.tcl` (USB の 4 行を外す)
+4. hw_server を起動して
+   `E:/vivado/2025.2/Vitis/bin/xsdb.bat tools/xsdb_run.tcl <hw/design_1_wrapper.bit> <nes.elf> <hw/psu_init_nousb.tcl>`
+   (起動モードを JTAG にしてリセット → PL 書込 → psu_init → ELF 起動。FSBL 不要)
+5. 操作は `python tools/nes_pad.py COM14` (おすすめ)。小さな窓が開き、押している間ずっと押下になる。
+   Xbox のゲームパッドも使える (pygame が要る。十字キー/左スティック=方向、A・Y=A、B・X=B、メニュー=Start、ビュー=Select)。
+   キー: 矢印/wasd=方向、x=A、z=B、Enter=Start、スペース=Select、F5=リセット、Esc=終了。
+   Tera Term (COM14, 115200) でも操作できるが、「押した」しか届かないので 1 回 12 フレーム押したままの扱いになる
+   (キー: x/k=A、z/j=B、スペース=Select、Enter=Start、wasd/矢印=方向、r=リセット)。
+
+COM14 は 1 つのプログラムしか開けない (nes_pad.py・Tera Term・シリアル記録のどれか 1 つ)。
+
+## はまったところ
+
+- xsim で連結式の中で同じ関数を何度も呼ぶと x になる → 変数に受けてから組む。
+- xsim で狭い reg を広いポートにつなぐと上位が x になる (PC が x で止まった。RTL は無実)。
+- 初期値の無いレジスタ / RAM は sim で x のまま (ce の積算が回らない) → 0 で初期化。
+- apu_test 4/5/6: フレームカウンタのリセット遅れと IRQ の時刻・優先 → テストのソースを読んで直した。
+- Holy Mapperel は結果が出るまで 110〜390 フレーム。150 フレームで切ると灰色画面で判定できない。
+- MMC3 をドット 260 で数える近似では mmc3_test が全滅 ($2006 で A12 を動かすテストがある)。

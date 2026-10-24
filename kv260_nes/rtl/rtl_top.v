@@ -8,8 +8,10 @@
 // 音は Pmod I2S2 (J2) へ。APU (nes_core 内) の音を mclk 側に渡して i2s_tx で送る。
 //
 // 【AXI マップ (ベース 0xA0000000, 256KB)】 レジスタは 0x10 刻み
-//   0x00000 CTRL  (RW) bit0=1 で CPU 実行 (0 でリセット保持) / bit1=1 で PRG 16KB 折り返し
-//                      bit2=1 でネームテーブル垂直ミラー (0 = 水平)
+//   0x00000 CTRL  (RW) bit0=1 で CPU 実行 (0 でリセット保持)
+//                      bit2=1 でネームテーブル垂直ミラー (0 = 水平。配線で決まるマッパー用)
+//                      bit3=1 で CHR-RAM ($2007 で書ける) / [7:4] マッパー番号 (0,1,2,3,4,7)
+//                      [11:8] PRG の 16KB 個数 - 1 / [15:12] CHR の 8KB 個数 - 1
 //   0x00010 ID    (R)  0x4E455301 ("NES" + 版)。AXI が届いているかの確認用
 //   0x00020 PAD   (RW) コントローラ 1。1 = 押下
 //                      [0]A [1]B [2]Select [3]Start [4]上 [5]下 [6]左 [7]右
@@ -17,11 +19,13 @@
 //   0x00040 PC    (R)  CPU の PC (観測用)
 //   0x00050 CYC   (R)  CPU の経過サイクル数 (CTRL bit0=0 で 0 に戻る)
 //   0x00060 PFRM  (R)  PPU のフレーム数 (VBlank に入った回数)
+//   0x00070 LOAD  (RW) PRG / CHR 書き込み窓の位置。[2:0] = PRG の 32KB 単位、[7:4] = CHR の 8KB 単位
 //   0x08000-0x09FFC WRAM (R) 内蔵 RAM。1 語 = 1 バイト ([7:0])、番地 = $0000 + n
 //   0x10000-0x1EFFC FB (W) 画面バッファ。語番号 = y*64 + x/4、1 語 = 横 4 画素
 //                    データ [5:0]=x, [13:8]=x+1, [21:16]=x+2, [29:24]=x+3 (色番号)
-//   0x20000-0x27FFC PRG (W) 1 語 = 4 バイト ([7:0] が若い番地)。CPU 停止中に書く
-//   0x30000-0x37FFC CHR (W) 1 語 = 1 バイト ([7:0])、番地 = $0000 + n。CPU 停止中に書く
+//   0x20000-0x27FFC PRG (W) 1 語 = 4 バイト ([7:0] が若い番地)。PRG の LOAD[2:0]*32KB + n*4 に入る
+//   0x30000-0x37FFC CHR (W) 1 語 = 1 バイト ([7:0])。CHR の LOAD[7:4]*8KB + n に入る
+//                   どちらも CPU 停止中に書く
 //
 // 画面バッファは PPU が 1 画素ずつ書く。PS からの FB 書き込みは PPU が書かないクロックだけ通る。
 
@@ -64,6 +68,7 @@ module rtl_top
 
   reg  [31:0] reg_ctrl;
   reg  [31:0] reg_pad;
+  reg  [7:0]  reg_load;
   reg  [31:0] frame_cnt;
 
   wire wr_reg = bus_wr_en && (bus_wr_addr[17:16] == 2'b00);
@@ -85,11 +90,10 @@ module rtl_top
     (
      .clk        (clk),
      .run        (reg_ctrl[0]),
-     .prg16      (reg_ctrl[1]),
-     .mirror_v   (reg_ctrl[2]),
+     .cart       (reg_ctrl[15:0]),
      .pad        (reg_pad[7:0]),
      .chr_we     (wr_chr),
-     .chr_waddr  (bus_wr_addr[14:2]),
+     .chr_waddr  ({reg_load[7:4], bus_wr_addr[14:2]}),
      .chr_wdata  (bus_wr_data[7:0]),
      .pix_we     (pix_we),
      .pix_x      (pix_x),
@@ -98,7 +102,7 @@ module rtl_top
      .ppu_frames (ppu_frames),
      .audio      (audio),
      .prg_we     (wr_prg),
-     .prg_waddr  (bus_wr_addr[14:2]),
+     .prg_waddr  ({reg_load[2:0], bus_wr_addr[14:2]}),
      .prg_wdata  (bus_wr_data),
      .wram_raddr (bus_rd_addr[12:2]),
      .wram_rdata (wram_rdata),
@@ -112,10 +116,12 @@ module rtl_top
     if (reset) begin
       reg_ctrl <= 32'd0;
       reg_pad  <= 32'd0;
+      reg_load <= 8'd0;
     end else if (wr_reg) begin
       case (bus_wr_addr[7:4])
         4'h0: reg_ctrl <= bus_wr_data;
         4'h2: reg_pad  <= bus_wr_data;
+        4'h7: reg_load <= bus_wr_data[7:0];
         default: ;
       endcase
     end
@@ -134,6 +140,7 @@ module rtl_top
         4'h4: bus_rd_data <= {16'd0, cpu_pc};
         4'h5: bus_rd_data <= cpu_cycles;
         4'h6: bus_rd_data <= ppu_frames;
+        4'h7: bus_rd_data <= {24'd0, reg_load};
         default: bus_rd_data <= 32'd0;
       endcase
   end

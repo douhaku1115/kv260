@@ -37,10 +37,13 @@ module ppu (
     input  wire [7:0]  reg_wdata,
     output reg  [7:0]  reg_rdata,
     output wire        nmi,
-    // カートリッジ
-    input  wire        mirror_v,     // 1 = 垂直ミラー (横スクロール向け)
+    // カートリッジ (マッパーから)
+    input  wire [1:0]  mirror,       // 0 = 水平, 1 = 垂直, 2 = 1 画面 (下), 3 = 1 画面 (上)
+    input  wire [55:0] chr_banks,    // 1KB 窓 8 つの番号 (7bit x 8)
+    input  wire        chr_ram,      // 1 = CHR-RAM ($2007 で書ける)
+    output wire        a12,          // PPU のアドレス線 A12 (MMC3 のライン数えに使う)
     input  wire        chr_axi_we,   // PS から CHR を書く (CPU 停止中)
-    input  wire [12:0] chr_axi_addr,
+    input  wire [16:0] chr_axi_addr, // CHR 全体 128KB の番地
     input  wire [7:0]  chr_axi_data,
     // 画素の出力
     output reg         pix_we,
@@ -63,12 +66,22 @@ module ppu (
 
     wire rendering = mask[3] | mask[4];
     wire [14:0] vinc = ctrl[2] ? 15'd32 : 15'd1;
+    wire [14:0] vnext = v + vinc;                    // $2007 で触ったあとの番地
 
     assign nmi = vbl & ctrl[7];
 
     // ネームテーブルの番地 (2KB) — ミラーは引数で渡す
-    function [10:0] ntmap(input [13:0] a, input mv);
-        ntmap = mv ? {a[10], a[9:0]} : {a[11], a[9:0]};
+    function [10:0] ntmap(input [13:0] a, input [1:0] m);
+        case (m)
+        2'd0:    ntmap = {a[11], a[9:0]};        // 水平
+        2'd1:    ntmap = {a[10], a[9:0]};        // 垂直
+        2'd2:    ntmap = {1'b0,  a[9:0]};        // 1 画面 (下)
+        default: ntmap = {1'b1,  a[9:0]};        // 1 画面 (上)
+        endcase
+    endfunction
+    // CHR の番地 (128KB): 1KB 窓 a[12:10] のバンク番号 + 窓の中 a[9:0]。番号は引数で渡す
+    function [16:0] chrmap(input [12:0] a, input [55:0] b);
+        chrmap = {b[a[12:10]*7 +: 7], a[9:0]};
     endfunction
     // パレットの番地: $3F10/14/18/1C は $3F00/04/08/0C と同じ
     function [4:0] palmap(input [4:0] a);
@@ -76,14 +89,14 @@ module ppu (
     endfunction
 
     // ---------------- メモリ ----------------
-    (* ram_style = "block" *) reg [7:0] chr [0:8191];
+    (* ram_style = "block" *) reg [7:0] chr [0:131071];
     (* ram_style = "block" *) reg [7:0] nt  [0:2047];
     reg [5:0] pal [0:31];
     reg [7:0] oam [0:255];
 
     integer k;
     initial begin
-        for (k = 0; k < 8192; k = k + 1) chr[k] = 8'h00;
+        for (k = 0; k < 131072; k = k + 1) chr[k] = 8'h00;
         for (k = 0; k < 2048; k = k + 1) nt[k]  = 8'h00;
         for (k = 0; k < 32;   k = k + 1) pal[k] = 6'h00;
         for (k = 0; k < 256;  k = k + 1) oam[k] = 8'h00;
@@ -94,15 +107,21 @@ module ppu (
     reg  [7:0]  chr_qa, nt_qa, chr_qb, nt_qb;
     wire [7:0]  rdat = ra[13] ? nt_qa : chr_qa;
 
+    // アドレス線 A12: 描画中は読み出し番地 ra。描画していない間は、最後に CPU が
+    // $2006 (2 回目) / $2007 で触った番地 (v) が出たまま (実機と同じ。テストは $2006 で A12 を上げ下げする)
+    reg  a12_idle;
+    wire render_act = rendering && (line < 9'd240 || line == 9'd261);
+    assign a12 = render_act ? ra[12] : a12_idle;
+
     wire is_pal   = (v[13:8] == 6'h3F);
     wire wr2007   = reg_wr && (reg_addr == 3'd7);
     wire nt_we    = wr2007 && v[13] && !is_pal;
-    wire chr_we   = wr2007 && !v[13];
-    wire [12:0] chr_pb = chr_axi_we ? chr_axi_addr : v[12:0];
+    wire chr_we   = wr2007 && !v[13] && chr_ram;       // CHR-ROM には書かない
+    wire [16:0] chr_pb = chr_axi_we ? chr_axi_addr : chrmap(v[12:0], chr_banks);
 
     always @(posedge clk) begin
-        chr_qa <= chr[ra[12:0]];
-        nt_qa  <= nt[ntmap(ra, mirror_v)];
+        chr_qa <= chr[chrmap(ra[12:0], chr_banks)];
+        nt_qa  <= nt[ntmap(ra, mirror)];
     end
     always @(posedge clk) begin
         if (chr_axi_we)  chr[chr_pb] <= chr_axi_data;
@@ -110,8 +129,8 @@ module ppu (
         chr_qb <= chr[chr_pb];
     end
     always @(posedge clk) begin
-        if (nt_we) nt[ntmap(v[13:0], mirror_v)] <= reg_wdata;
-        nt_qb <= nt[ntmap(v[13:0], mirror_v)];
+        if (nt_we) nt[ntmap(v[13:0], mirror)] <= reg_wdata;
+        nt_qb <= nt[ntmap(v[13:0], mirror)];
     end
     always @(posedge clk) begin
         if (wr2007 && is_pal) pal[palmap(v[4:0])] <= reg_wdata[5:0];
@@ -175,8 +194,9 @@ module ppu (
     endfunction
 
     always @(posedge clk) begin
-        pix_we <= 1'b0;
+        pix_we    <= 1'b0;
         if (rst) begin
+            a12_idle <= 1'b0;
             ctrl <= 8'd0; mask <= 8'd0; vbl <= 1'b0; sp0 <= 1'b0; ovf <= 1'b0;
             oamaddr <= 8'd0; v <= 15'd0; t <= 15'd0; fx <= 3'd0; w <= 1'b0; rbuf <= 8'd0;
             dot <= 9'd0; line <= 9'd0; odd <= 1'b0; frame_cnt <= 32'd0;
@@ -197,10 +217,10 @@ module ppu (
                 end
                 3'd6: begin
                     if (!w) t[14:8] <= {1'b0, reg_wdata[5:0]};
-                    else begin t[7:0] <= reg_wdata; v <= {t[14:8], reg_wdata}; end
+                    else begin t[7:0] <= reg_wdata; v <= {t[14:8], reg_wdata}; a12_idle <= t[12]; end
                     w <= ~w;
                 end
-                3'd7: v <= v + vinc;
+                3'd7: begin v <= vnext; a12_idle <= vnext[12]; end
                 default: ;
                 endcase
             end
@@ -210,7 +230,8 @@ module ppu (
                 3'd7: begin
                     // バッファは常に $2xxx 以下の中身で補充 (パレットの下はネームテーブル)
                     rbuf <= v[13] ? nt_qb : chr_qb;
-                    v <= v + vinc;
+                    v <= vnext;
+                    a12_idle <= vnext[12];
                 end
                 default: ;
                 endcase
