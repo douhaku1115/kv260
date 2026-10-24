@@ -99,6 +99,10 @@ static float set_autorotate = 0.35f;  /* 0〜1。参照実装の既定値 */
 static int    set_rev     = 0;        /* 0 / 5 / 10 / 20 [秒] */
 static double sim_rev_t   = 0.0;      /* 今の向きになってからの時間 */
 static double sim_rev_dir = 1.0;      /* +1 / -1 */
+/* おまかせモード (o キー): set_auto 秒ごとに SD の KPAL1〜4 を順に読む。0 = 切 */
+static int    set_auto  = 0;
+static double auto_t    = 0.0;        /* 今の模様になってからの時間 */
+static int    auto_slot = 1;          /* 今読んでいる番号。起動時は KPAL1 を読むので 1 */
 static int   set_text_on    = 1;      /* 操作一覧をモニターに出すか */
 static int   txt_keys       = 0;      /* モニターの文字をキーボードの並びの絵にするか (h / エディタでは /) */
 static float set_viscosity  = 0.5f;   /* 粘り 0〜1。参照実装の既定値 (まだキーは無い) */
@@ -171,6 +175,20 @@ static const char *const kind_name[NCSET] = {
 #define NKIND_EDIT    (NKINDS - 1)     /* 色を直せるピースの種類の数 (気泡を除く) */
 /* 配色エディタで直せるか (気泡だけ除く。SPARK は直せる) */
 #define KIND_EDITABLE(k)  ((k) != KIND_BUBBLE)
+
+/* 構成 (t キー / おまかせ): どの種類のピースを出すか。出さないピースは表にも押し合いにも入れない
+ * (動きの計算だけは続けるので、また出したときにその場から現れる)。
+ * ビットは種類の番号 (BEAD S.BEAD GLASS GLITTER STONE HEX ROD BLOB MOON BUBBLE の順) */
+#define KB(k)  (1u << (k))
+static const struct { const char *name; const char *jp; u16 mask; } comps[] = {
+    { "ALL", "全部",       0x3FF },
+    { "GRN", "粒だけ",     KB(0) | KB(1) | KB(3) | KB(9) },           /* ビーズ・小ビーズ・ラメ・気泡 */
+    { "GLS", "ガラスと石", 0x3FF & ~(KB(0) | KB(3)) },               /* 粒は小ビーズだけ */
+    { "CLM", "ラメなし",   0x3FF & ~KB(3) },
+};
+#define NCOMPS  ((int)(sizeof(comps) / sizeof(comps[0])))
+static int set_comp = 0;
+#define PART_SHOWN(i)  ((comps[set_comp].mask >> parts[i].kind) & 1)
 static void LoadPreset(int n);
 static void SpkColors(void);
 static int  SdSave(int slot);
@@ -214,6 +232,8 @@ static void StepSim(double dt);
 static void SimStir(void);
 static void SimTurn(double dir);
 static void WriteTable(void);
+static void AutoNext(void);
+static void SimLists(void);
 
 int main(void)
 {
@@ -335,6 +355,12 @@ int main(void)
         XTime_GetTime(&t1);
         if (t1 - t0 > t_sim_max) t_sim_max = t1 - t0;
 
+        /* おまかせモード。配色エディタを開いている間は切り替えない (直している配色が消える) */
+        if (set_auto > 0 && !ed_on) {
+            auto_t += dt;
+            if (auto_t >= set_auto) { auto_t = 0.0;  AutoNext(); }
+        }
+
         Xil_Out32(KAL_COS_T, (u32)(s32)(cos(sim_tube_angle) * 32768.0));
         Xil_Out32(KAL_SIN_T, (u32)(s32)(sin(sim_tube_angle) * 32768.0));
         SpkTick();
@@ -397,13 +423,13 @@ static int uart_getchar_nb(void)
    フレーム同期を圧迫して取りこぼしの原因になる。 */
 static void ShowSettings(void)
 {
-    xil_printf("ポイント %2d  ミラー %d  大きさ %3d  回転 %3d  往復 %2d秒  粘り %3d  色 %s%s\r\n",
+    xil_printf("ポイント %2d  ミラー %d  大きさ %3d  回転 %3d  往復 %2d秒  粘り %3d  色 %s  構成 %s  おまかせ %3d秒%s\r\n",
                set_points, set_mirror2 ? 2 : 3,
                (int)(set_zoom * 100.0f + 0.5f),
                (int)(set_autorotate * 100.0f + 0.5f),
                set_rev,
                (int)(set_viscosity * 100.0f + 0.5f),
-               cset_name,
+               cset_name, comps[set_comp].jp, set_auto,
                (set_points > 10) ? "  ※11以上は反射19回。K=16では外側が崩れる" : "");
 }
 
@@ -413,15 +439,18 @@ static void ShowHelp(void)
 {
     xil_printf("\r\n\r\n\r\n--- キー (Shift 不要。キーボードの並び) ---\r\n");   /* 空行 2 つで流れる表示と区切る */
     xil_printf("                                                        [0]初期設定\r\n");
-    xil_printf(" [q]ポイント- [w]ポイント+ [e]かき混ぜ [r]往復        [i]画面一覧 [p]配色\r\n");
+    xil_printf(" [q]ポイント- [w]ポイント+ [e]混ぜる [r]往復 [t]構成 [i]一覧 [o]自動 [p]配色\r\n");
     xil_printf("  [a]小さく [s]大きく                  [h]この一覧 [j]左回し   [l]右回し\r\n");
     xil_printf("   [z]回転遅く [x]回転速く [c]色の組 [v]サラサラ [b]ネバネバ   [m]鏡2/3枚\r\n");
     xil_printf("  r 往復: 切→5秒→10秒→20秒→切   c 色の組: %d 通り   j l は押している間だけ\r\n",
                NPALETTES);
+    xil_printf("  t 構成: 全部→粒だけ→ガラスと石→ラメなし   i 画面の一覧を出す/消す\r\n");
+    xil_printf("  o 自動 (おまかせ): 切→30秒→60秒→120秒→切。その間隔で KPAL1〜4 の設定を順に読み、\r\n");
+    xil_printf("    色の組と構成も替える (大きさは今のまま)\r\n");
     xil_printf("  p 配色エディタ (中で / を押すとエディタのキーが出る)\r\n");
     xil_printf("  h はモニターの文字もキーの並びの絵にする (もう一度 h で戻る)。絵の略語:\r\n");
     xil_printf("    P±ポイント MX混ぜる RV往復 TX画面一覧 ED配色 Z±大きさ KYこの絵 <<>>手で回す\r\n");
-    xil_printf("    S±回転 CL色の組 V±粘り MR鏡 RS初期設定\r\n");
+    xil_printf("    S±回転 CL色の組 V±粘り MR鏡 RS初期設定 AU自動 CM構成\r\n");
     ShowSettings();
 }
 
@@ -465,6 +494,15 @@ static void HandleKey(int c)
         if (set_rev == 0) sim_rev_dir = 1.0;   /* 切ったら元の向きに戻す */
         break;
 
+    /* おまかせモード: 切 → 30 秒 → 60 秒 → 120 秒 → 切 */
+    case 'o':
+        set_auto = (set_auto == 0) ? 30 : (set_auto == 30) ? 60 : (set_auto == 60) ? 120 : 0;
+        auto_t = 0.0;
+        break;
+
+    /* 構成: 全部 → 粒だけ → ガラスと石 → ラメなし → 全部 */
+    case 't': set_comp = (set_comp + 1) % NCOMPS;  SimLists();  break;
+
     /* 油の粘り (段6) */
     case 'v': if (set_viscosity > 0.001f) set_viscosity -= 0.1f; break;
     case 'b': if (set_viscosity < 0.999f) set_viscosity += 0.1f; break;
@@ -486,6 +524,8 @@ static void HandleKey(int c)
     case '0':
         set_points = 8; set_mirror2 = 0; set_zoom = 1.0f; set_autorotate = 0.35f;
         set_rev = 0;  sim_rev_t = 0.0;  sim_rev_dir = 1.0;
+        set_auto = 0;
+        set_comp = 0;  SimLists();
         set_viscosity = 0.5f;  LoadPreset(0);
         spk_amount = 45;  spk_bright = 100;  spk_size = 75;    /* SpkSet は KalSetGeometry から */
         geom = 1;
@@ -692,8 +732,6 @@ static inline float rndf(void)
 
 static void SimInit(void)
 {
-    nsolid = nbig = 0;
-    small_cr_max = 0.0f;
     grid_size = 2.0 / GRID_N;
     for (int i = 0; i < NPARTS; i++) {
         const Part *p = &parts[i];
@@ -703,18 +741,29 @@ static void SimInit(void)
         s->rot = p->rot;  s->spin = 0.0;
         s->sink = type_sink[p->typ] * (0.75 + 0.5 * rnd());   /* rand(0.75, 1.25) */
         s->cr = p->r * type_cr[p->typ];
-        if (s->cr > 0.0) {
-            if (2.0 * s->cr <= grid_size) {
-                solid[nsolid++] = (u16)i;
-                if ((float)s->cr > small_cr_max) small_cr_max = (float)s->cr;
-            } else {
-                big[nbig++] = (u16)i;
-            }
-        }
         order[i] = (u16)i;
     }
+    SimLists();
     xil_printf("押し合いのマス: 一辺 %d/1000、小 %d 個 (マス目)、大 %d 個 (別に調べる)\r\n",
                (int)(grid_size * 1000.0), nsolid, nbig);
+}
+
+/* 押し合いに加わるもの (当たり判定があり、今の構成で出しているもの) を小と大に分ける。
+ * 構成 (set_comp) を変えたら呼び直す */
+static void SimLists(void)
+{
+    nsolid = nbig = 0;
+    small_cr_max = 0.0f;
+    for (int i = 0; i < NPARTS; i++) {
+        const SimPart *s = &sp[i];
+        if (s->cr <= 0.0 || !PART_SHOWN(i)) continue;
+        if (2.0 * s->cr <= grid_size) {
+            solid[nsolid++] = (u16)i;
+            if ((float)s->cr > small_cr_max) small_cr_max = (float)s->cr;
+        } else {
+            big[nbig++] = (u16)i;
+        }
+    }
 }
 
 /* 押し合いの 1 組。重なっていれば当たり判定の面積 (cr^2) の比で押し離す */
@@ -1166,6 +1215,31 @@ static int SdLoad(int slot)
     return got;
 }
 
+/* おまかせモードの切り替え。次の KPAL を読み、配色と設定 (SETTING 行) を変える。
+ * 読めないファイル (無い・壊れている) は飛ばす。4 つとも読めなければ何もしない */
+static void AutoNext(void)
+{
+    /* 大きさだけは今のまま (KPAL ごとに 80〜180 と違い、切り替わるたびに大きさが跳ぶと言われた) */
+    const float zoom = set_zoom;
+    for (int k = 0; k < 4; k++) {
+        auto_slot = auto_slot % 4 + 1;
+        if (SdLoad(auto_slot) > 0) {
+            set_zoom = zoom;
+            /* 色の組と構成も、今と違うものを乱数で選ぶ (KPAL の 4 つだけでは「あまり変わらない」と
+             * 言われた)。KPAL から使うのは設定 (SETTING 行) だけになる */
+            LoadPreset((set_palette + 1 + (int)(rnd() * (NPALETTES - 1))) % NPALETTES);
+            set_comp = (set_comp + 1 + (int)(rnd() * (NCOMPS - 1))) % NCOMPS;
+            SimLists();
+            KalSetGeometry();              /* ポイント・ミラー・大きさ・きらめき層を書き直す */
+            UpdateText();
+            xil_printf("おまかせ: KPAL%d.TXT\r\n", auto_slot);
+            ShowSettings();
+            return;
+        }
+    }
+    xil_printf("おまかせ: SD の KPAL1〜4 が読めない\r\n");
+}
+
 /* ========== 配色エディタ (p キーで出す/閉じる) ==========
  * 画面の操作一覧の代わりに出る。今の配色 cset[] を直接直すので、模様を見ながら決められる
  * (次の描き直しから変わる)。色見本は出さない (画面の文字は白だけ)。
@@ -1262,6 +1336,7 @@ static void EditKey(int c)
     case '5': case '6': case '7': case '8':
         SdMessage("LOADED", c - '4', SdLoad(c - '4'));
         KalSetGeometry();                  /* SETTING の行でポイント・ミラー・大きさが変わる */
+        auto_slot = c - '4';               /* おまかせはこの次の番号から */
         break;
     case 'p': ed_on = 0; txt_keys = 0; UpdateText(); ShowHelp(); return;
     /* h は割合 - に使うので一覧は / と ? (/ は Shift 不要)。モニターもキーの並びの絵と切り替える */
@@ -1293,6 +1368,7 @@ static void WriteTable(void)
     Xil_Out32(KAL_CELL_CTRL, CELL_SEL_TABLE);      /* 表の番地を 0 に戻す */
     for (int i = 0; i < NPARTS; i++) {
         const int n = order[i];
+        if (!PART_SHOWN(n)) continue;              /* 今の構成で出さない種類 */
         const SimPart *s = &sp[n];
         Part p = parts[n];                         /* 種類・色・大きさ・種はそのまま */
         p.x = s->x;  p.y = s->y;  p.z = s->z;
@@ -1380,7 +1456,7 @@ static void KeyRow(int row, int off, const char *keys, const char *const *lab)
 static void KeyText(void)
 {
     static const char *const n_num[10] = { 0,0,0,0,0,0,0,0,0, "RS" };
-    static const char *const n_q[10]   = { "P-","P+","MX","RV",0,0,0,"TX",0,"ED" };
+    static const char *const n_q[10]   = { "P-","P+","MX","RV","CM",0,0,"TX","AU","ED" };
     static const char *const n_a[9]    = { "Z-","Z+",0,0,0,"KY","<<",0,">>" };
     static const char *const n_z[7]    = { "S-","S+","CL","V-","V+",0,"MR" };
     static const char *const e_num[10] = { "S1","S2","S3","S4","L1","L2","L3","L4",0,0 };
@@ -1410,6 +1486,7 @@ static void UpdateText(void)
         goto put;
     }
     TxtPut(0, 6, "OIL KALEIDOSCOPE");
+    if (set_auto > 0) { TxtPut(0, 24, "AUTO");  TxtNum(0, 31, set_auto); }   /* おまかせの間隔 [秒] */
     /* 8 行しか無いので、段6 で増えたキーは 6・7 行目に 2 つずつ詰める */
     TxtPut(1, 2, "Q W   POINTS");  TxtNum(1, 24, set_points);
     TxtPut(2, 2, "M     MIRROR");  TxtNum(2, 24, set_mirror2 ? 2 : 3);
@@ -1420,6 +1497,7 @@ static void UpdateText(void)
     if (set_rev > 0) TxtNum(4, 24, set_rev); else TxtPut(4, 22, "OFF");
     TxtPut(5, 2, "V B   THICK");   TxtNum(5, 24, (int)(set_viscosity * 100.0f + 0.5f));
     TxtPut(6, 2, "E STIR  J L TURN  P EDIT");
+    TxtPut(6, 27, "T");  TxtPut(6, 29, comps[set_comp].name);   /* 構成 */
     TxtPut(7, 2, "0 RESET I HIDE C");
     TxtPut(7, 19, cset_name);
 
