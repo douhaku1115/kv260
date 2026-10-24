@@ -2,7 +2,7 @@
 #ifndef PARTS_DATA_H
 #define PARTS_DATA_H
 
-#define NPARTS 2038
+#define NPARTS 2730
 #define NKINDS 10       /* 配色エディタの種類の数 (最後の気泡を含む) */
 #define KCOLS  8       /* 1 種類あたりの色の数 */
 

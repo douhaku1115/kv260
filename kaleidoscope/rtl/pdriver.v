@@ -46,7 +46,7 @@ module pdriver
   #(
     parameter W      = 24,
     parameter WORDS  = 24,          // 1 個あたりの語数
-    parameter MAXP   = 2048,        // 表に入る最大の個数 (段6b で 645 → 2048。番地 16bit に入る上限は 2730)
+    parameter MAXP   = 2730,        // 表に入る最大の個数 (段6b で 645 → 2048、段8b で 2730 = 番地 16bit に入る上限。65520 語)
     parameter CB     = 9,
     parameter CELLB  = 8
     )
