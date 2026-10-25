@@ -17,7 +17,7 @@ ROM はテスト ROM (nestest / blargg / Holy Mapperel) と、無料公開の自
 | D | PPU (背景・スクロール・NMI・スプライト・0 番ヒット・OAM DMA) | sprite_hit_tests 11 本 PASS |
 | E | コントローラ ($4016/$4017) と UART キー | tb_pad PASS |
 | F | APU (矩形波 2・三角波・ノイズ・DMC) → I2S2、PRG-RAM | apu_test 8 本 PASS。合成済・**実機 HDMI で Thwaite 表示** |
-| G | マッパー 0/1/2/3/4/7、PRG 256KB・CHR 128KB | Holy Mapperel 13 本・mmc3_test 4 本 PASS。合成済・実機で Thwaite と MMC3 のテスト ROM 表示 |
+| G | マッパー 0/1/2/3/4/7、PRG 256KB・CHR 128KB | Holy Mapperel 13 本 (WRAM 保護込み)・mmc3_test 4 本 PASS。合成済・実機で Thwaite と MMC1/MMC3 のテスト ROM 表示 |
 
 ## 構成
 
@@ -90,7 +90,9 @@ CTRL の bit0 以外は `tools/rom2c.py` が作る `ROM_CTRL` をそのまま書
   出力は実機の非線形ミキサ (表引き) → ローパス約 18kHz → 直流除去約 70Hz。
 - **mapper.v**: 0 NROM / 1 MMC1 / 2 UxROM / 3 CNROM / 4 MMC3 / 7 AxROM。
   MMC3 のライン割り込みは PPU の A12 の立ち上がりで数える (A12 が 10 ドット以上 0 のあとだけ。Mesen と同じ)。カウンタは新しい版 (Sharp) の動き。
-  WRAM の保護 (MMC1 の禁止ビット、MMC3 の読み出し専用) とバスの衝突は真似しない。
+  WRAM ($6000-$7FFF) の保護: MMC1 は $E000 の bit4 (SNROM は CHR バンクの bit4 も) で読み書き禁止、
+  MMC3 は $A001 の bit7 で有効・bit6 で書き込み禁止。読めないときは開きバス (番地の上位 1 バイト) を返す。
+  バスの衝突は真似しない。
 
 ## 検証 (sim)
 
@@ -120,7 +122,7 @@ blargg の $6000 の結果、または描画中に画面が 30 フレーム変�
 結果:
 - blargg sprite_hit_tests 01〜11、apu_test 1〜8: 全 PASS
 - Holy Mapperel 13 本: 全本でマッパー判定と PRG・IRQ・CHR が正常。
-  WRAM の桁だけ MMC1 = 5/1、MMC3 = 2 (保護機能を実装していないため)
+  WRAM の保護を入れて MMC1・MMC3 の結果も 0000 (保護なしでは MMC1 = 5000/1000、MMC3 = 2000)。実機の MMC1 (SNROM) でも 0000
 - blargg mmc3_test: 1・2・3・5 PASS。6 は古い版 (NEC) 用で対象外。
   4 (scanline_timing) は小テスト 3 で不合格 = 割り込みが 1〜2 ドット遅い (1 ドット精度のテスト。原因未確認)。
   CPU の割り込み受付を「命令の最後の 1 つ前のサイクル」に直して、1 サイクル早かったのは解消
@@ -132,13 +134,13 @@ blargg の $6000 の結果、または描画中に画面が 30 フレーム変�
 E:\vivado\2025.2\Vivado\bin\vivado.bat -mode batch -source E:/fpga/kria260/kv260_nes/vivado.tcl
 ```
 
-| | 段F | 段G |
-|---|---|---|
-| 所要時間 | 9 分 46 秒 | 11 分 52 秒 |
-| WNS / WHS | +2.948 / +0.016 | +1.436 / +0.017 |
-| LUT | 3301 | 3616 (3.09%) |
-| BRAM | 25 | 105.5 (73.3%) |
-| DSP | 2 | 2 |
+| | 段F | 段G | 段G + WRAM 保護 |
+|---|---|---|---|
+| 所要時間 | 9 分 46 秒 | 11 分 52 秒 | 12 分 33 秒 |
+| WNS / WHS | +2.948 / +0.016 | +1.436 / +0.017 | +1.049 / +0.013 |
+| LUT | 3301 | 3616 (3.09%) | 3623 (3.09%) |
+| BRAM | 25 | 105.5 (73.3%) | 105.5 (73.3%) |
+| DSP | 2 | 2 | 2 |
 
 ## 実機 (Vitis GUI を使わない)
 

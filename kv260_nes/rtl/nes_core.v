@@ -78,6 +78,7 @@ module nes_core #(
     wire        ppu_nmi;
     wire        apu_irq;
     wire        ppu_a12;        // PPU のアドレス線 A12 → マッパー (MMC3 のライン数え)
+    wire        prgram_rd, prgram_wr;   // マッパー: PRG-RAM を読んでよい / 書いてよい
     wire [19:0] prg_banks;      // マッパー → PRG (8KB 窓 x 4)
     wire [55:0] chr_banks;      // マッパー → PPU (1KB 窓 x 8)
     wire [1:0]  map_mirror;
@@ -192,7 +193,8 @@ module nes_core #(
       (.clk(clk), .rst(!run), .ce(cpu_ce), .cfg(cart),
        .wr(cpu_ce && we && addr[15]), .addr(addr), .wdata(dout),
        .ppu_ce(ppu_ce), .a12(ppu_a12),
-       .prg_banks(prg_banks), .chr_banks(chr_banks), .mirror(map_mirror), .irq(map_irq));
+       .prg_banks(prg_banks), .chr_banks(chr_banks), .mirror(map_mirror), .irq(map_irq),
+       .wram_rd(prgram_rd), .wram_wr(prgram_wr));
 
     // ---------------- PRG 256KB (1 語 = 4 バイト) ----------------
     // $8000-$FFFF の 8KB 窓 addr[14:13] ごとに、マッパーのバンク番号 + 窓の中 addr[12:0]
@@ -241,25 +243,30 @@ module nes_core #(
        .p1_out(), .p2_out(), .tri_out(), .noi_out(), .dmc_out());
 
     // ---------------- PRG-RAM 8KB ($6000-$7FFF) ----------------
+    // マッパーが禁止したら書かない・読めない (読むとオープンバス = 番地の上位バイト。絶対番地の読みと同じ)
     (* ram_style = "block" *) reg [7:0] prgram [0:8191];
     reg [7:0] prgram_q;
     initial for (wi = 0; wi < 8192; wi = wi + 1) prgram[wi] = 8'h00;
     wire sel_prgram = (addr[15:13] == 3'b011);
     always @(posedge clk) begin
-        if (cpu_ce && we && sel_prgram) prgram[addr[12:0]] <= dout;
+        if (cpu_ce && we && sel_prgram && prgram_wr) prgram[addr[12:0]] <= dout;
         prgram_q <= prgram[addr[12:0]];
     end
 
     // ---------------- 読みの選択 ----------------
     reg [15:0] addr_d;
-    always @(posedge clk) addr_d <= addr;       // RAM の読み遅れに合わせる
+    reg        prgram_rd_d;
+    always @(posedge clk) begin                 // RAM の読み遅れに合わせる
+        addr_d      <= addr;
+        prgram_rd_d <= prgram_rd;
+    end
     always @(*) begin
         if (addr_d[15:13] == 3'b000) din = wram_q;
         else if (addr_d[15:13] == 3'b001) din = ppu_rdata;
         else if (addr_d == 16'h4015) din = apu_status;
         else if (addr_d == 16'h4016) din = {7'b0100000, pad_sh[0]};
         else if (addr_d == 16'h4017) din = 8'h40;
-        else if (addr_d[15:13] == 3'b011) din = prgram_q;
+        else if (addr_d[15:13] == 3'b011) din = prgram_rd_d ? prgram_q : addr_d[15:8];
         else if (addr_d[15])         din = prg_byte;
         else                         din = 8'h00;
     end

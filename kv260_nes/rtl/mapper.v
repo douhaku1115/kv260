@@ -17,6 +17,7 @@
 //         (読み書き命令の空書きに反応しないため。実機と同じ)
 //   MMC3: ライン割り込みは PPU のアドレス線 A12 の立ち上がりで数える (10 ドット以上 0 のあとだけ)。
 //         数え方は新しい版 (Sharp): 0 か再読込指示なら latch を入れ、それ以外は 1 減らし、0 なら IRQ
+//   PRG-RAM の保護: MMC1 は $E000 bit4 (SNROM は CHR バンクの bit4 も)、MMC3 は $A001 (bit7 有効 / bit6 書込禁止)
 //   バスの衝突 (UxROM/CNROM で ROM の値と書いた値の AND になる) は真似しない
 
 module mapper (
@@ -32,7 +33,9 @@ module mapper (
     output reg  [19:0] prg_banks,
     output reg  [55:0] chr_banks,
     output reg  [1:0]  mirror,
-    output wire        irq
+    output wire        irq,
+    output reg         wram_rd,      // PRG-RAM ($6000-$7FFF) を読んでよい
+    output reg         wram_wr       // 書いてよい
 );
     wire [3:0] mapper_no = cfg[7:4];
     wire [3:0] last16    = cfg[11:8];               // 最後の 16KB バンク
@@ -43,9 +46,11 @@ module mapper (
     reg [7:0] latch;                                 // UxROM / CNROM / AxROM
     reg [4:0] m1_sh, m1_ctrl, m1_chr0, m1_chr1;      // MMC1
     reg [3:0] m1_prg;
+    reg       m1_ramdis;                             // $E000 bit4: PRG-RAM を使えなくする
     reg       prev_wr;
     reg [7:0] m3_sel, m3_r [0:7];                    // MMC3
     reg       m3_mir;
+    reg [1:0] m3_ram;                                // $A001 [7] 有効 / [6] 書込禁止
     reg [7:0] irq_latch, irq_cnt;
     reg       irq_reload, irq_en, irq_flag;
     reg [7:0] cnt_next;
@@ -63,8 +68,9 @@ module mapper (
         if (rst) begin
             latch <= 8'd0;
             m1_sh <= 5'b10000; m1_ctrl <= 5'h0C; m1_chr0 <= 5'd0; m1_chr1 <= 5'd0; m1_prg <= 4'd0;
+            m1_ramdis <= 1'b0;
             prev_wr <= 1'b0;
-            m3_sel <= 8'd0; m3_mir <= 1'b0;
+            m3_sel <= 8'd0; m3_mir <= 1'b0; m3_ram <= 2'b10;   // 電源投入時は有効 (ゲームは自分で設定する)
             for (i = 0; i < 8; i = i + 1) m3_r[i] <= 8'd0;
             irq_latch <= 8'd0; irq_cnt <= 8'd0; irq_reload <= 1'b0; irq_en <= 1'b0; irq_flag <= 1'b0;
             a12_d <= 1'b0; a12_low <= 4'd0;
@@ -86,7 +92,7 @@ module mapper (
                             2'd0: m1_ctrl <= {wdata[0], m1_sh[4:1]};
                             2'd1: m1_chr0 <= {wdata[0], m1_sh[4:1]};
                             2'd2: m1_chr1 <= {wdata[0], m1_sh[4:1]};
-                            2'd3: m1_prg  <= m1_sh[4:1];          // bit4 (PRG-RAM 禁止) は使わない
+                            2'd3: begin m1_prg <= m1_sh[4:1]; m1_ramdis <= wdata[0]; end
                             endcase
                             m1_sh <= 5'b10000;
                         end else
@@ -96,11 +102,12 @@ module mapper (
                         3'b000: m3_sel <= wdata;
                         3'b001: m3_r[m3_sel[2:0]] <= wdata;
                         3'b010: m3_mir <= wdata[0];
+                        3'b011: m3_ram <= wdata[7:6];
                         3'b100: irq_latch <= wdata;
                         3'b101: begin irq_cnt <= 8'd0; irq_reload <= 1'b1; end
                         3'b110: begin irq_en <= 1'b0; irq_flag <= 1'b0; end
                         3'b111: irq_en <= 1'b1;
-                        default: ;                                // $A001 (PRG-RAM 保護) は使わない
+                        default: ;
                         endcase
                     default: ;
                     endcase
@@ -126,8 +133,15 @@ module mapper (
         for (j = 0; j < 4; j = j + 1) p[j] = j;               // NROM: そのまま (マスクで 16KB は折り返す)
         for (j = 0; j < 8; j = j + 1) c[j] = j;
         mirror = cfg[2] ? 2'd1 : 2'd0;
+        wram_rd = 1'b1; wram_wr = 1'b1;
         case (mapper_no)
         4'd1: begin
+            // PRG-RAM: $E000 bit4 で禁止。SNROM (CHR-RAM 8KB の基板) は CHR バンクの bit4 でも禁止
+            // (配線が CHR A16 を PRG-RAM の許可につないでいる。4KB 切替なら PPU の A12 で効く方を選ぶ)
+            if (m1_ramdis ||
+                (cfg[3] && cfg[15:12] == 4'd0 && ((m1_ctrl[4] && a12) ? m1_chr1[4] : m1_chr0[4]))) begin
+                wram_rd = 1'b0; wram_wr = 1'b0;
+            end
             case (m1_ctrl[3:2])
             2'd0, 2'd1: for (j = 0; j < 4; j = j + 1) p[j] = {m1_prg[3:1], j[1:0]};   // 32KB 切替
             2'd2: begin p[0] = 5'd0; p[1] = 5'd1;                                    // $8000 固定
@@ -163,6 +177,8 @@ module mapper (
             c[{~m3_sel[7], 2'd0}] = m3_r[2][6:0]; c[{~m3_sel[7], 2'd1}] = m3_r[3][6:0];
             c[{~m3_sel[7], 2'd2}] = m3_r[4][6:0]; c[{~m3_sel[7], 2'd3}] = m3_r[5][6:0];
             mirror = m3_mir ? 2'd0 : 2'd1;
+            wram_rd = m3_ram[1];                                     // $A001 bit7: 有効
+            wram_wr = m3_ram[1] && !m3_ram[0];                       // bit6: 書き込み禁止
         end
         4'd7: begin                                                                  // 32KB 切替 + 1 画面
             for (j = 0; j < 4; j = j + 1) p[j] = {latch[2:0], j[1:0]};
