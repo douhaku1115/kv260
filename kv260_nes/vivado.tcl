@@ -6,6 +6,7 @@
 #     - clk_wiz を 2 出力 (clk_out1=100MHz: AXI/NES, clk_out2=12.5MHz: I2S の mclk)
 #     - Pmod I2S2 の 4 端子 (J2) を外へ出す
 #     - AXI の範囲 256KB (画面バッファ・ROM 窓のため)
+#     - HDMI の音: PS の Live Audio を有効、clk_wiz_1 で 24.576MHz を作る (Live_Audio_KV260_KR260_Template と同じ)
 # =============================================================================
 set origin_dir [file normalize [file dirname [info script]]]
 cd $origin_dir
@@ -15,7 +16,9 @@ set rtl_files [list \
     rtl/rtl_top.v rtl/nes_axi_slave.v rtl/nes_fb.v rtl/nes_palette.v \
     rtl/cdc_synchronizer.v rtl/shift_register.v rtl/vga_iface.v \
     rtl/nes_core.v rtl/cpu6502.v rtl/ppu.v rtl/apu.v rtl/mapper.v \
-    rtl/i2s_tx.v rtl/apu_pulse.hex rtl/apu_tnd.hex]
+    rtl/i2s_tx.v rtl/apu_pulse.hex rtl/apu_tnd.hex \
+    rtl/xlive_audio.v rtl/cdc_fifo.v rtl/dual_clk_ram.v \
+    rtl/shift_register_vector.v rtl/shift_register_factory.v]
 set project_name project_1
 set project_dir  project_1
 set design_name  design_1
@@ -54,7 +57,7 @@ CONFIG.PSU__USE__M_AXI_GP0  {1} \
 CONFIG.PSU__USE__M_AXI_GP1  {0} \
 CONFIG.PSU__USE__IRQ0 {0} \
 CONFIG.PSU__FPGA_PL1_ENABLE {0} \
-CONFIG.PSU__USE__AUDIO {0} \
+CONFIG.PSU__USE__AUDIO {1} \
 CONFIG.PSU__USE__VIDEO {1} \
 CONFIG.PSU__MAXIGP0__DATA_WIDTH {32} \
 ] [get_bd_cells $ps_name]
@@ -68,6 +71,15 @@ CONFIG.CLKOUT2_USED {true} \
 CONFIG.CLKOUT2_REQUESTED_OUT_FREQ {12.500} \
 ] [get_bd_cells clk_wiz_0]
 
+# Clock wizard: 24.576MHz (HDMI の音 48kHz x 512)
+create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:6.0 clk_wiz_1
+set_property -dict [list \
+CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {24.576} \
+CONFIG.PRIM_SOURCE {Global_buffer} \
+CONFIG.RESET_TYPE {ACTIVE_LOW} \
+CONFIG.USE_LOCKED {false} \
+] [get_bd_cells clk_wiz_1]
+
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 proc_sys_reset_0
 
 create_bd_cell -type module -reference $rtl_top_name $rtl_top_instance
@@ -77,8 +89,8 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_interconnec
 set_property CONFIG.NUM_MI {1} [get_bd_cells axi_interconnect_0]
 
 # クロック
-connect_bd_net [get_bd_pins ${ps_name}/pl_clk0] [get_bd_pins clk_wiz_0/clk_in1]
-connect_bd_net [get_bd_pins ${ps_name}/pl_resetn0] [get_bd_pins clk_wiz_0/resetn]
+connect_bd_net [get_bd_pins ${ps_name}/pl_clk0] [get_bd_pins clk_wiz_0/clk_in1] [get_bd_pins clk_wiz_1/clk_in1]
+connect_bd_net [get_bd_pins ${ps_name}/pl_resetn0] [get_bd_pins clk_wiz_0/resetn] [get_bd_pins clk_wiz_1/resetn]
 
 set axi_clk [get_bd_pins clk_wiz_0/clk_out1]
 
@@ -100,6 +112,13 @@ connect_bd_net [get_bd_pins ${rtl_top_instance}/video_color] [get_bd_pins ${ps_n
 connect_bd_net [get_bd_pins ${rtl_top_instance}/video_de] [get_bd_pins ${ps_name}/dp_live_video_in_de]
 connect_bd_net [get_bd_pins ${rtl_top_instance}/video_hsyncn] [get_bd_pins ${ps_name}/dp_live_video_in_hsync]
 connect_bd_net [get_bd_pins ${rtl_top_instance}/video_vsyncn] [get_bd_pins ${ps_name}/dp_live_video_in_vsync]
+
+# 音 → PS の Live Audio (24.576MHz)
+connect_bd_net [get_bd_pins clk_wiz_1/clk_out1] [get_bd_pins ${rtl_top_instance}/clka] [get_bd_pins ${ps_name}/dp_s_axis_audio_clk]
+connect_bd_net [get_bd_pins ${rtl_top_instance}/audio_data] [get_bd_pins ${ps_name}/dp_s_axis_audio_tdata]
+connect_bd_net [get_bd_pins ${rtl_top_instance}/audio_id] [get_bd_pins ${ps_name}/dp_s_axis_audio_tid]
+connect_bd_net [get_bd_pins ${rtl_top_instance}/audio_valid] [get_bd_pins ${ps_name}/dp_s_axis_audio_tvalid]
+connect_bd_net [get_bd_pins ${rtl_top_instance}/audio_ready] [get_bd_pins ${ps_name}/dp_s_axis_audio_tready]
 
 # Pmod I2S2 (J2) の端子
 create_bd_port -dir O -type clk pmod_mclk

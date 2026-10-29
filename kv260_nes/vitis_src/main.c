@@ -85,6 +85,7 @@ static XDpPsu DpPsu;
 static XAVBuf AVBuf;
 
 static int  InitDP(void);
+static void SetupAudio(void);
 static void RunDP(void);
 static void SetupVideoStream(void);
 static u32  TrainLink(void);
@@ -223,8 +224,8 @@ int main(void)
 /* InitDP: DP/AVBuf ドライバ初期化と映像経路の設定
  *   - XDpPsu (DP TX) と XAVBuf (映像ブレンダ) を Config から初期化
  *   - 入力 = Live Video(RGB 12bpc)、出力 = RGB 8bpc を選択
- *   - 映像ストリーム1 を Live に、音声は無しに構成
- *   - 映像クロックを PL クロック源に指定して AVBuf を SoftReset
+ *   - 映像ストリーム1・音声ストリーム1 を Live に構成 (音の設定は SetupAudio)
+ *   - 音声クロックを PL クロック源に指定して AVBuf を SoftReset (映像・音声とも)
  *   戻り値: XST_SUCCESS / XST_FAILURE */
 static int InitDP(void)
 {
@@ -245,16 +246,45 @@ static int InitDP(void)
     XAVBuf_SetInputLiveVideoFormat(&AVBuf, RGB_12BPC);
     XAVBuf_SetOutputVideoFormat(&AVBuf, RGB_8BPC);
     XAVBuf_InputVideoSelect(&AVBuf, XAVBUF_VIDSTREAM1_LIVE, XAVBUF_VIDSTREAM2_NONE);
-    XAVBuf_InputAudioSelect(&AVBuf, XAVBUF_AUDSTREAM1_NO_AUDIO, XAVBUF_AUDSTREAM2_NO_AUDIO);
+    XAVBuf_InputAudioSelect(&AVBuf, XAVBUF_AUDSTREAM1_LIVE, XAVBUF_AUDSTREAM2_NO_AUDIO);
     XDpPsu_MainStreamAttributes *Msa = &DpPsu.MsaConfig;
     XAVBuf_SetPixelClock(Msa->PixelClockHz);
+    SetupAudio();
     XAVBuf_ConfigureGraphicsPipeline(&AVBuf);
     XAVBuf_ConfigureOutputVideo(&AVBuf);
     XAVBuf_SetBlenderAlpha(&AVBuf, 0, 0);
     XDpPsu_CfgMsaEnSynchClkMode(&DpPsu, 0);
     XAVBuf_SetAudioVideoClkSrc(&AVBuf, XAVBUF_PS_CLK, XAVBUF_PL_CLK);
     XAVBuf_SoftReset(&AVBuf);
+    XAVBuf_AudioSoftReset(&AVBuf);
     return XST_SUCCESS;
+}
+
+/* SetupAudio: HDMI に音を出す設定 (Live_Audio_KV260_KR260_Template の InitDpDmaSubsystem と同じ)
+ *   - 音声を止めてから、オーディオインフォフレーム (L-PCM・2ch・48kHz・16bit) を書く
+ *   - チャンネル数 2 (書く値は 2-1)、音声を再開、ミキサの音量を 0x2000 (等倍) に
+ *   XAVBuf_AudioMixerVolumeControl は引数が u8 で 0x2000 を渡せないので直接書く */
+static void SetupAudio(void)
+{
+    u32 base = DpPsu.Config.BaseAddr;
+    XDpPsu_WriteReg(base, XDPPSU_TX_AUDIO_CONTROL, 0);
+    usleep(10000);
+    XAVBuf_EnableAudio0Buffers(&AVBuf, 0);
+    XAVBuf_EnableAudio1Buffers(&AVBuf, 0);
+
+    /* インフォフレームの頭 4 バイト: 0x00, 種類 0x84, 長さ 27, 版 0x11 */
+    u32 if00 = (0x11u << 2 << 24) | (27u << 16) | (0x84u << 8);
+    /* 次の 4 バイト: 2ch (1) / L-PCM (1<<4), 48kHz (3<<2) / 16bit (1), 割り当て 0 */
+    u32 if04 = (0u << 24) | (0u << 16) | (((3u << 2) | 1u) << 8) | (1u | (1u << 4));
+    XDpPsu_WriteReg(base, XDPPSU_TX_AUDIO_INFO_DATA + 0, if00);
+    XDpPsu_WriteReg(base, XDPPSU_TX_AUDIO_INFO_DATA + 4, if04);
+    for (int i = 8; i < 32; i += 4)
+        XDpPsu_WriteReg(base, XDPPSU_TX_AUDIO_INFO_DATA + i, 0);
+
+    XDpPsu_WriteReg(base, XDPPSU_TX_AUDIO_CHANNELS, 1);
+    XDpPsu_WriteReg(base, XDPPSU_TX_AUDIO_CONTROL, 1);
+    usleep(10000);
+    XAVBuf_WriteReg(AVBuf.Config.BaseAddr, XAVBUF_AUD_MIXER_VOLUME_CONTROL, 0x20002000);
 }
 
 /* TrainLink: DP リンクトレーニング

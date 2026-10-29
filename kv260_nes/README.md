@@ -2,7 +2,7 @@
 
 KV260 の PL に NES を Verilog で自作する。6502 CPU・PPU (画面)・APU (音)・マッパーをすべて PL に置き、
 PS (ベアメタル C) は ROM の書き込みとキー入力の中継だけを行う。
-映像は HDMI (PS の Live Video)、音は Pmod I2S2 (J2)、入力は UART のキー。
+映像は HDMI (PS の Live Video)、音は HDMI (PS の Live Audio) と Pmod I2S2 (J2) の両方、入力は UART のキー。
 
 ROM はテスト ROM (nestest / blargg / Holy Mapperel) と、無料公開の自作ゲーム
 (pinobatch の Thwaite・Concentration Room、GPL-3.0) を使う。ROM はリポジトリに入れない (`roms/` は git 外)。
@@ -18,6 +18,7 @@ ROM はテスト ROM (nestest / blargg / Holy Mapperel) と、無料公開の自
 | E | コントローラ ($4016/$4017) と UART キー | tb_pad PASS |
 | F | APU (矩形波 2・三角波・ノイズ・DMC) → I2S2、PRG-RAM | apu_test 8 本 PASS。合成済・**実機 HDMI で Thwaite 表示** |
 | G | マッパー 0/1/2/3/4/7、PRG 256KB・CHR 128KB | Holy Mapperel 13 本 (WRAM 保護込み)・mmc3_test 4 本 PASS。合成済・実機で Thwaite と MMC1/MMC3 のテスト ROM 表示 |
+| H | HDMI から音 (PS の Live Audio、48kHz) | tb_hdmi_audio PASS。合成済・**実機でモニターのスピーカーから Thwaite の音** |
 
 ## 構成
 
@@ -38,13 +39,18 @@ nes_axi_slave ── 単純なバス ──► rtl_top
                                  ├ nes_fb      画面バッファ 256x240 x 6bit
                                  ├ nes_palette 64 色 → RGB
                                  ├ vga_iface   1280x720 (74.25MHz)
-                                 └ i2s_tx      Pmod I2S2 (mclk 12.5MHz)
+                                 ├ i2s_tx      Pmod I2S2 (mclk 12.5MHz)
+                                 └ xlive_audio HDMI の音 (24.576MHz → PS の Live Audio)
 ```
 
 - 表示: 256x240 を縦横 3 倍 (768x720) にして X=256 から。外側は暗い灰色。
   3 で割る計算は `n*683 >> 11` (n < 768 で floor(n/3) と一致。sim で全数確認)。
 - NES 側 (100MHz) と映像側 (74.25MHz) は画面バッファで切り離す。
 - 音: APU の 16bit を 1024 クロックごとに保持し、トグル + 3 段 FF で mclk 側へ渡す。
+- HDMI の音: 同じ保持値を 24.576MHz 側でも受け、512 クロックに 1 回 (= 48kHz ちょうど) FIFO に入れる。
+  xlive_audio (miya4649 の Live_Audio_KV260_KR260_Template から) が S/PDIF 形式の語にして PS の DP に渡す。
+  DP も同じ 24.576MHz から 48kHz で取り出すので、入りと出の速さが一致する。左右は同じ値 (モノラル)。
+  main.c の SetupAudio がオーディオインフォフレーム (L-PCM・2ch・48kHz・16bit) を書く。
 - 時間: すべて 100MHz で動かし、クロック許可で刻む。ppu_ce = 5.3693MHz (位相積算)、cpu_ce = その 3 回に 1 回。
 
 ## CPU から見たメモリ
@@ -134,13 +140,13 @@ blargg の $6000 の結果、または描画中に画面が 30 フレーム変�
 E:\vivado\2025.2\Vivado\bin\vivado.bat -mode batch -source E:/fpga/kria260/kv260_nes/vivado.tcl
 ```
 
-| | 段F | 段G | 段G + WRAM 保護 |
-|---|---|---|---|
-| 所要時間 | 9 分 46 秒 | 11 分 52 秒 | 12 分 33 秒 |
-| WNS / WHS | +2.948 / +0.016 | +1.436 / +0.017 | +1.049 / +0.013 |
-| LUT | 3301 | 3616 (3.09%) | 3623 (3.09%) |
-| BRAM | 25 | 105.5 (73.3%) | 105.5 (73.3%) |
-| DSP | 2 | 2 | 2 |
+| | 段F | 段G | 段G + WRAM 保護 | 段H (HDMI の音) |
+|---|---|---|---|---|
+| 所要時間 | 9 分 46 秒 | 11 分 52 秒 | 12 分 33 秒 | 11 分 13 秒 |
+| WNS / WHS | +2.948 / +0.016 | +1.436 / +0.017 | +1.049 / +0.013 | +0.932 / +0.024 |
+| LUT | 3301 | 3616 (3.09%) | 3623 (3.09%) | 3698 (3.16%) |
+| BRAM | 25 | 105.5 (73.3%) | 105.5 (73.3%) | 105.5 (73.3%) |
+| DSP | 2 | 2 | 2 | 2 |
 
 ## 実機 (Vitis GUI を使わない)
 
@@ -167,3 +173,8 @@ COM14 は 1 つのプログラムしか開けない (nes_pad.py・Tera Term・�
 - apu_test 4/5/6: フレームカウンタのリセット遅れと IRQ の時刻・優先 → テストのソースを読んで直した。
 - Holy Mapperel は結果が出るまで 110〜390 フレーム。150 フレームで切ると灰色画面で判定できない。
 - MMC3 をドット 260 で数える近似では mmc3_test が全滅 ($2006 で A12 を動かすテストがある)。
+- HDMI の音: FIFO が空くたびに 100MHz 側から値を入れると、空きの知らせが遅れて 3 個ずつ固まって入り、
+  値の間隔が実質 1/16kHz になった (tb_hdmi_audio で発見)。拾う時刻を DP 側のクロックで 48kHz に固定して解決。
+- 見本の shift_register_vector.v は generate の中で delay_gen[i+1] を参照し、xsim が elaborate できない → 配列で書き直した。
+- 入れ直した Vivado で、部品の合成が「Failed to create directory 'C'」(tclapp::load_apps) で 1 度失敗。流し直すと通った (原因不明)。
+  合成中にシェルを project_1/ の中に置くと、Vivado が古いフォルダを消せず止まる。

@@ -6,6 +6,7 @@
 // 画面バッファ (nes_fb) の色番号を nes_palette で RGB にする。
 // 段A では PS が AXI で画面バッファに直接書く。段D 以降は PPU が書く。
 // 音は Pmod I2S2 (J2) へ。APU (nes_core 内) の音を mclk 側に渡して i2s_tx で送る。
+// 同じ音を HDMI (PS の DP の Live Audio) にも出す。xlive_audio (miya4649) が 48kHz の S/PDIF 形式にする。
 //
 // 【AXI マップ (ベース 0xA0000000, 256KB)】 レジスタは 0x10 刻み
 //   0x00000 CTRL  (RW) bit0=1 で CPU 実行 (0 でリセット保持)
@@ -34,6 +35,7 @@ module rtl_top
    input wire         clk,
    input wire         clkv,
    input wire         mclk,
+   input wire         clka,      // DP の音のクロック 24.576MHz (= 48kHz x 512)
    input wire         resetn,
    // nes_axi_slave からのバス
    input  wire        bus_wr_en,
@@ -46,6 +48,11 @@ module rtl_top
    output wire        video_hsyncn,
    output wire        video_vsyncn,
    output wire [35:0] video_color,
+   // DP live audio 出力 (AXI ストリーム)
+   output wire [31:0] audio_data,
+   output wire        audio_id,
+   output wire        audio_valid,
+   input  wire        audio_ready,
    // Pmod I2S2 (J2)
    output wire        pmod_mclk,
    output wire        pmod_sclk,
@@ -55,11 +62,13 @@ module rtl_top
 
   wire reset;
   wire resetv;
+  wire reseta;
   wire resetp;
   assign resetp = ~resetn;
 
   shift_register #(.DELAY(3)) sr_reset  (.clk(clk),  .din(resetp), .dout(reset));
   shift_register #(.DELAY(3)) sr_resetv (.clk(clkv), .din(resetp), .dout(resetv));
+  shift_register #(.DELAY(3)) sr_reseta (.clk(clka), .din(resetp), .dout(reseta));
 
   // ------------------------------------------------------------
   // レジスタ (clk 側)
@@ -288,6 +297,48 @@ module rtl_top
      .sclk   (pmod_sclk),
      .lrck   (pmod_lrck),
      .sdout  (pmod_sdin)
+     );
+
+  // ------------------------------------------------------------
+  // 音 (APU → HDMI)
+  // ------------------------------------------------------------
+  // I2S と同じく aud_hold / aud_tgl を clka (24.576MHz) 側で受け、512 クロックに 1 回 (= 48kHz ちょうど)
+  // その値を FIFO に入れる。DP は同じ clka から 48kHz で取り出すので、入りと出の速さが一致する。
+  // (FIFO が空くたびに clk 側から入れる作りは、空きの知らせが遅れて 3 個ずつ固まって入り、
+  //  値の間隔が 1/16kHz になった。tb_hdmi_audio で確認)
+  // APU 出力は約 18kHz のローパス済みなので、48kHz で拾い直しても折り返しは小さい。左右とも同じ値。
+  (* ASYNC_REG = "TRUE" *) reg [2:0] dpa_sync = 3'd0;
+  reg  signed [15:0] dpa_s = 16'sd0;
+  reg  [8:0] dpa_div = 9'd0;
+  reg        dpa_en = 1'b0;
+  wire       dpa_full;
+  always @(posedge clka) begin
+    dpa_sync <= {dpa_sync[1:0], aud_tgl};
+    if (dpa_sync[2] != dpa_sync[1]) dpa_s <= aud_hold;
+    dpa_div <= dpa_div + 9'd1;
+    dpa_en  <= !reseta && (dpa_div == 9'd0) && !dpa_full;
+  end
+
+  xlive_audio
+    #(
+      .AUDIO_WIDTH (16),
+      .BUFFER_DEPTH (4),
+      .AES_MODE (0),
+      .SAMPLE_FREQ (48000)
+      )
+  xlive_audio_0
+    (
+     .clk_tx   (clka),
+     .clk_rx   (clka),
+     .reset_tx (reseta),
+     .reset_rx (reseta),
+     .data_rx  ({dpa_s, dpa_s}),
+     .en_rx    (dpa_en),
+     .full_rx  (dpa_full),
+     .data_tx  (audio_data),
+     .valid_tx (audio_valid),
+     .id_tx    (audio_id),
+     .ready_tx (audio_ready)
      );
 
 endmodule
