@@ -19,6 +19,7 @@ ROM はテスト ROM (nestest / blargg / Holy Mapperel) と、無料公開の自
 | F | APU (矩形波 2・三角波・ノイズ・DMC) → I2S2、PRG-RAM | apu_test 8 本 PASS。合成済・**実機 HDMI で Thwaite 表示** |
 | G | マッパー 0/1/2/3/4/7、PRG 256KB・CHR 128KB | Holy Mapperel 13 本 (WRAM 保護込み)・mmc3_test 4 本 PASS。合成済・実機で Thwaite と MMC1/MMC3 のテスト ROM 表示 |
 | H | HDMI から音 (PS の Live Audio、48kHz) | tb_hdmi_audio PASS。合成済・**実機でモニターのスピーカーから Thwaite の音** |
+| - | ゲームの一覧 (メニュー)。PS のソフトだけ | 実機で 8 本から選べる・LB で一覧に戻る |
 
 ## 構成
 
@@ -150,7 +151,8 @@ E:\vivado\2025.2\Vivado\bin\vivado.bat -mode batch -source E:/fpga/kria260/kv260
 
 ## 実機 (Vitis GUI を使わない)
 
-1. `python tools/rom2c.py roms/games/thwaite.nes` → `vitis_src/rom_data.h` (git 外)
+1. `python tools/rom2c.py roms/games/thwaite.nes roms/games/croom.nes ...` → `vitis_src/rom_data.h` (git 外)
+   複数渡すと起動時にゲームの一覧 (メニュー) が出る。1 本ならすぐ始まる
 2. `bash tools/build_elf.sh` → `E:/Xilinx/project_vitis/kv260_nes/nes.elf` (kv260_chip8 の BSP で gcc を直接呼ぶ)
 3. XSA を `E:/Xilinx/project_vitis/kv260_nes/hw/` に展開し、
    `python ../kaleidoscope/tools/make_psu_nousb.py hw/psu_init.tcl hw/psu_init_nousb.tcl` (USB の 4 行を外す)
@@ -159,9 +161,14 @@ E:\vivado\2025.2\Vivado\bin\vivado.bat -mode batch -source E:/fpga/kria260/kv260
    (起動モードを JTAG にしてリセット → PL 書込 → psu_init → ELF 起動。FSBL 不要)
 5. 操作は `python tools/nes_pad.py COM14` (おすすめ)。小さな窓が開き、押している間ずっと押下になる。
    Xbox のゲームパッドも使える (pygame が要る。十字キー/左スティック=方向、A・Y=A、B・X=B、メニュー=Start、ビュー=Select)。
-   キー: 矢印/wasd=方向、x=A、z=B、Enter=Start、スペース=Select、F5=リセット、Esc=終了。
+   キー: 矢印/wasd=方向、x=A、z=B、Enter=Start、スペース=Select、F2=ゲームの一覧へ、F5=リセット、Esc=終了。
+   パッドの LB でもゲームの一覧へ戻る。パッドは窓を開いたあとにつないでも使える。
    Tera Term (COM14, 115200) でも操作できるが、「押した」しか届かないので 1 回 12 フレーム押したままの扱いになる
    (キー: x/k=A、z/j=B、スペース=Select、Enter=Start、wasd/矢印=方向、r=リセット)。
+
+メニュー: 十字キーの上下で選び、A か Start で開始。ゲーム中は LB・F2・m キー、または Select+Start を 1 秒押し続けると一覧に戻る。
+CPU を止めると PPU も止まって画面バッファに書かないので、PS が FB 窓に 8x8 の文字 (`vitis_src/font8x8.h`、
+dhepper/font8x8 の Public Domain フォント) で一覧を書く。回路の変更は無い。
 
 COM14 は 1 つのプログラムしか開けない (nes_pad.py・Tera Term・シリアル記録のどれか 1 つ)。
 
@@ -178,3 +185,5 @@ COM14 は 1 つのプログラムしか開けない (nes_pad.py・Tera Term・�
 - 見本の shift_register_vector.v は generate の中で delay_gen[i+1] を参照し、xsim が elaborate できない → 配列で書き直した。
 - 入れ直した Vivado で、部品の合成が「Failed to create directory 'C'」(tclapp::load_apps) で 1 度失敗。流し直すと通った (原因不明)。
   合成中にシェルを project_1/ の中に置くと、Vivado が古いフォルダを消せず止まる。
+- pygame (SDL) は自分の窓が無いとゲームパッドの「つないだ / 抜いた」の知らせを捨てる。
+  nes_pad.py は tkinter の窓なので `SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=1` を pygame の読み込み前に入れる。

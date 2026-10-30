@@ -6,10 +6,12 @@
  *   1. HDMI の初期化 (InitDP / RunDP)
  *   2. CPU を止めたまま PRG / CHR を AXI で PL に書き、実行させる
  *   3. UART のキーをコントローラの押下状態にして PAD に書く (約 60Hz)
- * ROM は vitis_src/rom_data.h (python tools/rom2c.py ROM.nes で作る、NROM のみ)。
+ *   4. ROM が複数あれば、起動時にメニュー (ゲームの一覧) を画面に出して選ばせる
+ * ROM は vitis_src/rom_data.h (python tools/rom2c.py ROM.nes [ROM2.nes ...] で作る)。
+ * メニュー: 上下で選び、A か Start で開始。ゲーム中に Select+Start を 1 秒押し続けるか m キーでメニューに戻る。
  *
  * キー:  x / k = A     z / j = B     スペース = Select   Enter = Start
- *        矢印 / w a s d = 上下左右    r = リセット
+ *        矢印 / w a s d = 上下左右    r = リセット    m = メニュー
  * UART は「押した」しか届かないので、押したら KEY_HOLD_FRAMES フレーム押しっぱなしにする。
  * 押し続けると端末のキーリピートで保持が延びる。
  *
@@ -26,6 +28,7 @@
  *   0x00040 PC    (R)   CPU の PC
  *   0x00060 PFRM  (R)   PPU のフレーム数
  *   0x00070 LOAD  (RW)  書き込み窓の位置 [2:0] = PRG の 32KB 単位 / [7:4] = CHR の 8KB 単位
+ *   0x10000〜     FB    (W)  画面バッファ。CPU 停止中 (メニュー) に PS が文字を書く
  *   0x20000〜     PRG   (W)  32KB の窓。1 語 = 4 バイト
  *   0x30000〜     CHR   (W)  8KB の窓。1 語 = 1 バイト
  */
@@ -41,6 +44,7 @@
 #include "sleep.h"
 #include <stdint.h>
 #include "rom_data.h"
+#include "font8x8.h"
 
 #define UART_BASE        0xFF010000U   /* KV260 USB-UART = UART_1 */
 #define KEY_HOLD_FRAMES  12            /* キー 1 回でボタンを押しておくフレーム数 */
@@ -64,6 +68,7 @@
 #define NES_PC       (NES_BASE + 0x00040)
 #define NES_PFRM     (NES_BASE + 0x00060)
 #define NES_LOAD     (NES_BASE + 0x00070)
+#define NES_FB       (NES_BASE + 0x10000)
 #define NES_PRG      (NES_BASE + 0x20000)
 #define NES_CHR      (NES_BASE + 0x30000)
 
@@ -99,30 +104,102 @@ static int uart_getchar_nb(void)
 }
 
 /* CPU を止めて ROM を書き、走らせ直す (CPU が止まっている間に書く約束) */
-static void nes_load_and_run(void)
+static void nes_load_and_run(const struct rom_entry *r)
 {
-    Xil_Out32(NES_CTRL, ROM_CTRL);                      /* bit0=0: リセット保持 */
+    Xil_Out32(NES_CTRL, r->ctrl);                       /* bit0=0: リセット保持 */
 
     /* PRG: 32KB の窓ずつ。16KB の ROM は 2 回並べて 32KB 埋める
      * (マッパー無しの段F までのハードは 32KB をそのまま読むため。段G 以降は折り返すので害はない) */
-    u32 prg_total = (ROM_PRG_SIZE < 32768) ? 32768 : ROM_PRG_SIZE;
+    u32 prg_total = (r->prg_size < 32768) ? 32768 : r->prg_size;
     for (u32 base = 0; base < prg_total; base += 32768) {
         Xil_Out32(NES_LOAD, base / 32768);
         for (u32 i = 0; i < 32768; i += 4) {
-            u32 s = (base + i) % ROM_PRG_SIZE;
-            Xil_Out32(NES_PRG + i, rom_prg[s] | (rom_prg[s + 1] << 8) | (rom_prg[s + 2] << 16)
-                                   | ((u32)rom_prg[s + 3] << 24));
+            u32 s = (base + i) % r->prg_size;
+            Xil_Out32(NES_PRG + i, r->prg[s] | (r->prg[s + 1] << 8) | (r->prg[s + 2] << 16)
+                                   | ((u32)r->prg[s + 3] << 24));
         }
     }
     /* CHR-ROM: 8KB の窓ずつ (CHR-RAM なら書かない) */
-    for (u32 base = 0; base < ROM_CHR_SIZE; base += 8192) {
+    for (u32 base = 0; base < r->chr_size; base += 8192) {
         Xil_Out32(NES_LOAD, (base / 8192) << 4);
         for (u32 i = 0; i < 8192; i++)
-            Xil_Out32(NES_CHR + i * 4, rom_chr[base + i]);
+            Xil_Out32(NES_CHR + i * 4, r->chr[base + i]);
     }
     Xil_Out32(NES_LOAD, 0);
     Xil_Out32(NES_PAD, 0);
-    Xil_Out32(NES_CTRL, ROM_CTRL | CTRL_RUN);
+    Xil_Out32(NES_CTRL, r->ctrl | CTRL_RUN);
+}
+
+/* ============================================================
+ * メニュー (ゲームの一覧を画面に出して選ぶ)
+ * ============================================================
+ * CPU を止めると PPU もリセットのまま画面バッファに書かないので、PS が FB 窓に直接文字を書く。
+ * 画面は 256x240 = 8x8 の文字で 32 桁 x 30 行。色は NES のパレット番号 (0〜63)。
+ * FB の 1 語 = 横 4 画素 ([5:0]=x, [13:8]=x+1, [21:16]=x+2, [29:24]=x+3)、語番号 = y*64 + x/4。 */
+#define COL_BG     0x0F   /* 黒 */
+#define COL_TEXT   0x30   /* 白 */
+#define COL_TITLE  0x28   /* 黄 */
+#define COL_HINT   0x10   /* 灰 */
+#define COL_SELBG  0x12   /* 選択中の行の背景 (青) */
+#define MENU_TOP   5      /* 一覧の最初の行 */
+#define MENU_ROWS  18     /* 一度に見せる本数 (多ければ送る) */
+
+static void fb_fill(u32 color)
+{
+    u32 w = color * 0x01010101U;
+    for (u32 i = 0; i < 240 * 64; i++)
+        Xil_Out32(NES_FB + i * 4, w);
+}
+
+/* 文字 1 つを桁 cx・行 cy に書く。1 行 8 画素 = 2 語 */
+static void fb_char(int cx, int cy, char ch, u32 fg, u32 bg)
+{
+    const uint8_t *g = font8x8[((u8)ch < 0x20 || (u8)ch > 0x7F) ? 0 : (u8)ch - 0x20];
+    for (int y = 0; y < 8; y++) {
+        u32 addr = NES_FB + ((cy * 8 + y) * 64 + cx * 2) * 4;
+        for (int h = 0; h < 2; h++) {
+            u32 w = 0;
+            for (int p = 0; p < 4; p++)
+                w |= ((g[y] >> (h * 4 + p)) & 1 ? fg : bg) << (p * 8);
+            Xil_Out32(addr + h * 4, w);
+        }
+    }
+}
+
+/* 文字列を書き、残りを width 桁まで背景で埋める */
+static void fb_text(int cx, int cy, const char *s, int width, u32 fg, u32 bg)
+{
+    for (int i = 0; i < width; i++)
+        fb_char(cx + i, cy, *s ? *s++ : ' ', fg, bg);
+}
+
+static void menu_draw_list(int sel, int top)
+{
+    for (int row = 0; row < MENU_ROWS; row++) {
+        int n = top + row;
+        if (n >= ROM_COUNT) { fb_text(0, MENU_TOP + row, "", 32, COL_TEXT, COL_BG); continue; }
+        int on = (n == sel);
+        fb_text(0, MENU_TOP + row, on ? " >" : "  ", 2, COL_TEXT, on ? COL_SELBG : COL_BG);
+        fb_text(2, MENU_TOP + row, roms[n].name, 30, COL_TEXT, on ? COL_SELBG : COL_BG);
+    }
+}
+
+static void menu_draw(int sel, int top)
+{
+    fb_fill(COL_BG);
+    fb_text(2, 2, "KV260 NES  GAME SELECT", 28, COL_TITLE, COL_BG);
+    menu_draw_list(sel, top);
+    fb_text(1, 25, "UP/DOWN  : CHOOSE", 30, COL_HINT, COL_BG);
+    fb_text(1, 26, "A / START: PLAY", 30, COL_HINT, COL_BG);
+    fb_text(1, 27, "LB / F2  : BACK TO THIS MENU", 30, COL_HINT, COL_BG);
+}
+
+/* メニューに入る: CPU を止めて一覧を書く */
+static void menu_enter(int sel, int top)
+{
+    Xil_Out32(NES_CTRL, 0);
+    Xil_Out32(NES_PAD, 0);
+    menu_draw(sel, top);
 }
 
 /* キーボード文字 → ボタン (対応なしは 0) */
@@ -156,9 +233,22 @@ int main(void)
     sleep(1);
     RunDP();
 
-    nes_load_and_run();
-    xil_printf("ROM %s loaded (CTRL=%04x PRG=%d CHR=%d)\r\n", ROM_NAME, ROM_CTRL, ROM_PRG_SIZE, ROM_CHR_SIZE);
-    xil_printf("keys: x/k=A z/j=B space=Select Enter=Start arrows/wasd=dir r=reset\r\n");
+    xil_printf("%d ROM(s)\r\n", ROM_COUNT);
+    xil_printf("keys: x/k=A z/j=B space=Select Enter=Start arrows/wasd=dir r=reset m=menu\r\n");
+
+    int sel = 0, top = 0;  /* メニューで選んでいる番号・一覧の先頭 */
+    int in_menu;           /* 1 = メニュー中 (CPU は止めている) */
+    u32 prev = 0;          /* 前のフレームの押下状態 (メニューで押した瞬間を見る) */
+    int combo = 0;         /* Select+Start を押し続けているフレーム数 */
+    int mute = 0;          /* 1 = 全部離すまで PAD に 0 を書く (メニューの A がゲームに入らないように) */
+    if (ROM_COUNT == 1) {
+        in_menu = 0;
+        nes_load_and_run(&roms[0]);
+        xil_printf("ROM %s\r\n", roms[0].name);
+    } else {
+        in_menu = 1;
+        menu_enter(sel, top);
+    }
 
     int hold[8] = {0};     /* ボタンごとの残りフレーム数 */
     int esc = 0;           /* 矢印キー ESC [ A〜D の読み途中 (0=なし 1=ESC 2=ESC[) */
@@ -184,9 +274,18 @@ int main(void)
             } else if (c == 0x1B) {
                 esc = 1; continue;
             } else if (c == 'r') {
-                nes_load_and_run();
-                for (int i = 0; i < 8; i++) hold[i] = 0;
-                xil_printf("reset\r\n");
+                if (!in_menu) {
+                    nes_load_and_run(&roms[sel]);
+                    for (int i = 0; i < 8; i++) hold[i] = 0;
+                    xil_printf("reset\r\n");
+                }
+                continue;
+            } else if (c == 'm') {
+                if (!in_menu && ROM_COUNT > 1) {
+                    in_menu = 1;
+                    menu_enter(sel, top);
+                    for (int i = 0; i < 8; i++) hold[i] = 0;
+                }
                 continue;
             } else
                 b = map_key(c);
@@ -199,7 +298,36 @@ int main(void)
         u32 pad = direct;
         for (int i = 0; i < 8; i++)
             if (hold[i] > 0) { pad |= 1U << i; hold[i]--; }
-        Xil_Out32(NES_PAD, pad);
+        u32 push = pad & ~prev;            /* このフレームで押されたボタン */
+        prev = pad;
+
+        if (in_menu) {
+            int old = sel;
+            if ((push & BTN_DOWN) && sel < ROM_COUNT - 1) sel++;
+            if ((push & BTN_UP)   && sel > 0)             sel--;
+            if (sel != old) {
+                if (sel < top)              top = sel;
+                if (sel >= top + MENU_ROWS) top = sel - MENU_ROWS + 1;
+                menu_draw_list(sel, top);
+            }
+            if (push & (BTN_A | BTN_START)) {
+                in_menu = 0;
+                mute = 1;
+                combo = 0;
+                nes_load_and_run(&roms[sel]);
+                xil_printf("ROM %s\r\n", roms[sel].name);
+            }
+        } else {
+            /* Select+Start を 1 秒押し続けたらメニューへ */
+            combo = ((pad & (BTN_SELECT | BTN_START)) == (BTN_SELECT | BTN_START)) ? combo + 1 : 0;
+            if (combo >= 60 && ROM_COUNT > 1) {
+                in_menu = 1;
+                menu_enter(sel, top);
+            } else {
+                if (mute && pad == 0) mute = 0;
+                Xil_Out32(NES_PAD, mute ? 0 : pad);
+            }
+        }
 
         /* 5 秒ごとに生存確認 (CPU の PC と PPU のフレーム数) */
         if (++n == 300) {

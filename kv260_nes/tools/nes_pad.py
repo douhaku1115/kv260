@@ -4,21 +4,27 @@
 
 小さな窓が開く。窓を選んだ状態でキーを押す (押している間ずっと押下になる)。
   矢印 / w a s d = 上下左右    x = A    z = B    Enter = Start    右 Shift / スペース = Select
-  F5 = NES をリセット (ROM を書き直して再起動)    Esc = 終了
+  F2 = ゲームの一覧 (メニュー) に戻る    F5 = NES をリセット (ROM を書き直して再起動)    Esc = 終了
+  ゲームパッドの LB (左上の肩ボタン) でも一覧に戻る
 送る形式: 'P' + 押下状態 1 バイト ([0]A [1]B [2]Select [3]Start [4]上 [5]下 [6]左 [7]右、PAD と同じ)。
 変化したとき、と 0.1 秒ごとに送る (main.c は 0.5 秒届かないと離したとみなす)。
 Tera Term と同時には使えない (COM ポートは 1 つのプログラムしか開けない)。
 
 ゲームパッド (pygame があれば): 十字キー / 左スティック = 方向、PAD_BTN の割り当てでボタン。
 窓に押しているボタンの番号を出すので、割り当てが違えば PAD_BTN を直す。
+窓を開いたあとにつないでも自動で使う (抜けば「なし」に戻る)。
 キーとゲームパッドは同時に使える (両方の押下を合わせる)。
 """
+import os
 import sys
 import threading
 import tkinter as tk
 
 import serial
 
+# SDL は自分の窓が無い (前面にない) とゲームパッドの知らせを捨てるので、受け取るようにする
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 try:
     import pygame
 except ImportError:
@@ -29,6 +35,7 @@ PAD_BTN = {0: 0, 3: 0,      # A, Y → A
            1: 1, 2: 1,      # B, X → B
            6: 2,            # ビュー → Select
            7: 3}            # メニュー → Start
+MENU_BTN = 4                # LB → ゲームの一覧に戻る ('m' を送る)
 
 PORT = sys.argv[1] if len(sys.argv) > 1 else "COM14"
 
@@ -50,21 +57,35 @@ held = set()            # 押しているキー名
 last_sent = [-1]
 
 
-joy = None
+joy = None              # 使っているゲームパッド (無ければ None)
 if pygame:
     pygame.init()
     pygame.joystick.init()
-    if pygame.joystick.get_count() > 0:
-        joy = pygame.joystick.Joystick(0)
-        joy.init()
 raw = [""]              # ゲームパッドで押しているボタン番号 (割り当て確認用)
+menu_prev = [False]     # 前回 LB を押していたか (押した瞬間に 1 回だけ送る)
+
+
+def pad_events():
+    """つないだ / 抜いたの知らせを見て joy を入れ替える。
+    窓を開いたあとにつないでも使えるように。起動時につながっているパッドも JOYDEVICEADDED で来る。
+    ほかのイベント (ボタン・軸) もここで全部取り出して捨てる (たまり続けると知らせが落ちるため)。"""
+    global joy
+    for e in pygame.event.get():
+        if e.type == pygame.JOYDEVICEADDED and joy is None:
+            joy = pygame.joystick.Joystick(e.device_index)
+            joy.init()
+        elif e.type == pygame.JOYDEVICEREMOVED and joy is not None and e.instance_id == joy.get_instance_id():
+            joy = None
+            menu_prev[0] = False
 
 
 def pad_state():
     """ゲームパッドの押下 (NES の並び)"""
+    if pygame is None:
+        return 0
+    pad_events()
     if joy is None:
         return 0
-    pygame.event.pump()
     s = 0
     nums = []
     for i in range(joy.get_numbuttons()):
@@ -79,6 +100,10 @@ def pad_state():
     if hx < 0 or ax < -0.5: s |= 1 << 6     # 左
     if hx > 0 or ax > 0.5:  s |= 1 << 7     # 右
     raw[0] = " ".join(nums)
+    m = joy.get_numbuttons() > MENU_BTN and bool(joy.get_button(MENU_BTN))
+    if m and not menu_prev[0]:
+        ser.write(b"m")
+    menu_prev[0] = m
     return s
 
 
@@ -103,6 +128,8 @@ def on_press(e):
         root.destroy()
     elif k == "f5":
         ser.write(b"r")
+    elif k == "f2":
+        ser.write(b"m")
     elif k in KEYS:
         held.add(k)
         send()
@@ -132,6 +159,8 @@ def tick():
         msg.config(text=last_line[0])
         if joy is not None:
             padinfo.config(text=f"ゲームパッド: {joy.get_name()}  押しているボタン番号: {raw[0] or 'なし'}")
+        elif pygame is not None:
+            padinfo.config(text="ゲームパッド: なし (つなげば自動で使う)")
     root.after(16, tick)
 
 
@@ -152,11 +181,12 @@ def reader():
 
 root = tk.Tk()
 root.title(f"NES パッド ({PORT})")
-tk.Label(root, text="この窓を選んでキーを押す\n矢印/wasd=方向  x=A  z=B  Enter=Start  スペース=Select\nF5=リセット  Esc=終了",
+tk.Label(root, text="この窓を選んでキーを押す\n矢印/wasd=方向  x=A  z=B  Enter=Start  スペース=Select\n"
+                    "F2 / パッドの LB = ゲームの一覧へ  F5=リセット  Esc=終了",
          justify="left", font=("Meiryo", 11)).pack(padx=12, pady=8)
 label = tk.Label(root, text="押下: なし", font=("Meiryo", 14))
 label.pack(padx=12, pady=4)
-padinfo = tk.Label(root, text="ゲームパッド: なし" if joy is None else "", font=("Meiryo", 10))
+padinfo = tk.Label(root, text="ゲームパッド: なし" if pygame is None else "", font=("Meiryo", 10))
 padinfo.pack(padx=12, pady=2)
 msg = tk.Label(root, text="", font=("Consolas", 10), fg="gray")
 msg.pack(padx=12, pady=6)
