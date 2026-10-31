@@ -81,6 +81,25 @@ shell でたたくだけなら shell_module を同じオーバーレイ付きで
   WNS 2.28ns で上限 約 130MHz)。一度これをやり、1328 us/枚で「合格」と出た。一致したのはたまたま。
   万華鏡の値 (/15 = 100MHz) のまま触らないのが正しい。**時間が Linux 版と合うかで周波数を確かめる**
 
+## Zephyr の部品で CNN を周期的に動かす (apps/cnn_rtos, 2026-10-31)
+```
+k_timer (割り込み) ──セマフォ──> 推論スレッド (優先 2) ──メッセージキュー──> 集計スレッド (優先 8)
+  周期ごとに時刻を記録          PL で 1 枚推論 (PL はミューテックスで守る)     件数・不一致・遅れ
+```
+shell の自作コマンド `cnn start [ms]` / `stop` / `stats` / `once <番号>` / `watch on|off` で操作する。
+ビルドと起動は apps/cnn と同じ (名前を `cnn_rtos` に)。確かめ方:
+```
+python shell_test.py COM14 out.txt "cnn once 3" "cnn watch on" "cnn start 100" "#sleep 1" "cnn watch off" "#sleep 5" "cnn stats" "cnn start 5" "#sleep 5" "cnn stats" "cnn stop" "kernel thread list"
+```
+実機の結果:
+| 周期 | 推論回数 | 不一致 | 取りこぼし | 遅れ (割り込み→スレッド) |
+|---|---|---|---|---|
+| 100 ms | 101 | 0 | 0 | 最大 13 us / 平均 12 us |
+| 5 ms | 1421 (約 7 秒) | 0 | 0 | 最大 12 us / 平均 12 us |
+
+推論時間はどれも 1991 us。遅れは周期を 20 倍にしても 12〜13 us で揺れない。
+スタック使用量は推論スレッド 200/2048、集計スレッド 332/2048 バイト。
+
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる
 - PC は WSL で `arm-zephyr-eabi-addr2line -f -e build_<名前>/zephyr/zephyr.elf <PC>`
