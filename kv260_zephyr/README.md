@@ -139,6 +139,40 @@ python shell_test.py COM14 out.txt "#sleep 4" "amp stats" "#sleep 5" "amp stats"
 - R5 を xsdb で止めて調べるときは `catch {stop}` / `catch {con}` で必ず再開させる (止めたままにしたら
   共有メモリの往復が止まり、R5 が DMB で動かなくなった)
 
+## Linux (PetaLinux) から remoteproc で起動する (段1: TCM だけ, 2026-10-31)
+SD カードの PetaLinux 2025.1 (カーネル 6.12) を普通に起動したまま、Linux から R5_0 の Zephyr を起動・停止する。
+xsdb も JTAG も使わない。**SD カードも U-Boot も変えない** (オーバーレイは起動中に当て、再起動で消える)。
+
+カーネルには remoteproc (`CONFIG_XLNX_R5_REMOTEPROC=y`)・IPI・RPMsg が入っているが、デバイスツリーに
+R5 のノードが無い。`linux/r5_rproc.dtso` で足す (カーネルの binding の分割モードの例そのまま)。
+
+```
+# PC → KV260 (petalinux@192.168.0.8。鍵 ~/.ssh/id_ed25519_kv260)
+scp -O linux/r5_rproc.dtso hello.elf petalinux@192.168.0.8:~/
+# KV260 (起動するたびに overlay から)
+dtc -I dts -O dtb -o r5_rproc.dtbo r5_rproc.dtso
+sudo mkdir /sys/kernel/config/device-tree/overlays/r5
+sudo sh -c 'cat r5_rproc.dtbo > /sys/kernel/config/device-tree/overlays/r5/dtbo'
+sudo cp hello.elf /lib/firmware/zephyr_hello.elf
+R=/sys/class/remoteproc/remoteproc1          # ffe00000.r5f = R5_0 (remoteproc0 は R5_1)
+echo zephyr_hello.elf | sudo tee $R/firmware
+echo start | sudo tee $R/state               # → Hello World! kv260_r5/zynqmp_rpu が UART1 (COM14) に
+echo stop  | sudo tee $R/state
+```
+結果: `remote processor ffe00000.r5f is now up` → COM14 に Hello World が出た → `stop` で offline。
+
+制約と理由:
+- **DDR のメモリ予約 (memory-region) を入れていない** — 予約は起動時にしか効かず、起動後のオーバーレイで足すと
+  ドライバが見つけられない。なので Zephyr は **ATCM (64KB) に収まるもの**だけ (hello は 37KB)。0 番地リンクの
+  xsdb 用 elf がそのまま使える。ドライバが起動前に TCM を 0 埋めするので ECC の問題も出ない
+- `failed to get memory region dev node` は予約が無いため。`no resource table found` も想定どおり (RPMsg なし)
+- UART1 は Linux のコンソール (ttyPS1) と共用。Zephyr の出力は Linux のコンソールに混ざる
+- sudo をパスワードなしにした: `/etc/sudoers.d/zz-nopw` (`petalinux ALL=(ALL) NOPASSWD: ALL`)。
+  sudoers.d は名前順に読まれ後が勝つので、`99-petalinux` / `dou` より後ろの名前にする必要があった。
+  戻すときは `sudo rm /etc/sudoers.d/zz-nopw`
+
+段2 (RPMsg で Linux と通信) は、共有メモリの予約を起動時のデバイスツリーに入れる必要がある (未着手)。
+
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる
 - PC は WSL で `arm-zephyr-eabi-addr2line -f -e build_<名前>/zephyr/zephyr.elf <PC>`
