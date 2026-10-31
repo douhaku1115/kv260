@@ -100,6 +100,45 @@ python shell_test.py COM14 out.txt "cnn once 3" "cnn watch on" "cnn start 100" "
 推論時間はどれも 1991 us。遅れは周期を 20 倍にしても 12〜13 us で揺れない。
 スタック使用量は推論スレッド 200/2048、集計スレッド 332/2048 バイト。
 
+## A53 と R5 で分業する (apps/amp_r5 + a53, 2026-10-31)
+```
+A53 #0 (ベアメタル)                          R5 #0 (Zephyr)
+  画像 10 枚を共有メモリ 0x18000000 に置く
+  IPI「画像 k を推論して」 ───────────>  受信コールバック → メッセージキュー → 推論スレッド
+                                           共有メモリの画像を PL の CNN へ、スコアを共有メモリへ
+  ISR をポーリングして返事を待つ <───────  IPI で返事 (答え・推論時間)
+  照合して統計を共有メモリへ               shell の `amp stats` で A53 の統計を表示
+```
+取り決め (番地・メッセージ・共有メモリの構造体) は `amp_shared.h` にまとめ、両方から include する。
+A53 は UART を使わない (R5 が使う) し、割り込みも使わない (ポーリング)。
+
+```
+# R5 (WSL)
+bash build.sh $K/apps/amp_r5 amp_r5 "-DDTC_OVERLAY_FILE=$K/pl_axi.overlay;$K/amp.overlay"
+# A53 (Git Bash。万華鏡の Vitis プラットフォームの BSP を使い、gcc を直接呼ぶ)
+bash a53/build.sh          # → a53_amp.elf (0x10000000 にリンク)
+# 起動 (第 4 引数が A53 の elf)
+xsdb.bat run_zephyr.tcl .../amp_r5.elf .../kv260_cnn/.../design_1_wrapper.bit .../cnn_ps_fix.tcl .../a53_amp.elf
+python shell_test.py COM14 out.txt "#sleep 4" "amp stats" "#sleep 5" "amp stats"
+```
+実機の結果: 往復 3788 回で不一致 0・返事なし 0・番号違い 0。往復時間 最小 2318 / 平均 2326 / 最大 4083 us
+(推論そのものは 1991 us)。
+
+| ファイル | 役割 |
+|---|---|
+| `amp_shared.h` | IPI のバッファ番地・メッセージ・共有メモリの構造体 (A53/R5 で並びが同じことを _Static_assert で確認) |
+| `amp.overlay` | R5_0 の IPI を有効に、共有メモリ 1MB を MPU にキャッシュなしで登録 |
+| `apps/amp_r5/` | R5 側。IPI を受けて推論して返す |
+| `a53/` | A53 側 (main.c / 0x10000000 用 lscript.ld / build.sh) |
+
+はまった所:
+- **A53 のアプリは既定で DDR 0 番地から**リンクされ、R5 の Zephyr (0〜64MB) と重なる。lscript.ld で 0x10000000 に
+- **推論スレッドが PL を空回りで待つと shell が一切応答しない** — A53 が返事を受けるとすぐ次を頼むので、
+  優先 2 のスレッドが CPU を独占する。終了待ちを `k_sleep(K_TICKS(1))` にしたら shell が動き、往復は
+  約 2.24 ms → 2.33 ms になった
+- R5 を xsdb で止めて調べるときは `catch {stop}` / `catch {con}` で必ず再開させる (止めたままにしたら
+  共有メモリの往復が止まり、R5 が DMB で動かなくなった)
+
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる
 - PC は WSL で `arm-zephyr-eabi-addr2line -f -e build_<名前>/zephyr/zephyr.elf <PC>`

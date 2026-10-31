@@ -1,12 +1,15 @@
 # KV260 の R5 #0 で Zephyr を起動する。FSBL の代わりに USB を外した psu_init で PS を初期化する。
 # (Zephyr 公式 boards/amd/kv260_r5/support/xsdb.cfg の流れを、FSBL→psu_init に置き換えたもの)
-# 使い方: xsdb run_zephyr.tcl <zephyr.elf> [PL のビットファイル] [PS の後設定 tcl]
+# 使い方: xsdb run_zephyr.tcl <zephyr.elf> [PL のビットファイル] [PS の後設定 tcl] [A53 の elf]
 #   PL を使うときはビットファイルを渡す。その PL が万華鏡と違う PS 設定 (PL クロック・
 #   HPM の幅など) を前提にしているなら、差分だけを書いた後設定 tcl も渡す (例: cnn_ps_fix.tcl)
+#   A53 との分業 (amp) では、R5 を走らせたあとに A53 #0 のベアメタルも載せる。
+#   途中の引数を使わないときは "" を渡す
 set DIR [file dirname [file normalize [info script]]]
 set ELF [lindex $argv 0]
 set BIT [lindex $argv 1]
 set FIX [lindex $argv 2]
+set A53 [lindex $argv 3]
 
 connect
 source E:/vivado/2025.2/Vitis/scripts/vitis/util/zynqmp_utils.tcl
@@ -83,6 +86,20 @@ dow $ELF
 con
 after 2000
 puts "3. zephyr started"
+
+# ---- 4. A53 #0 にベアメタルを載せる (渡されたときだけ。R5 が IPI を待ち始めてから) ----
+if {$A53 ne ""} {
+    targets -set -nocase -filter {name =~ "*A53*#0"}
+    rst -processor
+    dow $A53
+    con
+    after 2000
+    puts "4. A53 started: [file tail $A53]"
+    # 共有メモリ (amp_shared.h) の統計: magic / 往復回数 / 不一致
+    targets -set -nocase -filter {name =~ "PSU"}
+    puts [format "   SHM magic=0x%08x count=%u bad=%u" [mrd -force -value 0x18000008] \
+          [mrd -force -value 0x1800000c] [mrd -force -value 0x18000010]]
+}
 
 # ---- 確認用: RPU の設定と UART1 の状態 ----
 targets -set -nocase -filter {name =~ "PSU"}

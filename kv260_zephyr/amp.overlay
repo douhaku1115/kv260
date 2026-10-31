@@ -1,0 +1,22 @@
+/*
+ * A53 との分業用 (apps/amp_r5)。pl_axi.overlay と一緒に渡す:
+ *   -DDTC_OVERLAY_FILE="/mnt/e/.../pl_axi.overlay;/mnt/e/.../amp.overlay"
+ *
+ * - R5_0 の IPI (0xFF310000) を有効にする。A53 とのメールボックスは rpu0_apu_mailbox
+ * - 共有メモリ 0x18000000 から 1MB を MPU にキャッシュなしで登録する (amp_shared.h と一致させる)。
+ *   Zephyr の sram 用 MPU 領域 (0〜256MB) の外に置いたので、この領域の属性だけが効く
+ */
+#include <zephyr/dt-bindings/memory-attr/memory-attr-arm.h>
+
+&rpu0_ipi {
+	status = "okay";
+};
+
+/ {
+	amp_shm: memory@18000000 {
+		compatible = "zephyr,memory-region";
+		reg = <0x18000000 DT_SIZE_M(1)>;
+		zephyr,memory-region = "AMP_SHM";
+		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
+	};
+};
