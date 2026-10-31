@@ -18,6 +18,7 @@ Linux も SD カードも使わない。Zephyr はアプリと一体の `zephyr.
 | `shell_test.py` | `python shell_test.py COM14 <出力> [コマンド...]` で shell にコマンドを送って応答を記録 |
 | `rpmsg.overlay` + `apps/rpmsg_r5` | 段2: Linux と RPMsg で話す R5 側 (TCM 配置) |
 | `linux/r5_rpmsg.dtso` / `linux/rpmsg_rtt.py` | 段2: 起動 DT に足す差分 / 往復時間の測定 |
+| `linux/uEnv_rpmsg.txt` / `linux/r5_start.sh` / `linux/r5-rpmsg.service` | 段2: 電源投入だけで rpmsg.dtb 起動 + R5 自動起動 |
 
 `psu_init_nousb.tcl` と `*.elf` はリポジトリに入れない (下の手順で作る)。
 
@@ -234,6 +235,26 @@ echo rpmsg_r5.elf | sudo tee $R/firmware
 echo start | sudo tee $R/state               # dmesg: creating channel rpmsg-raw addr 0x400 → /dev/rpmsg0
 sudo python3 rpmsg_rtt.py 1000 32            # 1000 往復 / 32 バイト / 不一致 0 / 中央 357 us
 ```
+### 自動で起動する (U-Boot の手入力と R5 の start をなくす)
+電源を入れるだけで `rpmsg.dtb` で起動し、R5 も動く (確認: 起動 11.6 秒で R5 running、1000 往復不一致 0・中央 357us)。
+- `linux/uEnv_rpmsg.txt` → SD の FAT 側 `uEnv.txt`。`ext4load` で `/home/petalinux/rpmsg.dtb` が読めればそれで、
+  読めなければ従来どおり U-Boot の DT で起動する
+- `linux/r5_start.sh` → `/usr/local/bin/` (名前 `ffe00000.r5f` で R5_0 を探して start。R5 のノードが無ければ何もしない)
+- `linux/r5-rpmsg.service` → `/etc/systemd/system/` (`systemctl enable r5-rpmsg.service`)
+```
+# KV260 (送ったファイルの行末 CR を取ってから)
+B=/run/media/boot-mmcblk1p1
+sudo cp $B/uEnv.txt $B/uEnv.txt.before_rpmsg      # 控え
+sudo cp uEnv_rpmsg.txt $B/uEnv.txt; sync
+sudo mkdir -p /usr/local/bin                       # PetaLinux には無い
+sudo install -m 755 r5_start.sh /usr/local/bin/
+sudo install -m 644 r5-rpmsg.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable r5-rpmsg.service
+```
+戻すとき: `sudo cp $B/uEnv.txt.before_rpmsg $B/uEnv.txt` と `sudo systemctl disable r5-rpmsg.service`
+(または `rpmsg.dtb` の名前を変えるだけで従来の DT に戻る)。BOOT.BIN を作り直して U-Boot の DT が変わったら
+`rpmsg.dtb` も作り直す。
+
 起動直後の dmesg で `reserved mem: ... vdev0vring0@3ed00000` と
 `zynqmp-ipi-mbox mailbox@ff990400: Registered` が出ていれば dtb が効いている。
 

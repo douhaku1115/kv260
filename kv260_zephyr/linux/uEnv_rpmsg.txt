@@ -1,0 +1,2 @@
+bootargs=earlycon console=ttyPS1,115200 root=/dev/mmcblk1p2 rw rootwait cma=256M mem=1536M
+uenvcmd=fatload ${devtype} ${devnum}:${distro_bootpart} 0x00200000 Image; if ext4load ${devtype} ${devnum}:2 0x00100000 /home/petalinux/rpmsg.dtb; then booti 0x00200000 - 0x00100000; fi; booti 0x00200000 - ${fdtcontroladdr}

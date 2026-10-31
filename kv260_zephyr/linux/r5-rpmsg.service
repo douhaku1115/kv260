@@ -1,0 +1,11 @@
+[Unit]
+Description=R5_0 で RPMsg 用の Zephyr を起動する (kv260_zephyr 段2)
+After=systemd-modules-load.service local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/r5_start.sh
+
+[Install]
+WantedBy=multi-user.target
