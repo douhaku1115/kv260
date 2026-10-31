@@ -19,6 +19,7 @@ Linux も SD カードも使わない。Zephyr はアプリと一体の `zephyr.
 | `rpmsg.overlay` + `apps/rpmsg_r5` | 段2: Linux と RPMsg で話す R5 側 (TCM 配置) |
 | `linux/r5_rpmsg.dtso` / `linux/rpmsg_rtt.py` | 段2: 起動 DT に足す差分 / 往復時間の測定 |
 | `linux/uEnv_rpmsg.txt` / `linux/r5_start.sh` / `linux/r5-rpmsg.service` | 段2: 電源投入だけで rpmsg.dtb 起動 + R5 自動起動 |
+| `linux/r5_shell.sh` / `linux/r5_term.py` | 段2: R5 の shell に Linux からつなぐ |
 
 `psu_init_nousb.tcl` と `*.elf` はリポジトリに入れない (下の手順で作る)。
 
@@ -270,6 +271,32 @@ sudo systemctl daemon-reload && sudo systemctl enable r5-rpmsg.service
   (`shared-dma-pool` 必須)。memory-region[0] は動作中の R5 へ後から接続 (attach) するときだけ読まれる
 - R5_1 に memory-region を付けていないので `ffe90000.r5f: failed to get memory region dev node` が出るが、使わないので無害
 - Linux に `rpmsg_tty` は無い (`rpmsg_char` はモジュール)。なので名前を `rpmsg-raw` にして `/dev/rpmsgN` で読み書きする
+
+## R5 の Zephyr の shell を Linux から使う (段2の続き, 2026-10-31)
+カーネルを作り直さずに、Linux (SSH でも Tera Term でも) から R5 の shell を対話で使う。
+```
+sudo /usr/local/bin/r5_shell.sh                    # ipc:~$ が出る。抜けるのは Ctrl+]
+sudo /usr/local/bin/r5_shell.sh "kernel uptime"    # コマンドを送って応答を表示 (確認用)
+```
+- Zephyr の RPMsg 用 shell (`CONFIG_SHELL_BACKEND_RPMSG`) の名前を `rpmsg-raw`、番号を 0x440 にした。
+  エコー (0x400) と合わせて Linux に `/dev/rpmsg0` (エコー) と `/dev/rpmsg1` (shell) ができる。
+  `r5_shell.sh` は sysfs の `virtio0.rpmsg-raw.-1.1088` (= 0x440) で shell の方を探す
+- 対話は自作の `linux/r5_term.py` (キーをそのまま書き、返事は別スレッドで読む)
+- 置き場所: KV260 の `/usr/local/bin/` に `r5_start.sh` `r5_shell.sh` `r5_term.py` (sudo の検索パスに入っていないのでフルパスで呼ぶ)
+
+はまった所:
+- **Zephyr が UART1 の割り込みを止める** — Zephyr の UART ドライバ (`uart_xlnx_ps.c`) は初期化で割り込み禁止レジスタに
+  全ビットを書く。UART1 は Linux のコンソールと共用なので、R5 が起動した瞬間から Tera Term で入力できなくなる
+  (段1の hello から同じだった。R5 起動後に入力していなかったので気づかなかった)。`r5_start.sh` が起動の 1 秒後に
+  Linux のドライバと同じ値 `CDNS_UART_RX_IRQS` = 0x161 を IER (0xFF010008) に書き戻す。
+  手で戻すなら `sudo devmem 0xFF010008 32 0x161` (IMR 0xFF010010 が 0x161 になれば OK)
+- **R5 側の窓口の番号は 0x400〜0x47F だけ** — OpenAMP は予約 1024 + 管理表 128 ビット。0x500 にしたら作成失敗した
+- **コードが 32KB を超えると ATCM があふれる** — リンカスクリプトの `MPU_ALIGN` がコード領域を 2 のべき乗に切り上げ、
+  shell 入りの 52KB は 64KB 扱いになって初期値の置き場がなくなった (372 バイトあふれ。機能を削っても変わらない)。
+  `apps/rpmsg_r5/linker.ld` (Zephyr の Cortex-R 用の写しに 3 行足しただけ) で初期値を BTCM に直接置いた
+- **socat ではキーが届かない** — `socat -,raw /dev/rpmsg1` は開くが 1 バイトも書かず (IPI の回数が増えない)、
+  Ctrl+] も効かず固まった。`r5_term.py` に替えた
+- UART の shell は外した (`CONFIG_SHELL_BACKEND_SERIAL=n`)。残すと Linux への入力を Zephyr も読む
 
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる

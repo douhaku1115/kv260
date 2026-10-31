@@ -8,6 +8,7 @@
 //     rpmsg_char が /dev/rpmsg0 を作る  <── (名前の通知)
 //     /dev/rpmsg0 に書く   ──────────────>  受信コールバック: "R5: " を付けて送り返す
 //     /dev/rpmsg0 から読む <──────────────
+//     /dev/rpmsg1 (番号 0x440) ── shell のコマンドと応答 (linux/r5_shell.sh で socat につなぐ)
 //
 //   起動の流れは Zephyr の samples/subsys/ipc/openamp_rsc_table の main_remote.c と同じ。
 //   shell と rpmsg-tty を外して小さくした (公式のままだと 83KB で TCM 64KB に入らない)。
@@ -17,6 +18,7 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/ipm.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/shell/shell_rpmsg.h>
 #include <string.h>
 
 #include <openamp/open_amp.h>
@@ -156,6 +158,12 @@ int main(void)
 	ret = rpmsg_create_ept(&ept, rpdev, EPT_NAME, RPMSG_ADDR_ANY, RPMSG_ADDR_ANY, ept_cb,
 			       NULL);
 	printk("[R5] 窓口 \"%s\" %s\n", EPT_NAME, ret ? "作成失敗" : "作成 (Linux に通知済)");
+
+	/* shell も RPMsg に載せる (名前 rpmsg-raw、番号 0x440。prj.conf)。
+	 * Linux 側は linux/r5_shell.sh で番号 0x440 の /dev/rpmsgN を探してつなぐ
+	 */
+	ret = shell_backend_rpmsg_init_transport(rpdev);
+	printk("[R5] shell (0x%x) %s\n", CONFIG_SHELL_RPMSG_SRC_ADDR, ret ? "失敗" : "開始");
 
 	/* IPI が来るたびに vring を見る。受信コールバックはこの中から呼ばれる */
 	for (;;) {

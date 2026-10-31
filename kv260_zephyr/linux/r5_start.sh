@@ -16,6 +16,13 @@ for r in /sys/class/remoteproc/remoteproc*; do
 		echo "$FW" > "$r/firmware"
 		echo start > "$r/state"
 		echo "r5_start: $r ($FW) → $(cat "$r/state")"
+		# Zephyr の UART ドライバは初期化で UART1 の割り込みを全部止める (uart_xlnx_ps.c、IDR に全ビット)。
+		# UART1 は Linux のコンソール (ttyPS1) と共用なので、そのままだと Linux がキー入力を受けられない。
+		# Zephyr の初期化が終わるのを待って、Linux のドライバが入れる値 (CDNS_UART_RX_IRQS = 0x161) を
+		# 割り込み有効レジスタ (IER, 0xFF010008) に書き戻す
+		sleep 1
+		devmem 0xFF010008 32 0x161
+		echo "r5_start: UART1 の割り込みを戻した (IMR=$(devmem 0xFF010010 32))"
 		exit 0
 	fi
 done
