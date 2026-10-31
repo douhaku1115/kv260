@@ -47,6 +47,18 @@
 		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
 	};
 
+	/* PL の CNN (M_AXI_HPM0_FPD) を入出力領域として MPU に登録 (pl_axi.overlay と同じ)。
+	 * 1 つのファイルにまとめたのは、build.sh に「;」区切りで 2 つ渡すと WSL 側で
+	 * 「;」がコマンドの区切りと解釈されて 2 つ目が落ちるため。
+	 * 登録するだけなら PL が空でも害はない (R5 は Linux から依頼が来るまで PL に触らない)
+	 */
+	pl_axi: memory@a0000000 {
+		compatible = "zephyr,memory-region";
+		reg = <0xa0000000 DT_SIZE_K(64)>;
+		zephyr,memory-region = "PL_AXI";
+		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_IO)>;
+	};
+
 	vdev0buffer: memory@3ed40000 {
 		compatible = "mmio-sram";
 		reg = <0x3ed40000 DT_SIZE_K(256)>;

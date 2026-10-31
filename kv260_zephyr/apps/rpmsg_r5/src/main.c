@@ -8,7 +8,8 @@
 //     rpmsg_char が /dev/rpmsg0 を作る  <── (名前の通知)
 //     /dev/rpmsg0 に書く   ──────────────>  受信コールバック: "R5: " を付けて送り返す
 //     /dev/rpmsg0 から読む <──────────────
-//     /dev/rpmsg1 (番号 0x440) ── shell のコマンドと応答 (linux/r5_shell.sh で socat につなぐ)
+//     /dev/rpmsg1 (番号 0x440) ── shell のコマンドと応答 (linux/r5_shell.sh でつなぐ)
+//     番号 0x410 ── PL の CNN の推論依頼 (cnn_rpmsg.c、linux/cnn_rpmsg.py)
 //
 //   起動の流れは Zephyr の samples/subsys/ipc/openamp_rsc_table の main_remote.c と同じ。
 //   shell と rpmsg-tty を外して小さくした (公式のままだと 83KB で TCM 64KB に入らない)。
@@ -32,6 +33,8 @@
 #define SHM_SIZE       DT_REG_SIZE(SHM_NODE)
 
 #define EPT_NAME "rpmsg-raw"   /* Linux の rpmsg_char がこの名前で /dev/rpmsgN を作る */
+
+int cnn_rpmsg_init(struct rpmsg_device *rpdev);   /* cnn_rpmsg.c */
 
 static const struct device *const ipm = DEVICE_DT_GET(DT_CHOSEN(zephyr_ipc));
 
@@ -164,6 +167,10 @@ int main(void)
 	 */
 	ret = shell_backend_rpmsg_init_transport(rpdev);
 	printk("[R5] shell (0x%x) %s\n", CONFIG_SHELL_RPMSG_SRC_ADDR, ret ? "失敗" : "開始");
+
+	/* PL の CNN の窓口 (番号 0x410。cnn_rpmsg.c)。PL には依頼が来るまで触らない */
+	ret = cnn_rpmsg_init(rpdev);
+	printk("[R5] CNN 窓口 (0x410) %s\n", ret ? "作成失敗" : "作成");
 
 	/* IPI が来るたびに vring を見る。受信コールバックはこの中から呼ばれる */
 	for (;;) {

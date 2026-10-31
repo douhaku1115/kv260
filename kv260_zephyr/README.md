@@ -20,6 +20,7 @@ Linux も SD カードも使わない。Zephyr はアプリと一体の `zephyr.
 | `linux/r5_rpmsg.dtso` / `linux/rpmsg_rtt.py` | 段2: 起動 DT に足す差分 / 往復時間の測定 |
 | `linux/uEnv_rpmsg.txt` / `linux/r5_start.sh` / `linux/r5-rpmsg.service` | 段2: 電源投入だけで rpmsg.dtb 起動 + R5 自動起動 |
 | `linux/r5_shell.sh` / `linux/r5_term.py` | 段2: R5 の shell に Linux からつなぐ |
+| `apps/rpmsg_r5/src/cnn_rpmsg.c` / `linux/cnn_rpmsg.py` | 段2: Linux から RPMsg で PL の CNN 推論を頼む |
 
 `psu_init_nousb.tcl` と `*.elf` はリポジトリに入れない (下の手順で作る)。
 
@@ -178,6 +179,8 @@ echo stop  | sudo tee $R/state
 ## Linux と R5 の Zephyr が RPMsg で話す (段2, apps/rpmsg_r5, 2026-10-31)
 Linux の `/dev/rpmsg0` に書いた文字列を、R5 の Zephyr が `"R5: "` を付けて送り返す。
 2000 往復で不一致 0。往復 (Python から 1000 回、中央値) は 32 バイトで 357us、400 バイトで 786us。
+**★この数字は R5 が 16.7MHz で動いていたときのもの** (下の「R5 のクロックが止められていた」)。
+直した後は 32 バイトで **61us**。
 
 ```
 Linux (A53)                                  R5_0 (Zephyr, apps/rpmsg_r5)
@@ -238,7 +241,8 @@ sudo python3 rpmsg_rtt.py 1000 32            # 1000 往復 / 32 バイト / 不�
 ```
 ### 自動で起動する (U-Boot の手入力と R5 の start をなくす)
 電源を入れるだけで `rpmsg.dtb` で起動し、R5 も動く (確認: 起動 11.6 秒で R5 running、1000 往復不一致 0・中央 357us)。
-- `linux/uEnv_rpmsg.txt` → SD の FAT 側 `uEnv.txt`。`ext4load` で `/home/petalinux/rpmsg.dtb` が読めればそれで、
+- `linux/uEnv_rpmsg.txt` → SD の FAT 側 `uEnv.txt`。bootargs に `clk_ignore_unused` と
+  `zynqmp_ipi_mailbox.tx_poll_period=1` を足してある (理由は下の CNN の節)。`ext4load` で `/home/petalinux/rpmsg.dtb` が読めればそれで、
   読めなければ従来どおり U-Boot の DT で起動する
 - `linux/r5_start.sh` → `/usr/local/bin/` (名前 `ffe00000.r5f` で R5_0 を探して start。R5 のノードが無ければ何もしない)
 - `linux/r5-rpmsg.service` → `/etc/systemd/system/` (`systemctl enable r5-rpmsg.service`)
@@ -297,6 +301,55 @@ sudo /usr/local/bin/r5_shell.sh "kernel uptime"    # コマンドを送って応
 - **socat ではキーが届かない** — `socat -,raw /dev/rpmsg1` は開くが 1 バイトも書かず (IPI の回数が増えない)、
   Ctrl+] も効かず固まった。`r5_term.py` に替えた
 - UART の shell は外した (`CONFIG_SHELL_BACKEND_SERIAL=n`)。残すと Linux への入力を Zephyr も読む
+
+## Linux から RPMsg で PL の CNN 推論を頼む (段2の続き, 2026-11-01)
+Linux の Python が画像を RPMsg で R5 に送り、R5 が PL の CNN で推論して答え・スコアを返す。
+段3 (A53 ベアメタル + IPI) を、Linux の普通のプログラムから使える形にしたもの。
+
+**結果: 1000 枚 不一致 0、往復 中央 2396us (最大 2461us)、411 枚/秒。** PL の推論そのもの (1991us) に約 0.4ms 足しただけ。
+
+```
+Linux (linux/cnn_rpmsg.py)              R5 (apps/rpmsg_r5/src/cnn_rpmsg.c)        PL (CNN)
+  画像 784 バイトを 392 バイト × 2 通で ─> 受信: 1 枚分ためる
+                                          推論スレッド: 画素を PL へ 784 回 ───>   推論 1991us
+  答え・スコア 10 個・推論時間       <─   1 通で返す
+```
+- 窓口は 3 本目の `rpmsg-raw`、番号 0x410 (`virtio0.rpmsg-raw.-1.1040`、いまは `/dev/rpmsg2`)。形式は `cnn_rpmsg.c` の冒頭
+- RPMsg の 1 通は最大 496 バイトなので画像は 2 通に分ける
+- R5 は電源投入で自動起動するが PL は空。空の PL の番地を読むと止まるおそれがあるので、**R5 は依頼が来るまで PL に触らない**。
+  `cnn_rpmsg.py` は fpga_manager が `operating` か確かめてから送る
+- PL の番地 (0xA0000000) の MPU 登録は `rpmsg.overlay` に入れた (build.sh に `;` で 2 つ渡すと WSL 側で `;` がコマンドの区切りになり、2 つ目が落ちる)
+- R5 の shell の `cnn stats` で件数と内訳 (起床・画素・推論・読出・送信) が見える
+
+```
+# PC → KV260
+scp kv260_cnn/vivado/cnn_mnist.runs/impl_1/design_1_wrapper.bit kv260_cnn/sim/test_images.hex \
+    kv260_cnn/sim/test_scores.hex kv260_zephyr/linux/cnn_rpmsg.py petalinux@192.168.0.8:~/
+# KV260 (電源を入れるたびに。R5 は自動で動いている)
+sudo fpgautil -b ~/design_1_wrapper.bit
+sudo devmem 0xFF5E00C0 32 0x01010A00         # PL クロック 100MHz (IOPLL 1000MHz / 10)
+sudo python3 cnn_rpmsg.py 1000               # 1000 枚 / 不一致 0 / 411 枚/秒
+sudo /usr/local/bin/r5_shell.sh "cnn stats"
+```
+
+### 速くするまで (1 枚の往復、中央値)
+| 段階 | 往復 | 枚/秒 | R5 側の内訳 |
+|---|---|---|---|
+| 最初 | 4413us | 222 | 起床 125 / 画素 976 / 推論 2128 / 読出 50 / 送信 88 us |
+| `clk_ignore_unused` 後 | 7316us | 136 | 起床 6 / 画素 213 / 推論 2007 / 読出 6 / 送信 4 us |
+| `tx_poll_period=1` 後 | **2396us** | **411** | (同上) |
+
+- **R5 のクロックが止められていた** — Linux は起動の終わりに「Linux が使っていないクロック」を止める。RPLL は R5 にしか
+  使われていないので止められ、R5 は RPLL を通らない 33.33MHz ÷ 2 = **約 16.7MHz** で動いていた (本来 750MHz ÷ 2)。
+  `RPLL_CTRL` (0xFF5E0030) の下位が 0x09 (RESET と BYPASS)、`/sys/kernel/debug/clk/clk_summary` の `rpll_int` が N で確認。
+  bootargs に `clk_ignore_unused` を足して止めないようにした (直ると 0x00012D00)。段1からずっとこの状態だった
+- **Linux の IPI は通知を 5ms に 1 回しか送れない** — `zynqmp-ipi-mailbox.c` は送った通知が受け取られたかを割り込みでなく
+  見回り (`tx_poll_period` = 5ms) で確かめ、確認が済むまで次の通知を待たせる。画像を 2 通に分けると 2 通目の通知が待たされ、
+  R5 が速くなった途端に往復が 7.3ms に悪化した (遅かった頃は 1 通目の処理中に 2 通目が届いていて見えなかった)。
+  Linux 側を「送信 2 通 / 返事の受信」に分けて測ると、受信だけが 7.3ms だった。bootargs に
+  `zynqmp_ipi_mailbox.tx_poll_period=1` (組み込みドライバなので起動時に指定) で直った。エコーは通知 1 回なので当たらない
+- PL への窓口の幅 (AFI_FS 0xFD615000) は Linux では 128 ビット (0xA00)。CNN は 32 ビットで作ってあるが、32 ビット (0x800) に
+  しても画素の時間は変わらなかった (原因ではない)。音楽プロジェクトの「AXI のレジスタは 0x10 刻みでないと読めない」はおそらくこの食い違い
 
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる
