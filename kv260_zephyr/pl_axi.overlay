@@ -1,0 +1,15 @@
+/*
+ * PL の AXI 窓口 (M_AXI_HPM0_FPD, 0xA0000000) を R5 の MPU に入出力領域として登録する。
+ * Zephyr の zynqmp_rpu は MPU の背景領域を使わないので、表に無い番地に触るとアボートする。
+ * build.sh <サンプル> <名前> -DDTC_OVERLAY_FILE=/mnt/e/fpga/kria260/kv260_zephyr/pl_axi.overlay
+ */
+#include <zephyr/dt-bindings/memory-attr/memory-attr-arm.h>
+
+/ {
+	pl_axi: memory@a0000000 {
+		compatible = "zephyr,memory-region";
+		reg = <0xa0000000 DT_SIZE_K(64)>;
+		zephyr,memory-region = "PL_AXI";
+		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_IO)>;
+	};
+};

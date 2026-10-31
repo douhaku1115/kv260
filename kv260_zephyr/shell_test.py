@@ -2,7 +2,8 @@
 import sys, time, serial
 
 port, out = sys.argv[1], sys.argv[2]
-cmds = ["help", "kernel version", "kernel uptime", "kernel thread list", "demo ping"]
+# 送るコマンドは第 3 引数以降。無ければ動作確認の定番を送る
+cmds = sys.argv[3:] or ["help", "kernel version", "kernel uptime", "kernel thread list", "demo ping"]
 end = time.time() + 60
 buf = b""
 s = None

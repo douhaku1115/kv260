@@ -11,11 +11,11 @@ Linux も SD カードも使わない。Zephyr はアプリと一体の `zephyr.
 | ファイル | 役割 |
 |---|---|
 | `setup_env.sh` | WSL にビルド環境を作る (sudo 不要。venv + west + 取得を絞った Zephyr) |
-| `build.sh` | `build.sh <サンプル> <名前>` でビルドし `<名前>.elf` をここへコピー |
-| `run_zephyr.tcl` | `xsdb run_zephyr.tcl <elf>` で PS を初期化し R5 #0 で起動 |
+| `build.sh` | `build.sh <サンプル> <名前> [cmake 引数]` でビルドし `<名前>.elf` をここへコピー |
+| `run_zephyr.tcl` | `xsdb run_zephyr.tcl <elf> [ビット] [後設定 tcl]` で (PL を書き) PS を初期化し R5 #0 で起動 |
 | `debug_r5.tcl` | 止まったときに DFSR/DFAR と PC を読む |
 | `serlog.py` | `python serlog.py COM14 <秒> <出力>` でシリアルを記録 |
-| `shell_test.py` | shell にコマンドを送って応答を記録 |
+| `shell_test.py` | `python shell_test.py COM14 <出力> [コマンド...]` で shell にコマンドを送って応答を記録 |
 
 `psu_init_nousb.tcl` と `*.elf` はリポジトリに入れない (下の手順で作る)。
 
@@ -52,6 +52,34 @@ PL は書かない (PS だけで動く)。
 4. **TCM をワード単位で 0 埋め** — TCM は ECC 付きで、未初期化のまま部分書き込みすると ECC エラーでアボートする
    (BSS のゼロ埋めで DFSR=0xC09, DFAR=0x8080)。R5_0 の ATCM 0xFFE00000 / BTCM 0xFFE20000 を各 64KB 埋める
    (FSBL の XFsbl_TcmEccInit と同じ)
+
+## PL を Zephyr から動かす (CNN, 2026-10-31)
+[../kv260_cnn](../kv260_cnn) の MNIST 推論回路 (0xA0000000) を R5 から動かした。合成はしていない (既存のビットファイル)。
+
+結果 (COM14): `ID = 0xC4400001 ... AXI 疎通 OK` → 10 枚すべて答えとスコアが期待値と一致、
+**1 枚 1991 us**。Linux (A53) から動かしたときの 1.991 ms と同じ (PL 100MHz で 199,088 クロック)。
+
+```
+# ビルド (pl_axi.overlay で 0xA0000000 を MPU に入出力領域として登録する。無いとアボート)
+bash build.sh /mnt/e/fpga/kria260/kv260_zephyr/apps/cnn cnn -DDTC_OVERLAY_FILE=/mnt/e/fpga/kria260/kv260_zephyr/pl_axi.overlay
+# 起動 (PL のビットファイルと PS の後設定を渡す)
+xsdb.bat run_zephyr.tcl E:/fpga/kria260/kv260_zephyr/cnn.elf E:/fpga/kria260/kv260_cnn/vivado/cnn_mnist.runs/impl_1/design_1_wrapper.bit E:/fpga/kria260/kv260_zephyr/cnn_ps_fix.tcl
+```
+shell でたたくだけなら shell_module を同じオーバーレイ付きでビルドし `devmem 0xA0000000` (→ `0xc4400001`)。
+
+| ファイル | 役割 |
+|---|---|
+| `pl_axi.overlay` | 0xA0000000 から 64KB を MPU の入出力領域に。zynqmp_rpu は MPU の背景領域を使わないので必須 |
+| `cnn_ps_fix.tcl` | 万華鏡の psu_init との差分だけ合わせる: HPM0_FPD の幅を 32 ビットに (AFI_FS bit[9:8]=0) |
+| `apps/cnn/` | `cnn_test.c` の移植。`gen_cnn_data.py` で `sim/test_*.hex` を `src/cnn_data.h` に埋め込む |
+
+はまった所:
+- **CNN の psu_init はそのまま使えない** — Linux から PL だけ載せる前提なので UART1 が設定されていない。
+  PS は万華鏡の psu_init で初期化し、違いだけ後から書く
+- **PL クロックの値を Linux 手順から写してはいけない** — `devmem 0xFF5E00C0 0x01010A00` (/10) は CNN 設計の
+  IOPLL 1000MHz 用。万華鏡の psu_init は IOPLL 1500MHz なので /10 だと 150MHz になる (CNN は 100MHz 前提、
+  WNS 2.28ns で上限 約 130MHz)。一度これをやり、1328 us/枚で「合格」と出た。一致したのはたまたま。
+  万華鏡の値 (/15 = 100MHz) のまま触らないのが正しい。**時間が Linux 版と合うかで周波数を確かめる**
 
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる
