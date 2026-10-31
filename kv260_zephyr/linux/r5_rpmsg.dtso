@@ -1,0 +1,103 @@
+/*
+ * KV260 の PetaLinux で R5 と RPMsg をするためのデバイスツリー差分 (段2)
+ *
+ * 段1 (r5_rproc.dtso) は起動後に configfs で当てたが、メモリ予約 (reserved-memory) は
+ * 起動時にしか効かない。そこでこの差分を「今の起動 DT」に重ねた dtb を作り、
+ * U-Boot から手でその dtb を指定して起動する (SD の BOOT/uEnv.txt は変えない):
+ *
+ *   sudo cp /sys/firmware/fdt boot_now.dtb      (今 U-Boot から渡されている DT)
+ *   dtc -@ -I dts -O dtb -o r5_rpmsg.dtbo r5_rpmsg.dtso
+ *   fdtoverlay -i boot_now.dtb -o rpmsg.dtb r5_rpmsg.dtbo
+ *
+ * 足すもの:
+ *   1. reserved-memory: vring 2 本と vdev0buffer。番地は Zephyr 側 rpmsg.overlay と一致させる
+ *      (R5 からも同じ物理番地で見える)。ドライバ (xlnx_r5_remoteproc.c) はノード名で区別し、
+ *      "vdev0buffer" だけ DMA プールとして使うので shared-dma-pool を付ける
+ *   2. IPI: APU(チャネル0) ⇔ RPU0 のメールボックス。番地は段3で動いた組と同じ
+ *        local  = APU のバッファのうち RPU0 宛て  0xFF990400 (依頼) / 0xFF990420 (応答)
+ *        remote = RPU0 のバッファのうち APU 宛て 0xFF990080 (依頼) / 0xFF9900A0 (応答)
+ *        xlnx,ipi-id = 1 (相手が RPU0)
+ *   3. R5 のノード: 段1と同じものに memory-region と mboxes を足す
+ *      memory-region[0] は「動いている R5 に後から接続する」ときだけ読まれ、
+ *      印 (マジック番号) がなければ普通の未起動 (offline) 扱いになる
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/reserved-memory";
+		__overlay__ {
+			rpu0vdev0vring0: vdev0vring0@3ed00000 {
+				no-map;
+				reg = <0x0 0x3ed00000 0x0 0x4000>;
+			};
+			rpu0vdev0vring1: vdev0vring1@3ed04000 {
+				no-map;
+				reg = <0x0 0x3ed04000 0x0 0x4000>;
+			};
+			rpu0vdev0buffer: vdev0buffer@3ed40000 {
+				compatible = "shared-dma-pool";
+				no-map;
+				reg = <0x0 0x3ed40000 0x0 0x40000>;
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&zynqmp_ipi>;
+		__overlay__ {
+			ipi_mailbox_rpu0: mailbox@ff990400 {
+				reg = <0x0 0xff990400 0x0 0x20>,
+				      <0x0 0xff990420 0x0 0x20>,
+				      <0x0 0xff990080 0x0 0x20>,
+				      <0x0 0xff9900a0 0x0 0x20>;
+				reg-names = "local_request_region", "local_response_region",
+					    "remote_request_region", "remote_response_region";
+				#mbox-cells = <1>;
+				xlnx,ipi-id = <1>;
+			};
+		};
+	};
+
+	fragment@2 {
+		target-path = "/";
+		__overlay__ {
+			remoteproc@ffe00000 {
+				compatible = "xlnx,zynqmp-r5fss";
+				xlnx,cluster-mode = <0>;   /* 分割モード */
+				xlnx,tcm-mode = <0>;
+
+				#address-cells = <2>;
+				#size-cells = <2>;
+				ranges = <0x0 0x0 0x0 0xffe00000 0x0 0x10000>,
+					 <0x0 0x20000 0x0 0xffe20000 0x0 0x10000>,
+					 <0x1 0x0 0x0 0xffe90000 0x0 0x10000>,
+					 <0x1 0x20000 0x0 0xffeb0000 0x0 0x10000>;
+
+				r5f@0 {
+					compatible = "xlnx,zynqmp-r5f";
+					reg = <0x0 0x0 0x0 0x10000>, <0x0 0x20000 0x0 0x10000>;
+					reg-names = "atcm0", "btcm0";
+					power-domains = <&zynqmp_firmware 7>,
+							<&zynqmp_firmware 15>,
+							<&zynqmp_firmware 16>;
+					memory-region = <&rpu0vdev0vring0>, <&rpu0vdev0vring1>,
+							<&rpu0vdev0buffer>;
+					mboxes = <&ipi_mailbox_rpu0 0>, <&ipi_mailbox_rpu0 1>;
+					mbox-names = "tx", "rx";
+				};
+
+				/* 分割モードではドライバが子ノードを 2 つ要求する。使うのは R5_0 だけ */
+				r5f@1 {
+					compatible = "xlnx,zynqmp-r5f";
+					reg = <0x1 0x0 0x0 0x10000>, <0x1 0x20000 0x0 0x10000>;
+					reg-names = "atcm0", "btcm0";
+					power-domains = <&zynqmp_firmware 8>,
+							<&zynqmp_firmware 17>,
+							<&zynqmp_firmware 18>;
+				};
+			};
+		};
+	};
+};

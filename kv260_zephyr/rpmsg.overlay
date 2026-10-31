@@ -1,0 +1,54 @@
+/*
+ * Linux の remoteproc + RPMsg 用 (apps/rpmsg_r5)。段2
+ *
+ * 1. 置き場所を TCM に変える。ボード既定は「DDR 0 番地から 64MB」だが、0 番地付近は Linux の
+ *    メモリなので使えない。XIP の仕組みを借りて、コード (読み取り専用) を ATCM、変数を BTCM に置く
+ *      ATCM: R5_0 から見て 0x00000〜0x0FFFF (64KB)  ← 例外ベクタもここ (VINITHI=0 / LOVEC)
+ *      BTCM: R5_0 から見て 0x20000〜0x2FFFF (64KB)
+ * 2. IPI を有効にする (相手は APU。段3と同じ rpu0_apu_mailbox)
+ * 3. Linux と共有するメモリ。番地は linux/r5_rpmsg.dtso の reserved-memory と必ず一致させる
+ *      0x3ED00000  vdev0vring0  16KB  (Linux → R5)
+ *      0x3ED04000  vdev0vring1  16KB  (R5 → Linux)
+ *      0x3ED40000  vdev0buffer 256KB  (メッセージ本体)
+ *    ARMv7-R の MPU は「先頭番地が大きさの倍数」でないと黙って下位ビットを捨てるので、
+ *    vdev0buffer (zephyr,ipc_shm として自動で MPU 登録される) は 256KB 境界に置く
+ */
+#include <zephyr/dt-bindings/memory-attr/memory-attr-arm.h>
+
+/delete-node/ &sram0;
+
+&rpu0_ipi {
+	status = "okay";
+};
+
+/ {
+	chosen {
+		zephyr,flash = &atcm0;
+		zephyr,sram = &btcm0;
+		zephyr,ipc = &rpu0_apu_mailbox;
+		zephyr,ipc_shm = &vdev0buffer;
+	};
+
+	atcm0: memory@0 {
+		compatible = "mmio-sram";
+		reg = <0x0 DT_SIZE_K(64)>;
+	};
+
+	btcm0: memory@20000 {
+		compatible = "mmio-sram";
+		reg = <0x20000 DT_SIZE_K(64)>;
+	};
+
+	/* vring と vdev0buffer をまとめて 1MB、キャッシュなしで MPU に登録する */
+	rproc_shm: memory@3ed00000 {
+		compatible = "zephyr,memory-region";
+		reg = <0x3ed00000 DT_SIZE_M(1)>;
+		zephyr,memory-region = "RPROC_SHM";
+		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
+	};
+
+	vdev0buffer: memory@3ed40000 {
+		compatible = "mmio-sram";
+		reg = <0x3ed40000 DT_SIZE_K(256)>;
+	};
+};

@@ -16,6 +16,8 @@ Linux も SD カードも使わない。Zephyr はアプリと一体の `zephyr.
 | `debug_r5.tcl` | 止まったときに DFSR/DFAR と PC を読む |
 | `serlog.py` | `python serlog.py COM14 <秒> <出力>` でシリアルを記録 |
 | `shell_test.py` | `python shell_test.py COM14 <出力> [コマンド...]` で shell にコマンドを送って応答を記録 |
+| `rpmsg.overlay` + `apps/rpmsg_r5` | 段2: Linux と RPMsg で話す R5 側 (TCM 配置) |
+| `linux/r5_rpmsg.dtso` / `linux/rpmsg_rtt.py` | 段2: 起動 DT に足す差分 / 往復時間の測定 |
 
 `psu_init_nousb.tcl` と `*.elf` はリポジトリに入れない (下の手順で作る)。
 
@@ -171,7 +173,82 @@ echo stop  | sudo tee $R/state
   sudoers.d は名前順に読まれ後が勝つので、`99-petalinux` / `dou` より後ろの名前にする必要があった。
   戻すときは `sudo rm /etc/sudoers.d/zz-nopw`
 
-段2 (RPMsg で Linux と通信) は、共有メモリの予約を起動時のデバイスツリーに入れる必要がある (未着手)。
+## Linux と R5 の Zephyr が RPMsg で話す (段2, apps/rpmsg_r5, 2026-10-31)
+Linux の `/dev/rpmsg0` に書いた文字列を、R5 の Zephyr が `"R5: "` を付けて送り返す。
+2000 往復で不一致 0。往復 (Python から 1000 回、中央値) は 32 バイトで 357us、400 バイトで 786us。
+
+```
+Linux (A53)                                  R5_0 (Zephyr, apps/rpmsg_r5)
+  remoteproc が elf を TCM に書き、
+  リソーステーブルに vring の番地を書いて起動
+                                             vring を作り「rpmsg-raw」を名乗る
+  rpmsg_char が /dev/rpmsg0 を作る     <──  (名前の通知)
+  /dev/rpmsg0 に書く  ── vring + IPI ──>     受信コールバック → "R5: " を付けて送り返す
+  /dev/rpmsg0 を読む  <── vring + IPI ──
+```
+
+段1との違いは 2 つ。
+
+**1. メモリ予約を起動時のデバイスツリーに入れる。** 予約は起動後のオーバーレイでは効かないので、
+今の起動 DT に `linux/r5_rpmsg.dtso` (予約 3 つ + IPI のメールボックス + R5 のノード) を重ねた
+`rpmsg.dtb` を作り、U-Boot から手で指定して起動する。いまの起動は uEnv.txt の
+`fatload Image; booti 0x200000 - ${fdtcontroladdr}` (image.ub は使っていない) なので、dtb の番地だけ差し替えればよい。
+**SD の BOOT/uEnv.txt/U-Boot は変えない** (普通に電源を入れれば元の起動)。
+
+| 番地 | 大きさ | 用途 |
+|---|---|---|
+| 0x3ED00000 | 16KB | vdev0vring0 (Linux → R5) |
+| 0x3ED04000 | 16KB | vdev0vring1 (R5 → Linux) |
+| 0x3ED40000 | 256KB | vdev0buffer (メッセージ本体、shared-dma-pool) |
+| 0xFF990400/420 ⇔ 0xFF990080/0A0 | | IPI: APU(ch0) ⇔ RPU0 (xlnx,ipi-id = 1。段3と同じバッファ) |
+
+**2. Zephyr を TCM に収める。** 公式サンプル `openamp_rsc_table` のままだと 83KB で ATCM (64KB) を超え、
+ボード既定の置き場所「DDR 0 番地から」は Linux のメモリと重なる。shell を外して小さくし、
+XIP の仕組みでコード 33KB を ATCM (0x0)、変数 7KB を BTCM (0x20000) に分けた (`rpmsg.overlay`)。
+
+```
+# ビルド (WSL)
+bash build.sh /mnt/e/fpga/kria260/kv260_zephyr/apps/rpmsg_r5 rpmsg_r5 \
+     -DDTC_OVERLAY_FILE=/mnt/e/fpga/kria260/kv260_zephyr/rpmsg.overlay
+# PC → KV260
+scp linux/r5_rpmsg.dtso linux/rpmsg_rtt.py rpmsg_r5.elf petalinux@192.168.0.8:~/
+# KV260 (一度だけ。普通に起動した Linux で)
+sudo cp /sys/firmware/fdt boot_now.dtb && sudo chown petalinux boot_now.dtb
+dtc -@ -I dts -O dtb -o r5_rpmsg.dtbo r5_rpmsg.dtso
+fdtoverlay -i boot_now.dtb -o rpmsg.dtb r5_rpmsg.dtbo
+sudo cp rpmsg_r5.elf /lib/firmware/
+```
+起動 (毎回。Tera Term で `sudo reboot` → `Hit any key to stop autoboot` でキーを押し `ZynqMP>` で):
+```
+mmc list                                   # mmc@ff170000: 1 → SD は 1 番
+ext4load mmc 1:2 0x100000 /home/petalinux/rpmsg.dtb
+fatload mmc 1:1 0x200000 Image
+setenv bootargs earlycon console=ttyPS1,115200 root=/dev/mmcblk1p2 rw rootwait cma=256M mem=1536M
+booti 0x200000 - 0x100000
+```
+Linux が上がったら:
+```
+sudo modprobe rpmsg_char
+R=/sys/class/remoteproc/remoteproc1          # ffe00000.r5f = R5_0
+echo rpmsg_r5.elf | sudo tee $R/firmware
+echo start | sudo tee $R/state               # dmesg: creating channel rpmsg-raw addr 0x400 → /dev/rpmsg0
+sudo python3 rpmsg_rtt.py 1000 32            # 1000 往復 / 32 バイト / 不一致 0 / 中央 357 us
+```
+起動直後の dmesg で `reserved mem: ... vdev0vring0@3ed00000` と
+`zynqmp-ipi-mbox mailbox@ff990400: Registered` が出ていれば dtb が効いている。
+
+はまった所・理由:
+- **リソーステーブルの置き場所** — XIP にすると `.resource_table` が ATCM (R5 からは読み取り専用) に置かれる。
+  Linux がここに vring の番地を書き、R5 側も状態を書き戻すことがあるので、`rsc_table.ld` で BTCM に置き直した。
+  その際「置き場所 = 読み込み先」にして、起動時の ROM→RAM コピーの対象から外す (コピーされると Linux が書いた内容が消える)
+- **MPU の境界** — ARMv7-R の MPU は先頭番地が大きさの倍数でないと黙って下位ビットを捨てる。
+  `zephyr,ipc_shm` (vdev0buffer) は Zephyr が自動で MPU 登録するので 256KB 境界 (0x3ED40000) に置いた
+- **UART の表示が遅さの原因** — 受信ごとに 1 行 (約 30 文字) 表示すると 115200bps で約 2.6ms かかり、
+  往復の中央値が 2679us になった。最初の 3 通と 1000 通ごとだけにして 357us
+- ドライバ (`xlnx_r5_remoteproc.c`, 6.12) は memory-region をノード名で区別し、`vdev0buffer` だけを DMA プールにする
+  (`shared-dma-pool` 必須)。memory-region[0] は動作中の R5 へ後から接続 (attach) するときだけ読まれる
+- R5_1 に memory-region を付けていないので `ffe90000.r5f: failed to get memory region dev node` が出るが、使わないので無害
+- Linux に `rpmsg_tty` は無い (`rpmsg_char` はモジュール)。なので名前を `rpmsg-raw` にして `/dev/rpmsgN` で読み書きする
 
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる
