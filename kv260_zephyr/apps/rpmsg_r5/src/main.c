@@ -35,6 +35,7 @@
 #define EPT_NAME "rpmsg-raw"   /* Linux の rpmsg_char がこの名前で /dev/rpmsgN を作る */
 
 int cnn_rpmsg_init(struct rpmsg_device *rpdev);   /* cnn_rpmsg.c */
+int audio_rpmsg_init(struct rpmsg_device *rpdev); /* audio_rpmsg.c */
 
 static const struct device *const ipm = DEVICE_DT_GET(DT_CHOSEN(zephyr_ipc));
 
@@ -171,6 +172,10 @@ int main(void)
 	/* PL の CNN の窓口 (番号 0x410。cnn_rpmsg.c)。PL には依頼が来るまで触らない */
 	ret = cnn_rpmsg_init(rpdev);
 	printk("[R5] CNN 窓口 (0x410) %s\n", ret ? "作成失敗" : "作成");
+
+	/* PL の音声 FIFO の窓口 (番号 0x420。audio_rpmsg.c)。再生の命令が来るまで PL には触らない */
+	ret = audio_rpmsg_init(rpdev);
+	printk("[R5] 音声 窓口 (0x420) %s\n", ret ? "作成失敗" : "作成");
 
 	/* IPI が来るたびに vring を見る。受信コールバックはこの中から呼ばれる */
 	for (;;) {

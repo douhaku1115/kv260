@@ -59,6 +59,17 @@
 		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_IO)>;
 	};
 
+	/* PL 専用 DDR (Linux の起動引数 mem=1536M で Linux 管理外にした 0x60000000〜、512MB)。
+	 * 音声 (audio_rpmsg.c) は Linux がここに置いた音源を読んで PL の FIFO に書く。
+	 * Linux は /dev/mem (O_SYNC = キャッシュなし) で書くので、R5 もキャッシュなしで読む
+	 */
+	pl_ddr: memory@60000000 {
+		compatible = "zephyr,memory-region";
+		reg = <0x60000000 DT_SIZE_M(512)>;
+		zephyr,memory-region = "PL_DDR";
+		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
+	};
+
 	vdev0buffer: memory@3ed40000 {
 		compatible = "mmio-sram";
 		reg = <0x3ed40000 DT_SIZE_K(256)>;

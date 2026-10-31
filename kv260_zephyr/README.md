@@ -21,6 +21,7 @@ Linux も SD カードも使わない。Zephyr はアプリと一体の `zephyr.
 | `linux/uEnv_rpmsg.txt` / `linux/r5_start.sh` / `linux/r5-rpmsg.service` | 段2: 電源投入だけで rpmsg.dtb 起動 + R5 自動起動 |
 | `linux/r5_shell.sh` / `linux/r5_term.py` | 段2: R5 の shell に Linux からつなぐ |
 | `apps/rpmsg_r5/src/cnn_rpmsg.c` / `linux/cnn_rpmsg.py` | 段2: Linux から RPMsg で PL の CNN 推論を頼む |
+| `apps/rpmsg_r5/src/audio_rpmsg.c` / `linux/r5play.py` | 段2: R5 が PL の音声 FIFO を 5ms ごとに満たす (Linux は指示だけ) |
 
 `psu_init_nousb.tcl` と `*.elf` はリポジトリに入れない (下の手順で作る)。
 
@@ -350,6 +351,47 @@ sudo /usr/local/bin/r5_shell.sh "cnn stats"
   `zynqmp_ipi_mailbox.tx_poll_period=1` (組み込みドライバなので起動時に指定) で直った。エコーは通知 1 回なので当たらない
 - PL への窓口の幅 (AFI_FS 0xFD615000) は Linux では 128 ビット (0xA00)。CNN は 32 ビットで作ってあるが、32 ビット (0x800) に
   しても画素の時間は変わらなかった (原因ではない)。音楽プロジェクトの「AXI のレジスタは 0x10 刻みでないと読めない」はおそらくこの食い違い
+
+## R5 で音声を途切れず流す (段2の続き, 2026-11-01)
+
+R5 を「時間に正確な処理」の担当にする。音楽プロジェクト (`kv260_i2s2`) の stream 設計の PL を使い、
+**R5 が 5ms ごとに FIFO の残量を見て、空いた分を DDR から書き足す**。Linux は音源を DDR に置いて指示を出すだけ。
+段5 の `play.c` は Linux が自分で FIFO を満たしていたので、Linux が忙しいと切れるおそれがあった。
+
+```
+Linux (linux/r5play.py)                R5 (apps/rpmsg_r5/src/audio_rpmsg.c)        PL (kv260_i2s2 stream 設計)
+  音源を /dev/mem で 0x60000000 に置く
+  「再生 番地 長さ」 ── RPMsg 0x420 ──> 5ms ごと (k_timer、優先度 2 のスレッド) ──> 0x00 DATA → FIFO 8192 段
+  音量・エコー・停止・状態  <────────>   残量を読み (0x10)、空き分を DDR から書く       → 音量・エコー → I2S → DAC
+```
+
+- PL 専用 DDR (0x60000000〜512MB、起動引数 `mem=1536M` で Linux 管理外) を `rpmsg.overlay` の `pl_ddr` で
+  キャッシュなしとして MPU に登録。Linux は `/dev/mem` を O_SYNC (キャッシュなし) で書くので食い違わない
+- 音源の並びは `play.c` / `dmaplay` と同じ生 PCM。1 語 = 1 組をそのまま渡す
+- 空の PL に触らないよう、再生の命令が来るまで PL を読まない。来たら 0x00 が 0xDEADBEEF かを確かめる
+- 止めるときは書き足しをやめ、FIFO を鳴らし切ってから CTRL を 0 にする (FIFO を空にするレジスタがないので、
+  次の再生に前の曲の残りが混ざらないように)
+- 命令と返事の形は `audio_rpmsg.c` の冒頭。shell では `audio stats`
+
+### 使い方 (KV260)
+
+```bash
+sudo fpgautil -b ~/stream.bit                 # kv260_i2s2/vivado_stream/.../design_1_wrapper.bit と同じもの
+sudo devmem 0xFF5E00C0 32 0x01010A00          # PL のクロック
+sudo python3 ~/r5play.py ~/song.raw           # +/- 音量  e エコー  r 統計を消す  q 停止
+sudo python3 ~/r5play.py ~/song.raw 30        # 30 秒鳴らして統計を出す (SSH から測る用)
+```
+
+### 実測
+
+| 状態 | 最小残量 (8192 段中) | 空になった回数 | 1 回の書き足し最長 |
+|---|---|---|---|
+| 普段 (20 秒、見回り 3999 回) | 7898 | 0 | 378 us |
+| 重い負荷 (30 秒。`yes` 8 本 + `dd` で SD に 2GB 書き込み。CPU 空き 0%、平均負荷 4.5) | 7898 | 0 | 378 us |
+
+- FIFO の減りは最大 294 段 (約 6ms 分) で、Linux の負荷にまったく左右されない。書き足しは 5ms のうち最長 378us (約 8%)
+- 音源 314MB を DDR に置くのは 1 回目 19.7 秒 (2 回目以降はファイルがキャッシュに乗って 0.8 秒)
+- 実機で正しい速さで鳴ることを耳で確認
 
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる
