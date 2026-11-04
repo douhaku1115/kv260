@@ -19,6 +19,8 @@
 //     cmd 3 = 音量 a (64 で等倍)   cmd 4 = エコー a (0 で無し)
 //     cmd 5 = 状態を返すだけ       cmd 6 = 統計を消す
 //     cmd 7 = 書き足しの上限 a 段 (1〜8192。既定 8192)。FIFO を浅く使い、遅延の小さい再生を真似る試験用
+//     cmd 8〜12 = シンセ (R5 が音を作る。synth.c)。8 開始/停止 9 音符 10 波形 11 楽譜に足す 12 楽譜の演奏/消去
+//       中身は do_cmd() の各 case のコメント。返事の後ろにシンセの統計が付く (struct aud_res)
 //   返事 (どの命令にも 1 通)  u32 magic = 0x52445541 ("AUDR")  u32 status (0=正常 1=PLが音声設計でない 2=形式違い)
 //     u32 playing  u32 pos (送ったバイト数)  u32 len  u32 level (今の残量)  u32 min_level  u32 n_empty
 //     u32 n_tick  u32 fill_max_us (1 回の書き足しに掛かった最長時間)
@@ -30,6 +32,9 @@
 #include <zephyr/sys/sys_io.h>
 
 #include <openamp/open_amp.h>
+#include <string.h>
+
+#include "synth.h"
 
 #define AUD_EPT_ADDR 0x420
 
@@ -49,6 +54,7 @@
 #define MAGIC_RES 0x52445541u   /* "AUDR" */
 
 #define PERIOD_MS 5
+#define SYNTH_PERIOD_MS 1   /* シンセは FIFO を浅く使う (既定の上限は Linux 側で 256 段) ので 1ms ごと */
 
 struct aud_cmd {
 	uint32_t magic, cmd, a, b;
@@ -56,6 +62,8 @@ struct aud_cmd {
 
 struct aud_res {
 	uint32_t magic, status, playing, pos, len, level, min_level, n_empty, n_tick, fill_max_us;
+	/* シンセ (synth.c) */
+	uint32_t synth_on, n_notes, n_lat, lat_max_us, lat_avg_us, active, score_run;
 } __packed;
 
 static struct rpmsg_endpoint aud_ept;
@@ -67,6 +75,8 @@ static bool playing;    /* 書き足し中 */
 static bool draining;   /* 停止命令の後、FIFO を鳴らし切るのを待っている */
 static bool pl_used;    /* 一度でも PL を確かめた (それまで PL に触らない) */
 static uint32_t limit = FIFO_DEPTH;   /* 残量をここまでしか満たさない (cmd 7) */
+static bool synth_on;   /* シンセで音を作っている (synth.c) */
+static bool primed;     /* シンセで 1 回満たした (それまでは空でも数えない) */
 
 /* 統計 */
 static uint32_t level_now, min_level = FIFO_DEPTH, n_empty, n_tick;
@@ -135,6 +145,23 @@ static void audio_thread(void *p1, void *p2, void *p3)
 				playing = false;
 				draining = true;
 			}
+		} else if (synth_on) {
+			/* シンセ: 1ms ごとに、上限まで足りない分の標本を作って書く */
+			uint32_t st = sys_read32(REG_STATUS);
+
+			level_now = (st >> 16) & 0x3FFF;
+			n_tick++;
+			if (primed) {   /* 出だしは空から始まるので、1 回満たしてから数える */
+				min_level = MIN(min_level, level_now);
+				if (st & 0x2) {
+					n_empty++;
+				}
+			}
+			uint32_t c0 = k_cycle_get_32();
+
+			synth_render(level_now < limit ? limit - level_now : 0, level_now);
+			fill_max_cyc = MAX(fill_max_cyc, k_cycle_get_32() - c0);
+			primed = true;
 		} else if (draining) {
 			uint32_t st = sys_read32(REG_STATUS);
 
@@ -152,23 +179,23 @@ K_THREAD_DEFINE(audio_tid, 1024, audio_thread, NULL, NULL, NULL, 2, 0, 0);
 
 static int do_cmd(const struct aud_cmd *c)
 {
-	if (!pl_used || c->cmd == 1) {
-		if (c->cmd >= 5) {
-			/* 状態・統計・上限は PL に触らない (cmd 7 の範囲は下の switch で見る) */
-			goto no_pl;
-		}
+	/* PL に触る命令 (1〜4 と 8) の前に、PL が音声設計かを確かめる。
+	 * 再生とシンセの開始 (1, 8) は毎回、ほかは最初の 1 回だけ。5〜7, 9〜12 は PL に触らない
+	 */
+	bool start = c->cmd == 1 || (c->cmd == 8 && c->a);
+
+	if (start || (!pl_used && c->cmd >= 2 && c->cmd <= 4)) {
 		if (sys_read32(REG_DATA) != AUD_ID) {
 			return 1;
 		}
 		pl_used = true;
 	}
-no_pl:
 	switch (c->cmd) {
 	case 1:
 		if (c->a < DDR_LO || c->b == 0 || (c->a | c->b) & 3 || c->b > DDR_HI - c->a) {
 			return 2;
 		}
-		if (playing || draining) {
+		if (playing || draining || synth_on) {
 			return 2;   /* 再生中 (先に止める) */
 		}
 		src_addr = c->a;
@@ -206,6 +233,43 @@ no_pl:
 	case 6:
 		reset_stats();
 		return 0;
+	case 8:   /* シンセ a=1 開始 / a=0 停止 */
+		if (c->a) {
+			if (playing || draining || synth_on) {
+				return 2;
+			}
+			reset_stats();
+			memset(&synth_st, 0, sizeof(synth_st));
+			primed = false;
+			synth_on = true;
+			sys_write32(1, REG_CTRL);
+			k_timer_start(&tick_timer, K_MSEC(SYNTH_PERIOD_MS), K_MSEC(SYNTH_PERIOD_MS));
+		} else if (synth_on) {
+			synth_on = false;
+			draining = true;   /* 残りを鳴らし切ってから止める (再生と同じ) */
+		}
+		return 0;
+	case 9:   /* 音符 a = 音の高さ (MIDI 番号、60 = ド)  b = 長さ ms | 強さ (0〜127) << 16 */
+		if (!synth_on) {
+			return 2;
+		}
+		synth_note(c->a & 0x7F, c->b & 0xFFFF, (c->b >> 16) & 0x7F);
+		return 0;
+	case 10:  /* 波形 a = 0 正弦 1 矩形 2 のこぎり 3 三角 */
+		synth_wave(c->a);
+		return 0;
+	case 11:  /* 楽譜に 1 音足す a = 時刻 ms  b = 高さ | 強さ << 8 | 長さ ms << 16 */
+		return synth_score_add(c->a, c->b & 0x7F, c->b >> 16, (c->b >> 8) & 0x7F) ? 2 : 0;
+	case 12:  /* 楽譜 a=1 演奏開始 / a=0 消す */
+		if (c->a) {
+			if (!synth_on) {
+				return 2;
+			}
+			synth_score_start();
+		} else {
+			synth_score_clear();
+		}
+		return 0;
 	default:
 		return 2;
 	}
@@ -230,6 +294,13 @@ static int aud_cb(struct rpmsg_endpoint *e, void *data, size_t len, uint32_t src
 	r.n_empty = n_empty;
 	r.n_tick = n_tick;
 	r.fill_max_us = cyc_to_us(fill_max_cyc);
+	r.synth_on = synth_on;
+	r.n_notes = synth_st.n_notes;
+	r.n_lat = synth_st.n_lat;
+	r.lat_max_us = synth_st.lat_max_us;
+	r.lat_avg_us = synth_st.n_lat ? (uint32_t)(synth_st.lat_sum_us / synth_st.n_lat) : 0;
+	r.active = synth_active();
+	r.score_run = synth_score_running();
 	k_mutex_unlock(&lock);
 	rpmsg_send(e, &r, sizeof(r));
 	return RPMSG_SUCCESS;
@@ -237,6 +308,7 @@ static int aud_cb(struct rpmsg_endpoint *e, void *data, size_t len, uint32_t src
 
 int audio_rpmsg_init(struct rpmsg_device *rpdev)
 {
+	synth_init();
 	return rpmsg_create_ept(&aud_ept, rpdev, "rpmsg-raw", AUD_EPT_ADDR, RPMSG_ADDR_ANY, aud_cb,
 				NULL);
 }
