@@ -18,6 +18,7 @@
 //     cmd 2 = 停止 (FIFO に残った分を鳴らし切ってから止める)
 //     cmd 3 = 音量 a (64 で等倍)   cmd 4 = エコー a (0 で無し)
 //     cmd 5 = 状態を返すだけ       cmd 6 = 統計を消す
+//     cmd 7 = 書き足しの上限 a 段 (1〜8192。既定 8192)。FIFO を浅く使い、遅延の小さい再生を真似る試験用
 //   返事 (どの命令にも 1 通)  u32 magic = 0x52445541 ("AUDR")  u32 status (0=正常 1=PLが音声設計でない 2=形式違い)
 //     u32 playing  u32 pos (送ったバイト数)  u32 len  u32 level (今の残量)  u32 min_level  u32 n_empty
 //     u32 n_tick  u32 fill_max_us (1 回の書き足しに掛かった最長時間)
@@ -65,6 +66,7 @@ static uint32_t src_addr, src_len, src_pos;   /* DDR の番地・長さ・送り
 static bool playing;    /* 書き足し中 */
 static bool draining;   /* 停止命令の後、FIFO を鳴らし切るのを待っている */
 static bool pl_used;    /* 一度でも PL を確かめた (それまで PL に触らない) */
+static uint32_t limit = FIFO_DEPTH;   /* 残量をここまでしか満たさない (cmd 7) */
 
 /* 統計 */
 static uint32_t level_now, min_level = FIFO_DEPTH, n_empty, n_tick;
@@ -96,7 +98,7 @@ static uint32_t fill(void)
 {
 	uint32_t st = sys_read32(REG_STATUS);
 	uint32_t level = (st >> 16) & 0x3FFF;
-	uint32_t room = FIFO_DEPTH - level;
+	uint32_t room = level < limit ? limit - level : 0;
 	uint32_t left = (src_len - src_pos) / 4;
 	uint32_t n = MIN(room, left);
 	uint32_t a = src_addr + src_pos;
@@ -151,14 +153,16 @@ K_THREAD_DEFINE(audio_tid, 1024, audio_thread, NULL, NULL, NULL, 2, 0, 0);
 static int do_cmd(const struct aud_cmd *c)
 {
 	if (!pl_used || c->cmd == 1) {
-		if (c->cmd == 5 || c->cmd == 6) {
-			return 0;   /* 状態を見るだけなら PL に触らない */
+		if (c->cmd >= 5) {
+			/* 状態・統計・上限は PL に触らない (cmd 7 の範囲は下の switch で見る) */
+			goto no_pl;
 		}
 		if (sys_read32(REG_DATA) != AUD_ID) {
 			return 1;
 		}
 		pl_used = true;
 	}
+no_pl:
 	switch (c->cmd) {
 	case 1:
 		if (c->a < DDR_LO || c->b == 0 || (c->a | c->b) & 3 || c->b > DDR_HI - c->a) {
@@ -192,6 +196,12 @@ static int do_cmd(const struct aud_cmd *c)
 		sys_write32(c->a & 0xFF, REG_ECHO);
 		return 0;
 	case 5:
+		return 0;
+	case 7:
+		if (c->a == 0 || c->a > FIFO_DEPTH) {
+			return 2;
+		}
+		limit = c->a;
 		return 0;
 	case 6:
 		reset_stats();

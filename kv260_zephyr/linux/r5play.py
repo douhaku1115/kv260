@@ -2,6 +2,7 @@
 # R5 に音を流させる (Linux は音源を DDR に置いて指示するだけ)。apps/rpmsg_r5/src/audio_rpmsg.c と対
 #   sudo python3 r5play.py song.raw            キー操作で再生 (+/- 音量、e エコー、q 停止)
 #   sudo python3 r5play.py song.raw 秒数       その秒数だけ鳴らして統計を出す (SSH からの実測用)
+#   sudo python3 r5play.py song.raw 秒数 512   残量を 512 段 (約 10ms 分) までしか満たさない
 #   sudo python3 r5play.py --stop              止める
 #
 # 先に PL (kv260_i2s2 の stream 設計) を書いてクロックを入れておく:
@@ -82,6 +83,10 @@ os.close(mfd)
 print(f"{path}: {size} バイト ({size / 4 / RATE:.0f} 秒分) を {DDR_PHYS:#x} に置いた "
       f"({time.perf_counter() - t0:.1f} 秒)")
 
+limit = int(sys.argv[3]) if len(sys.argv) > 3 else 8192   # 書き足しの上限 (段)。浅く使う試験用
+if cmd(7, limit)["status"] != 0:
+    sys.exit(f"上限 {limit} は範囲外 (1〜8192)")
+print(f"上限 {limit} 段")
 r = cmd(1, DDR_PHYS, size)
 if r["status"] != 0:
     sys.exit(f"再生できない: {STATUS_TXT.get(r['status'], r['status'])}")
