@@ -1,11 +1,16 @@
 #!/bin/sh
 # R5 の Zephyr の shell (RPMsg、名前 rpmsg-raw・番号 0x440) に Linux からつなぐ
+#   sudo r5_shell.sh -1 ...               最初に -1 を付けると R5_1 (2 コア目) の shell (番号 0x441)
 #   sudo r5_shell.sh                      対話。抜けるときは Ctrl+] (Ctrl+C は R5 の shell に届く)
 #   sudo r5_shell.sh "kernel version" ... コマンドを順に送って応答を表示 (確認用)
 #
 # rpmsg-raw のチャネルは 2 本ある (0x400 = エコー、0x440 = shell)。どちらも /dev/rpmsgN になるので、
 # sysfs の親デバイス名 (virtio0.rpmsg-raw.-1.1088 = 0x440) で shell の方を探す
 ADDR=1088   # 0x440 (R5 側で使える番号は 0x400〜0x47F)
+if [ "$1" = "-1" ]; then
+	ADDR=1089   # 0x441 = R5_1
+	shift
+fi
 
 DEV=
 for d in /sys/class/rpmsg/rpmsg[0-9]*; do
@@ -15,7 +20,7 @@ for d in /sys/class/rpmsg/rpmsg[0-9]*; do
 	esac
 done
 if [ -z "$DEV" ]; then
-	echo "r5_shell: shell のチャネル (rpmsg-raw, 0x440) がない。R5 は動いている? (r5_start.sh)"
+	echo "r5_shell: shell のチャネル (rpmsg-raw, 番号 $ADDR) がない。R5 は動いている? (r5_start.sh)"
 	exit 1
 fi
 

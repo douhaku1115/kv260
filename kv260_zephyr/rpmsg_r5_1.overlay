@@ -1,0 +1,66 @@
+/*
+ * R5_1 (2 コア目) 用。Linux の remoteproc + RPMsg (apps/rpmsg_r5_1)
+ *
+ * rpmsg.overlay (R5_0) との違い:
+ *   - TCM は R5_1 自身から見ると R5_0 と同じ番地 (ATCM 0x0、BTCM 0x20000)。Linux からは
+ *     0xFFE90000 / 0xFFEB0000 に見え、remoteproc がそこへ書く
+ *   - IPI は RPU1 用 (0xFF320000、割り込み 34)。相手は APU (rpu1_apu_mailbox)
+ *   - Linux と共有するメモリは R5_0 の 1MB 後ろ。linux/r5_rpmsg.dtso の rpu1 の予約と一致させる
+ *       0x3EE00000 vring0 16KB / 0x3EE04000 vring1 16KB / 0x3EE40000 vdev0buffer 256KB
+ *   - タイマーは TTC1 (R5_0 が TTC0 を使う。Linux は TTC1 を使っていない)
+ *   - UART1 は使わない。Zephyr の UART ドライバは初期化で UART1 の割り込みを全部止め、
+ *     Linux のコンソール入力が死ぬため。やりとりは RPMsg だけ
+ */
+#include <zephyr/dt-bindings/memory-attr/memory-attr-arm.h>
+
+/delete-node/ &sram0;
+
+&rpu1_ipi {
+	status = "okay";
+};
+
+&ttc0 {
+	status = "disabled";
+};
+
+&ttc1 {
+	status = "okay";
+	clock-frequency = <100000000>;
+};
+
+&uart1 {
+	status = "disabled";
+};
+
+/ {
+	chosen {
+		/delete-property/ zephyr,console;
+		/delete-property/ zephyr,shell-uart;
+		zephyr,flash = &atcm0;
+		zephyr,sram = &btcm0;
+		zephyr,ipc = &rpu1_apu_mailbox;
+		zephyr,ipc_shm = &vdev0buffer;
+	};
+
+	atcm0: memory@0 {
+		compatible = "mmio-sram";
+		reg = <0x0 DT_SIZE_K(64)>;
+	};
+
+	btcm0: memory@20000 {
+		compatible = "mmio-sram";
+		reg = <0x20000 DT_SIZE_K(64)>;
+	};
+
+	rproc_shm: memory@3ee00000 {
+		compatible = "zephyr,memory-region";
+		reg = <0x3ee00000 DT_SIZE_M(1)>;
+		zephyr,memory-region = "RPROC_SHM";
+		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
+	};
+
+	vdev0buffer: memory@3ee40000 {
+		compatible = "mmio-sram";
+		reg = <0x3ee40000 DT_SIZE_K(256)>;
+	};
+};

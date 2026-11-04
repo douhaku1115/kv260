@@ -24,6 +24,7 @@ Linux も SD カードも使わない。Zephyr はアプリと一体の `zephyr.
 | `apps/rpmsg_r5/src/audio_rpmsg.c` / `linux/r5play.py` | 段2: R5 が PL の音声 FIFO を 5ms ごとに満たす (Linux は指示だけ) |
 | `linux/linplay.c` / `linux/audio_cmp.sh` | 段2: 比較用。Linux だけで FIFO を満たす場合と R5 の場合を測る |
 | `apps/rpmsg_r5/src/synth.c` / `linux/r5synth.py` / `linux/synth_cmp.sh` | 段2: R5 で音を作る (8 音シンセ + 楽譜演奏) |
+| `rpmsg_r5_1.overlay` + `apps/rpmsg_r5_1` / `linux/r5_1_calc.py` / `linux/core_cmp.sh` | 段2: R5_1 (2 コア目) で重い計算。R5_0 の音が乱れないかを測る |
 
 `psu_init_nousb.tcl` と `*.elf` はリポジトリに入れない (下の手順で作る)。
 
@@ -457,6 +458,61 @@ sh ~/synth_cmp.sh 128                   # 普段と重い負荷 (audio_cmp.sh �
 - 遅れはほぼ FIFO の上限の分だけ。負荷をかけても変わらない
 - 処理時間の大半は PL への書き込み (1 語 約 1.3us、12.5MHz の AXI)。波形の計算は軽い
 - きらきら星は正しい高さとテンポで鳴ることを耳で確認
+
+## R5_1 (2 コア目) も Linux から動かす (2026-11-04)
+
+R5_0 は音・CNN など PL を使う時間に正確な仕事、**R5_1 は重い計算**を受け持つ。どちらも電源投入で自動起動。
+
+```
+Linux ── virtio0 (IPI ch1, 0x3ED00000〜) ── R5_0 (apps/rpmsg_r5)   0x400 エコー 0x440 shell 0x410 CNN 0x420 音
+      └─ virtio1 (IPI ch2, 0x3EE00000〜) ── R5_1 (apps/rpmsg_r5_1) 0x401 エコー 0x441 shell 0x450 計算
+```
+
+### 2 つの Zephyr でぶつかる所
+
+- **割り込みコントローラ (GIC) は 2 コアで共用**。普通の Zephyr は初期化で全部の割り込みの行き先を自分にするので、
+  R5_1 が自分のタイマー割り込みを有効にすると行き先が両方になり、R5_0 に知らない割り込みが届いて止まる。
+  → 両方とも `CONFIG_GIC_SAFE_CONFIG=y`。行き先を最初は空にし、先に起動した側だけが初期化、各自が自分の割り込みだけを足す
+- **タイマー**: R5_0 は TTC0、R5_1 は TTC1 (`rpmsg_r5_1.overlay`)。Linux は TTC1 を使っていない (DT で disabled)
+- **UART1**: R5_1 は使わない (Zephyr の UART ドライバが初期化で Linux のコンソール入力を止めるため)。表示は shell (RPMsg) だけ
+- TCM は R5_1 自身からも 0x0 / 0x20000 に見えるので、リンカは R5_0 と同じもの (`apps/rpmsg_r5/linker.ld` を共用)。
+  Linux からは 0xFFE90000 / 0xFFEB0000
+- IPI: R5_1 は RPU1 (0xFF320000、割り込み 34) の `rpu1_apu_mailbox`。Linux 側は mailbox@ff990440 (`xlnx,ipi-id = <2>`)
+- 窓口の番号は R5_0 と重ならないようにする (Linux のスクリプトは番号で /dev/rpmsgN を探すため)
+
+### 入れ方 (KV260)
+
+```bash
+# r5_rpmsg.dtso に R5_1 の分 (予約 3 つ・IPI・r5f@1 の memory-region と mboxes) を足して作り直し、再起動
+dtc -@ -I dts -O dtb -o r5_rpmsg.dtbo r5_rpmsg.dtso
+sudo cat boot_now.dtb > /tmp/base.dtb
+fdtoverlay -i /tmp/base.dtb -o rpmsg.dtb r5_rpmsg.dtbo
+sudo cp rpmsg_r5.elf rpmsg_r5_1.elf /lib/firmware/
+sudo cp r5_start.sh r5_shell.sh /usr/local/bin/
+sudo systemctl reboot
+```
+
+### 使い方と実測
+
+```bash
+sudo python3 rpmsg_rtt.py 1000 32 1        # R5_1 のエコー (最後の 1 = R5_1)
+sudo python3 r5_1_calc.py 200000           # R5_1 に計算を頼む (20 万以下の素数を割り算で数える)
+sudo /usr/local/bin/r5_shell.sh -1         # R5_1 の shell (r51 stats)
+sh core_cmp.sh 128                         # R5_1 が計算し続ける間の R5_0 のシンセを測る (PL は stream.bit)
+```
+
+- エコー往復 (1000 回、32 バイト): R5_0 中央 62us / R5_1 中央 61us
+- R5_1 の計算: 20 万以下の素数 17984 個、1 回 134.5ms
+- R5_0 のシンセ (上限 128 段、30 秒、0.1 秒ごとに 1 音):
+
+| 状態 | 遅れ 平均 / 最長 | 最小残量 | 空 | R5_1 の計算 1 回 |
+|---|---|---|---|---|
+| シンセだけ | 2.11 / 2.54 ms | 78 | 0 | |
+| R5_1 が計算し続ける間 (99.9%) | 2.09 / 2.56 ms | 78 | 0 | 134.5 ms |
+| 上 + Linux に重い負荷 | 2.09 / 2.56 ms | 78 | 0 | 134.5 ms |
+
+- R5_1 が 100% 動いても、Linux が重くても、R5_0 の音は変わらない。R5_1 の計算時間も Linux の負荷に左右されない
+- GIC の設定を変えた R5_0 で CNN も再確認 (1000 枚不一致 0、往復中央 2397us)
 
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる

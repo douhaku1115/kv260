@@ -41,6 +41,20 @@
 				no-map;
 				reg = <0x0 0x3ed40000 0x0 0x40000>;
 			};
+			/* R5_1 (2 コア目) の分。R5_0 の 1MB 後ろ。rpmsg_r5_1.overlay と一致させる */
+			rpu1vdev0vring0: vdev0vring0@3ee00000 {
+				no-map;
+				reg = <0x0 0x3ee00000 0x0 0x4000>;
+			};
+			rpu1vdev0vring1: vdev0vring1@3ee04000 {
+				no-map;
+				reg = <0x0 0x3ee04000 0x0 0x4000>;
+			};
+			rpu1vdev0buffer: vdev0buffer@3ee40000 {
+				compatible = "shared-dma-pool";
+				no-map;
+				reg = <0x0 0x3ee40000 0x0 0x40000>;
+			};
 		};
 	};
 
@@ -56,6 +70,20 @@
 					    "remote_request_region", "remote_response_region";
 				#mbox-cells = <1>;
 				xlnx,ipi-id = <1>;
+			};
+			/* APU ⇔ RPU1 (R5_1)。Zephyr の rpu1_apu_mailbox と表裏の組
+			 *   local  = APU のバッファのうち RPU1 宛て 0xFF990440 (依頼) / 0xFF990460 (応答)
+			 *   remote = RPU1 のバッファのうち APU 宛て 0xFF990280 (依頼) / 0xFF9902A0 (応答)
+			 */
+			ipi_mailbox_rpu1: mailbox@ff990440 {
+				reg = <0x0 0xff990440 0x0 0x20>,
+				      <0x0 0xff990460 0x0 0x20>,
+				      <0x0 0xff990280 0x0 0x20>,
+				      <0x0 0xff9902a0 0x0 0x20>;
+				reg-names = "local_request_region", "local_response_region",
+					    "remote_request_region", "remote_response_region";
+				#mbox-cells = <1>;
+				xlnx,ipi-id = <2>;
 			};
 		};
 	};
@@ -88,7 +116,7 @@
 					mbox-names = "tx", "rx";
 				};
 
-				/* 分割モードではドライバが子ノードを 2 つ要求する。使うのは R5_0 だけ */
+				/* R5_1 (2 コア目)。apps/rpmsg_r5_1 を動かす */
 				r5f@1 {
 					compatible = "xlnx,zynqmp-r5f";
 					reg = <0x1 0x0 0x0 0x10000>, <0x1 0x20000 0x0 0x10000>;
@@ -96,6 +124,10 @@
 					power-domains = <&zynqmp_firmware 8>,
 							<&zynqmp_firmware 17>,
 							<&zynqmp_firmware 18>;
+					memory-region = <&rpu1vdev0vring0>, <&rpu1vdev0vring1>,
+							<&rpu1vdev0buffer>;
+					mboxes = <&ipi_mailbox_rpu1 0>, <&ipi_mailbox_rpu1 1>;
+					mbox-names = "tx", "rx";
 				};
 			};
 		};
