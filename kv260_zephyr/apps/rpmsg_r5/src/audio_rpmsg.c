@@ -20,6 +20,8 @@
 //     cmd 5 = 状態を返すだけ       cmd 6 = 統計を消す
 //     cmd 7 = 書き足しの上限 a 段 (1〜8192。既定 8192)。FIFO を浅く使い、遅延の小さい再生を真似る試験用
 //     cmd 8〜12 = シンセ (R5 が音を作る。synth.c)。8 開始/停止 9 音符 10 波形 11 楽譜に足す 12 楽譜の演奏/消去
+//     cmd 13 = 分業 a=1 開始 / a=0 停止。R5_1 が作って共有 DDR の輪バッファに書いた音を、1ms ごとに
+//              FIFO へ移し、R5_1 に「足して」と IPI で知らせる (r2r.c、apps/common/r2r_shm.h)
 //       中身は do_cmd() の各 case のコメント。返事の後ろにシンセの統計が付く (struct aud_res)
 //   返事 (どの命令にも 1 通)  u32 magic = 0x52445541 ("AUDR")  u32 status (0=正常 1=PLが音声設計でない 2=形式違い)
 //     u32 playing  u32 pos (送ったバイト数)  u32 len  u32 level (今の残量)  u32 min_level  u32 n_empty
@@ -35,6 +37,9 @@
 #include <string.h>
 
 #include "synth.h"
+#include "r2r_shm.h"
+
+void r2r_kick(uint32_t rd);   /* r2r.c */
 
 #define AUD_EPT_ADDR 0x420
 
@@ -64,6 +69,8 @@ struct aud_res {
 	uint32_t magic, status, playing, pos, len, level, min_level, n_empty, n_tick, fill_max_us;
 	/* シンセ (synth.c) */
 	uint32_t synth_on, n_notes, n_lat, lat_max_us, lat_avg_us, active, score_run;
+	/* 分業 (cmd 13): 輪バッファが FIFO の空きを埋めきれなかった回数 */
+	uint32_t ring_on, n_ring_short;
 } __packed;
 
 static struct rpmsg_endpoint aud_ept;
@@ -76,7 +83,9 @@ static bool draining;   /* 停止命令の後、FIFO を鳴らし切るのを待
 static bool pl_used;    /* 一度でも PL を確かめた (それまで PL に触らない) */
 static uint32_t limit = FIFO_DEPTH;   /* 残量をここまでしか満たさない (cmd 7) */
 static bool synth_on;   /* シンセで音を作っている (synth.c) */
-static bool primed;     /* シンセで 1 回満たした (それまでは空でも数えない) */
+static bool primed;     /* シンセ/分業で 1 回満たした (それまでは空でも数えない) */
+static bool ring_on;    /* 分業: R5_1 が作った音を輪バッファから流している */
+static uint32_t n_ring_short;
 
 /* 統計 */
 static uint32_t level_now, min_level = FIFO_DEPTH, n_empty, n_tick;
@@ -162,6 +171,36 @@ static void audio_thread(void *p1, void *p2, void *p3)
 			synth_render(level_now < limit ? limit - level_now : 0, level_now);
 			fill_max_cyc = MAX(fill_max_cyc, k_cycle_get_32() - c0);
 			primed = true;
+		} else if (ring_on) {
+			/* 分業: 輪バッファにある分を、FIFO の上限まで移す。そのあと R5_1 に「足して」 */
+			uint32_t st = sys_read32(REG_STATUS);
+
+			level_now = (st >> 16) & 0x3FFF;
+			n_tick++;
+			if (primed) {
+				min_level = MIN(min_level, level_now);
+				if (st & 0x2) {
+					n_empty++;
+				}
+			}
+			uint32_t c0 = k_cycle_get_32();
+			uint32_t room = level_now < limit ? limit - level_now : 0;
+			uint32_t rd = R2R->rd;
+			uint32_t avail = R2R->wr - rd;
+			uint32_t n = MIN(room, avail);
+
+			if (primed && avail < room) {
+				n_ring_short++;   /* R5_1 が間に合わなかった */
+			}
+			for (uint32_t i = 0; i < n; i++) {
+				sys_write32(R2R->buf[(rd + i) & (R2R_RING - 1)], REG_DATA);
+			}
+			rd += n;
+			R2R->rd = rd;
+			R2R->fifo_level = level_now + n;
+			r2r_kick(rd);
+			fill_max_cyc = MAX(fill_max_cyc, k_cycle_get_32() - c0);
+			primed = true;
 		} else if (draining) {
 			uint32_t st = sys_read32(REG_STATUS);
 
@@ -182,7 +221,7 @@ static int do_cmd(const struct aud_cmd *c)
 	/* PL に触る命令 (1〜4 と 8) の前に、PL が音声設計かを確かめる。
 	 * 再生とシンセの開始 (1, 8) は毎回、ほかは最初の 1 回だけ。5〜7, 9〜12 は PL に触らない
 	 */
-	bool start = c->cmd == 1 || (c->cmd == 8 && c->a);
+	bool start = c->cmd == 1 || ((c->cmd == 8 || c->cmd == 13) && c->a);
 
 	if (start || (!pl_used && c->cmd >= 2 && c->cmd <= 4)) {
 		if (sys_read32(REG_DATA) != AUD_ID) {
@@ -195,7 +234,7 @@ static int do_cmd(const struct aud_cmd *c)
 		if (c->a < DDR_LO || c->b == 0 || (c->a | c->b) & 3 || c->b > DDR_HI - c->a) {
 			return 2;
 		}
-		if (playing || draining || synth_on) {
+		if (playing || draining || synth_on || ring_on) {
 			return 2;   /* 再生中 (先に止める) */
 		}
 		src_addr = c->a;
@@ -233,9 +272,31 @@ static int do_cmd(const struct aud_cmd *c)
 	case 6:
 		reset_stats();
 		return 0;
+	case 13:  /* 分業 a=1 開始 / a=0 停止 */
+		if (c->a) {
+			if (playing || draining || synth_on || ring_on) {
+				return 2;
+			}
+			if (R2R->magic != R2R_MAGIC) {
+				return 3;   /* R5_1 が輪バッファを用意していない (R5_1 は動いている?) */
+			}
+			reset_stats();
+			n_ring_short = 0;
+			primed = false;
+			R2R->rd = R2R->wr;   /* 古い分は捨てる */
+			R2R->fifo_level = 0;
+			ring_on = true;
+			sys_write32(1, REG_CTRL);
+			r2r_kick(R2R->rd);   /* 先に作らせる (最初の 1ms で輪バッファがたまる) */
+			k_timer_start(&tick_timer, K_MSEC(SYNTH_PERIOD_MS), K_MSEC(SYNTH_PERIOD_MS));
+		} else if (ring_on) {
+			ring_on = false;
+			draining = true;
+		}
+		return 0;
 	case 8:   /* シンセ a=1 開始 / a=0 停止 */
 		if (c->a) {
-			if (playing || draining || synth_on) {
+			if (playing || draining || synth_on || ring_on) {
 				return 2;
 			}
 			reset_stats();
@@ -301,6 +362,8 @@ static int aud_cb(struct rpmsg_endpoint *e, void *data, size_t len, uint32_t src
 	r.lat_avg_us = synth_st.n_lat ? (uint32_t)(synth_st.lat_sum_us / synth_st.n_lat) : 0;
 	r.active = synth_active();
 	r.score_run = synth_score_running();
+	r.ring_on = ring_on;
+	r.n_ring_short = n_ring_short;
 	k_mutex_unlock(&lock);
 	rpmsg_send(e, &r, sizeof(r));
 	return RPMSG_SUCCESS;

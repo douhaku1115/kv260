@@ -23,6 +23,10 @@ int synth_score_add(uint32_t t_ms, uint8_t note, uint16_t len_ms, uint8_t vel);
 void synth_score_start(void);
 bool synth_score_running(void);
 uint32_t synth_active(void);
-void synth_render(uint32_t n, uint32_t level);   /* n 標本を作って FIFO に書く */
+void synth_render(uint32_t n, uint32_t level);   /* R5_0 用: n 標本を作って FIFO に書く */
+/* R5_1 用 (輪バッファに書くとき): 頭で synth_measure、1 標本ずつ synth_next、最後に synth_block_end */
+void synth_measure(uint32_t level);
+int32_t synth_next(void);
+void synth_block_end(void);
 
 #endif

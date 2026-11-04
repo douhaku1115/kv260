@@ -133,6 +133,20 @@ int synth_score_add(uint32_t t_ms, uint8_t note, uint16_t len_ms, uint8_t vel)
 
 void synth_score_start(void)
 {
+	/* 時刻順に並べる (挿入ソート。同時刻は入れた順のまま)。synth_next は先頭から順に「時刻が来たか」を
+	 * 見るので、並んでいないと後ろに入れた音 (例: メロディの後にまとめて入れた低音) が全部最後に
+	 * 一斉に鳴ってしまう (段3〜段5 のきらきら星で最後が爆発音になっていた原因)
+	 */
+	for (uint32_t i = 1; i < n_score; i++) {
+		struct ev e = score[i];
+		uint32_t j = i;
+
+		while (j > 0 && score[j - 1].t > e.t) {
+			score[j] = score[j - 1];
+			j--;
+		}
+		score[j] = e;
+	}
 	clk = 0;
 	score_pos = 0;
 	score_run = n_score > 0;
@@ -163,19 +177,22 @@ static int32_t osc(uint32_t ph)
 	case 2:
 		return (int32_t)(ph >> 16) - 32768;
 	default: {
-		int32_t t = (int32_t)(ph >> 15);              /* 0〜65535 */
+		/* 0〜65535。段3〜段5 は ph >> 15 (0〜131071) と誤っていて、波が約 5 倍に振れて割れていた */
+		int32_t t = (int32_t)(ph >> 16);
 
 		return t < 32768 ? t * 2 - 32768 : 32767 - (t - 32768) * 2;
 	}
 	}
 }
 
-/* n 標本を作って FIFO に書く。level = 書き始める時点の FIFO の残量 (遅れの計算用) */
-void synth_render(uint32_t n, uint32_t level)
+/* 遅れを測る (1 区切りの頭で 1 回)。level = 今作る標本が鳴るまでに先に鳴る標本の数
+ * 遅れ = 命令を受けてから作り始めるまで + level 標本ぶん (R5_0 では FIFO の残量、R5_1 では
+ * 輪バッファの残り + FIFO の残量)
+ */
+void synth_measure(uint32_t level)
 {
 	uint32_t now = k_cycle_get_32();
 
-	/* 遅れ = 命令を受けてから書き始めるまで + 書いた標本が FIFO の残量の後ろで鳴るまで */
 	for (int i = 0; i < NVOICE; i++) {
 		if (v[i].on && v[i].t_rx) {
 			uint32_t us = (uint32_t)((uint64_t)(now - v[i].t_rx) * 1000000U /
@@ -188,45 +205,62 @@ void synth_render(uint32_t n, uint32_t level)
 			v[i].t_rx = 0;
 		}
 	}
+}
 
-	for (uint32_t k = 0; k < n; k++) {
-		/* 楽譜: 時刻が来た音符を鳴らす (標本単位で正確) */
-		while (score_run && score_pos < n_score && score[score_pos].t <= clk) {
-			struct ev *e = &score[score_pos++];
+/* 1 標本作る (全部の声を足し合わせ、16 ビットに収める) */
+int32_t synth_next(void)
+{
+	/* 楽譜: 時刻が来た音符を鳴らす (標本単位で正確) */
+	while (score_run && score_pos < n_score && score[score_pos].t <= clk) {
+		struct ev *e = &score[score_pos++];
 
-			note_start(e->note, e->len_ms, e->vel, false);
+		note_start(e->note, e->len_ms, e->vel, false);
+	}
+	clk++;
+
+	int32_t mix = 0;
+
+	for (int i = 0; i < NVOICE; i++) {
+		struct voice *p = &v[i];
+
+		if (!p->on) {
+			continue;
 		}
-		clk++;
-
-		int32_t mix = 0;
-
-		for (int i = 0; i < NVOICE; i++) {
-			struct voice *p = &v[i];
-
-			if (!p->on) {
+		if (p->age < ATTACK) {
+			p->env = p->peak / ATTACK * (int32_t)(p->age + 1);
+		} else if (p->age < p->len) {
+			p->env -= p->env >> 13;   /* 長さの間: 時定数 約 168ms でゆっくり減る */
+		} else {
+			p->env -= p->env >> 8;    /* 長さの後: 時定数 約 5ms で消える */
+			if (p->env < ENV_OFF) {
+				p->on = false;
 				continue;
 			}
-			if (p->age < ATTACK) {
-				p->env = p->peak / ATTACK * (int32_t)(p->age + 1);
-			} else if (p->age < p->len) {
-				p->env -= p->env >> 13;   /* 長さの間: 時定数 約 168ms でゆっくり減る */
-			} else {
-				p->env -= p->env >> 8;    /* 長さの後: 時定数 約 5ms で消える */
-				if (p->env < ENV_OFF) {
-					p->on = false;
-					continue;
-				}
-			}
-			p->age++;
-			mix += (int32_t)(((int64_t)osc(p->phase) * p->env) >> 26);   /* 1 音で最大 ±8192 */
-			p->phase += p->inc;
 		}
-		mix = CLAMP(mix, -32768, 32767);
-		/* 左右に同じ値 (モノラル) */
-		sys_write32(((uint32_t)(uint16_t)mix << 16) | (uint16_t)mix, SYNTH_REG_DATA);
+		p->age++;
+		mix += (int32_t)(((int64_t)osc(p->phase) * p->env) >> 26);   /* 1 音で最大 ±8192 */
+		p->phase += p->inc;
 	}
-	/* 楽譜を最後まで鳴らし、音が全部消えたら終わり */
+	return CLAMP(mix, -32768, 32767);
+}
+
+/* 1 区切り作り終えたら呼ぶ: 楽譜を最後まで鳴らし、音が全部消えたら終わり */
+void synth_block_end(void)
+{
 	if (score_run && score_pos >= n_score && synth_active() == 0) {
 		score_run = false;
 	}
+}
+
+/* R5_0 用: n 標本を作って PL の FIFO に直接書く。level = 書き始める時点の FIFO の残量 */
+void synth_render(uint32_t n, uint32_t level)
+{
+	synth_measure(level);
+	for (uint32_t k = 0; k < n; k++) {
+		int32_t s = synth_next();
+
+		/* 左右に同じ値 (モノラル) */
+		sys_write32(((uint32_t)(uint16_t)s << 16) | (uint16_t)s, SYNTH_REG_DATA);
+	}
+	synth_block_end();
 }

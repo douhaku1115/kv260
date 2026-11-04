@@ -8,6 +8,7 @@
 //     0x401  エコー: "R5_1: " を付けて送り返す (linux/rpmsg_rtt.py で往復を測る)
 //     0x441  shell (prj.conf。linux/r5_shell.sh 1089 でつなぐ)
 //     0x450  計算役: n 以下の素数を割り算で数え、かかった時間を返す (linux/r5_1_calc.py)
+//     0x460  音の分業: 音を作ってリバーブを掛け、R5_0 と共有の輪バッファに書く (r51_audio.c)
 //       依頼  u32 magic = 0x434C4143 ("CALC")  u32 seq  u32 n
 //       返事  u32 magic = 0x524C4143 ("CALR")  u32 seq  u32 n  u32 count  u32 us
 //
@@ -26,6 +27,15 @@
 #include <metal/io.h>
 #include <resource_table.h>
 #include <addr_translation.h>
+
+#include "r2r_shm.h"
+#include "ipi_early_clear.h"
+
+/* 前回の R5_1 が残した IPI の合図で起動が止まらないよう、割り込み解禁前に消す (ipi_early_clear.h) */
+IPI_EARLY_CLEAR(DT_NODELABEL(rpu1_ipi));
+
+void r51_audio_kick(void);                         /* r51_audio.c */
+int r51_audio_init(struct rpmsg_device *rpdev);    /* r51_audio.c */
 
 #define SHM_NODE       DT_CHOSEN(zephyr_ipc_shm)
 #define SHM_START_ADDR DT_REG_ADDR(SHM_NODE)
@@ -140,6 +150,33 @@ static void calc_thread(void *a, void *b, void *c)
 /* 優先度は低め (7)。計算中も shell と通信は動く */
 K_THREAD_DEFINE(calc_tid, 1024, calc_thread, NULL, NULL, NULL, 7, 0, 0);
 
+/* ---- R5_0 からの直接の IPI (Linux を通さない。R5_0 の r2r.c と対、形は apps/common/r2r_shm.h) ----
+ * 割り込みの中で呼ばれる。PING はそのまま返し、KICK は音を作るスレッドを起こす。
+ * data はドライバ内の struct xlnx_ipi_data。中身は先頭から 8 バイト目 (r2r.c の説明)
+ */
+static const struct device *const r2r = DEVICE_DT_GET(DT_NODELABEL(rpu1_rpu0_mailbox));
+static uint32_t n_r2r;
+
+static void r2r_cb(const struct device *dev, void *ctx, uint32_t id, volatile void *data)
+{
+	const volatile struct r2r_msg *m = (const volatile struct r2r_msg *)((volatile uint8_t *)data + 8);
+
+	n_r2r++;
+	/* Zephyr の IPI ドライバは ISR のビットを「読んで OR して書き戻す」で消すため、この合図を消す時に
+	 * 同時に来ていた Linux の合図 (APU のビット) まで消してしまう (W1C のレジスタ)。KICK は 1ms ごとに
+	 * 来るので実際に起きた (段B で Linux の命令が 15 個目で止まった)。消されても取りこぼさないよう、
+	 * ここで毎回 main に受信リングを見に行かせる (何も無ければ空振りするだけ)
+	 */
+	k_sem_give(&ipi_sem);
+	if (m->type == R2R_PING) {   /* 往復の測定: そのまま返す */
+		struct r2r_msg back = {R2R_PING, m->val};
+
+		ipm_send(r2r, 0, 0, &back, sizeof(back));
+	} else if (m->type == R2R_KICK) {   /* 輪バッファを読んだので足して (r51_audio.c) */
+		r51_audio_kick();
+	}
+}
+
 static int platform_init(void)
 {
 	struct metal_init_params mp = METAL_INIT_DEFAULTS;
@@ -159,6 +196,10 @@ static int platform_init(void)
 		return -2;
 	}
 	ipm_register_callback(ipm, ipm_cb, NULL);
+	if (device_is_ready(r2r)) {
+		ipm_register_callback(r2r, r2r_cb, NULL);
+		ipm_set_enabled(r2r, 1);
+	}
 	return ipm_set_enabled(ipm, 1);
 }
 
@@ -208,6 +249,7 @@ int main(void)
 	rpmsg_create_ept(&echo_ept, rpdev, EPT_NAME, ECHO_ADDR, RPMSG_ADDR_ANY, echo_cb, NULL);
 	shell_backend_rpmsg_init_transport(rpdev);
 	rpmsg_create_ept(&calc_ept, rpdev, EPT_NAME, CALC_ADDR, RPMSG_ADDR_ANY, calc_cb, NULL);
+	r51_audio_init(rpdev);   /* 0x460: 音の分業 */
 
 	for (;;) {
 		k_sem_take(&ipi_sem, K_FOREVER);
@@ -219,8 +261,8 @@ int main(void)
 /* ---- shell: r51 stats ---- */
 static int cmd_stats(const struct shell *sh, size_t argc, char **argv)
 {
-	shell_print(sh, "R5_1: エコー %u 通 / 計算 %u 回 (平均 %u us) / 形式違い %u", n_echo, n_calc,
-		    n_calc ? (uint32_t)(calc_sum_us / n_calc) : 0, n_bad);
+	shell_print(sh, "R5_1: エコー %u 通 / 計算 %u 回 (平均 %u us) / 形式違い %u / R5_0 から直接 %u 回",
+		    n_echo, n_calc, n_calc ? (uint32_t)(calc_sum_us / n_calc) : 0, n_bad, n_r2r);
 	return 0;
 }
 

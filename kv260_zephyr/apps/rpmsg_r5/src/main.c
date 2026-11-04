@@ -52,6 +52,14 @@ static uint32_t rx_count;
 static K_SEM_DEFINE(ipi_sem, 0, 1);
 
 /* ---- IPI の受信 (割り込みの中): 起こすだけ。中身は vring を見て処理する ---- */
+/* r2r.c から: R5_1 の合図を処理した時、同時に来た Linux の合図が消されていても取りこぼさないよう
+ * 受信リングを見に行かせる (理由は apps/rpmsg_r5_1/src/main.c の r2r_cb)
+ */
+void rpmsg_poke(void)
+{
+	k_sem_give(&ipi_sem);
+}
+
 static void ipm_cb(const struct device *dev, void *ctx, uint32_t id, volatile void *data)
 {
 	k_sem_give(&ipi_sem);

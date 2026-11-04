@@ -59,6 +59,16 @@
 		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
 	};
 
+	/* R5_0 と直接やりとりする共有 DDR (apps/common/r2r_shm.h の輪バッファ)。Linux 管理外。
+	 * R5_0 は rpmsg.overlay の pl_ddr (0x60000000〜512MB) に含まれている
+	 */
+	r2r_shm: memory@7f000000 {
+		compatible = "zephyr,memory-region";
+		reg = <0x7f000000 DT_SIZE_M(1)>;
+		zephyr,memory-region = "R2R_SHM";
+		zephyr,memory-attr = <DT_MEM_ARM(ATTR_MPU_RAM_NOCACHE)>;
+	};
+
 	vdev0buffer: memory@3ee40000 {
 		compatible = "mmio-sram";
 		reg = <0x3ee40000 DT_SIZE_K(256)>;
