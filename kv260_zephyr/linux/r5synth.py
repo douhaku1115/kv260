@@ -11,6 +11,7 @@
 #   sudo fpgautil -b stream.bit
 #   sudo devmem 0xFF5E00C0 32 0x01010A00
 import glob
+import mmap
 import os
 import random
 import select
@@ -108,8 +109,43 @@ def stats(r):
             f"[R5_0] " + s + f"  輪バッファ不足 {r['n_ring_short']}回")
 
 
+def pl_out_hdmi():
+    # PL の出口 (0xA0000140 OUT_SEL bit0)。1 なら HDMI (stream_hdmi.bit + hdmi_audio.sh on)。
+    # 音声設計でない (0x00 が 0xDEADBEEF でない) か読めなければ I2S とみなす
+    try:
+        fdm = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
+        m = mmap.mmap(fdm, 4096, mmap.MAP_SHARED, mmap.PROT_READ, offset=0xA0000000)
+        ok = struct.unpack("<I", m[0:4])[0] == 0xDEADBEEF
+        sel = struct.unpack("<I", m[0x140:0x144])[0] & 1 if ok else 0
+        m.close()
+        os.close(fdm)
+        return sel == 1
+    except OSError:
+        return False
+
+
+def dp_live_ok():
+    # HDMI 側が PL の音を取りに来る設定か (hdmi_audio.sh on の値)。0xFD4AB070 bit5:4 = 00 (PL から)、
+    # 0xFD4AB120 bit1 = 0 (音声クロックは PL)。起動直後に Linux が元に戻したことがあり、戻ると FIFO が減らず止まる
+    fdm = os.open("/dev/mem", os.O_RDONLY | os.O_SYNC)
+    m = mmap.mmap(fdm, 4096, mmap.MAP_SHARED, mmap.PROT_READ, offset=0xFD4AB000)
+    sel, clk = struct.unpack("<I", m[0x70:0x74])[0], struct.unpack("<I", m[0x120:0x124])[0]
+    m.close()
+    os.close(fdm)
+    return (sel & 0x30) == 0 and (clk & 0x2) == 0, sel, clk
+
+
+hdmi = pl_out_hdmi()
+if hdmi:
+    ok, sel, clk = dp_live_ok()
+    if not ok:
+        sys.exit(f"HDMI 側の設定が戻っている (0xFD4AB070={sel:#x} 0xFD4AB120={clk:#x})。sudo sh hdmi_audio.sh on をやり直す")
+fs = 48000 if hdmi else 48828    # 標本の速さ。HDMI は 48kHz、I2S は 12.5MHz/256
 if cmd(7, limit)["status"] != 0:
     sys.exit(f"上限 {limit} は範囲外 (1〜8192)")
+cmd(15, fs)
+if r51:
+    cmd1(15, fs)
 if r51:
     cmd1(6)            # R5_1 の統計を消す
     cmd1(14, rev)      # リバーブの量
@@ -120,7 +156,7 @@ if r["status"] != 0:
     sys.exit({1: "PL が音声設計でない", 2: "再生中 (先に r5play.py --stop)",
               3: "R5_1 が輪バッファを用意していない (R5_1 は動いている?)"}.get(r["status"], r))
 print(f"シンセ開始 ({'分業: R5_1 が作り R5_0 が流す、リバーブ ' + str(rev) if r51 else 'R5_0 だけ'}、"
-      f"FIFO の上限 {limit} 段 = {limit / 48.828:.1f} ms 分)")
+      f"FIFO の上限 {limit} 段 = {limit * 1000 / fs:.1f} ms 分、出口 {'HDMI 48000Hz' if hdmi else 'I2S 48828Hz'})")
 
 try:
     if mode == "twinkle":

@@ -42,6 +42,10 @@
 //                        位相誤差 = atan(PQUAD / PILOT)、38kHz 側はその 2 倍
 //   0x120 [R] DLEVEL   - L−R の平均振幅
 //   0x130 [R] SLEVEL   - L+R の平均振幅（DLEVEL と比べる）
+//   -- HDMI 音声 (2026-11-05。stream_hdmi.bit のみ。PS の DP の live audio 入力へ) --
+//   0x140 [RW] OUT_SEL - bit0: 1 なら FIFO を HDMI の速さ (48000Hz) で読み HDMI へ出す。0 なら従来の I2S (48828Hz)
+//                        書くと 0x150 を 0 に戻す
+//   0x150 [R]  HDMI_EMPTY - HDMI が標本を欲しい時に FIFO が空だった回数 (再生中だけ。途切れの数)
 //
 // 【PS 側の手順】
 //   1. CTRL に 1 を書いて再生開始
@@ -126,7 +130,15 @@ module i2s_stream_axi #(
     output wire mclk_o,
     output reg  sclk,
     output reg  lrck,
-    output reg  sdout
+    output reg  sdout,
+
+    // HDMI 音声 (PS の DP サブシステムの live audio 入力。OUT_SEL=1 のとき使う)
+    //   使わない設計 (stream.bit) では aud_clk を 0、aud_ready を 0 につなげばよい
+    input  wire        aud_clk,             // 24.576MHz = 512 × 48kHz (PL の clk_wiz から)
+    output wire [31:0] aud_data,
+    output wire        aud_id,
+    output wire        aud_valid,
+    input  wire        aud_ready
 );
     // クロックとリセットは AXI と共通（単一クロック構成）
     wire clk   = S_AXI_ACLK;
@@ -189,11 +201,15 @@ module i2s_stream_axi #(
     reg [7:0]    reg_fm_vol;                // 0xD0 [15:8]: FM 復調後の音量（64で等倍）
     reg          reg_stereo_en;             // 0xD0 bit3: 1 ならステレオ復調を許す
     reg          reg_diag_d;                // 0xD0 bit4: 1 なら L−R を左右に出す（診断）
+    reg          reg_out_hdmi;              // 0x140 OUT_SEL bit0: 1 なら FIFO を HDMI の速さ (48kHz) で読む
+    reg          clr_hdmi_empty;            // OUT_SEL を書いたとき 1 クロックだけ 1 (空の回数を 0 に)
     reg          fifo_wr;                   // FIFOへの書き込み（1クロックだけ1）
     reg [DW-1:0] fifo_wr_data;
 
     always @(posedge clk) begin
         if (!rst_n) begin
+            reg_out_hdmi   <= 1'b0;         // 既定は従来どおり I2S
+            clr_hdmi_empty <= 1'b0;
             reg_play     <= 1'b0;
             reg_gain     <= 8'd64;          // 既定は等倍
             reg_echo     <= 8'd0;           // 既定はエコー無効
@@ -214,6 +230,7 @@ module i2s_stream_axi #(
         end else begin
             fifo_wr   <= 1'b0;              // 既定は書かない
             dma_start <= 1'b0;              // 1クロックだけのパルス
+            clr_hdmi_empty <= 1'b0;
             if (wr_en) begin
                 case (axi_awaddr[8:4])
                     5'd0: begin             // 0x00 DATA
@@ -236,6 +253,10 @@ module i2s_stream_axi #(
                         reg_stereo_en <= S_AXI_WDATA[3];      //   bit3: ステレオ許可
                         reg_diag_d   <= S_AXI_WDATA[4];      //   bit4: L−R を左右に出す
                         reg_fm_vol   <= S_AXI_WDATA[15:8];    //   [15:8]: FM音量
+                    end
+                    5'd20: begin                              // 0x140 OUT_SEL
+                        reg_out_hdmi   <= S_AXI_WDATA[0];     //   bit0: 1=HDMI 0=I2S
+                        clr_hdmi_empty <= 1'b1;
                     end
                     default: ;
                 endcase
@@ -286,6 +307,7 @@ module i2s_stream_axi #(
     wire signed [31:0] fm_pilot_quad;       // FM ステレオ: PLL の直交成分
     wire signed [31:0] fm_sum_level;        // FM ステレオ: L+R の平均振幅
     wire signed [31:0] fm_diff_level;       // FM ステレオ: L−R の平均振幅
+    reg  [31:0]        hdmi_empty_cnt;      // HDMI 出力: 欲しい時に FIFO が空だった回数 (再生中だけ数える)
 
     always @(posedge clk) begin
         if (!rst_n)
@@ -313,6 +335,8 @@ module i2s_stream_axi #(
                 5'd17: axi_rdata <= fm_pilot_quad;        // 0x110 PLL 直交成分
                 5'd18: axi_rdata <= fm_diff_level;        // 0x120 L−R の平均振幅
                 5'd19: axi_rdata <= fm_sum_level;         // 0x130 L+R の平均振幅
+                5'd20: axi_rdata <= {31'b0, reg_out_hdmi}; // 0x140 OUT_SEL
+                5'd21: axi_rdata <= hdmi_empty_cnt;       // 0x150 HDMI が欲しい時に FIFO が空だった回数
                 default: axi_rdata <= 32'b0;
             endcase
         end
@@ -328,6 +352,7 @@ module i2s_stream_axi #(
     //   （Verilog は暗黙 net を作ってしまうので、必ず宣言を先に置くこと）
     reg           dma_fifo_wr;
     reg [DW-1:0]  dma_fifo_data;
+    wire          fifo_rd;                  // FIFO から 1 組取り出す (I2S か HDMI の速さで。下の HDMI 音声の節)
 
     // FIFO への書き込みは 2 系統ある：
     //   1. PS が AXI4-Lite で 1 組ずつ書く（段5〜10 の方式。CPU が働く）
@@ -341,11 +366,54 @@ module i2s_stream_axi #(
         .rst_n   (rst_n),
         .wr_en   (fifo_wr_any),
         .wr_data (fifo_wr_any_data),
-        .rd_en   (sample_tick & reg_play),
+        .rd_en   (fifo_rd),
         .rd_data (fifo_out),
         .full    (fifo_full),
         .empty   (fifo_empty),
         .count   (fifo_count)
+    );
+
+    // =========================================================================
+    // HDMI 音声 (OUT_SEL=1)。FIFO を読む速さを HDMI 側に決めさせる
+    //   xlive_audio (rtl/xlive/、miya4649 さんのひな型) の中の小さな FIFO (16 段) が 8 段未満の間、
+    //   毎クロック 1 組ずつ渡す。HDMI 側は音声クロック 24.576MHz で 48kHz ごとに 1 組引き取るので、
+    //   こちらの FIFO もちょうど 48kHz で減る (I2S の 48828Hz ではない)。
+    //   FIFO が空 (または再生無効) のときは 0 (無音) を渡し、HDMI の音声を途切れさせない。
+    //   左右は FIFO の 1 段 ([31:16]=左, [15:0]=右) をそのまま渡す。音量・エコー等 (audio_fx) は通さない。
+    // =========================================================================
+    wire hdmi_full;                         // xlive_audio の小さな FIFO がほぼ満杯 (12.5MHz 側)
+    wire hdmi_take = reg_out_hdmi & ~hdmi_full;
+    assign fifo_rd = reg_out_hdmi ? (hdmi_take & reg_play) : (sample_tick & reg_play);
+
+    always @(posedge clk) begin
+        if (!rst_n || clr_hdmi_empty)               hdmi_empty_cnt <= 32'd0;
+        else if (hdmi_take && reg_play && fifo_empty) hdmi_empty_cnt <= hdmi_empty_cnt + 32'd1;
+    end
+
+    // 音声クロック側のリセット (rst_n を 4 段で受け直す。ひな型と同じ考え)
+    reg [3:0] aud_rst_sr;
+    always @(posedge aud_clk or negedge rst_n)
+        if (!rst_n) aud_rst_sr <= 4'hF;
+        else        aud_rst_sr <= {aud_rst_sr[2:0], 1'b0};
+    wire aud_rst = aud_rst_sr[3];
+
+    xlive_audio #(
+        .AUDIO_WIDTH (SMP),
+        .BUFFER_DEPTH(4),
+        .AES_MODE    (0),
+        .SAMPLE_FREQ (48000)
+    ) u_xlive (
+        .clk_tx  (aud_clk),
+        .clk_rx  (clk),
+        .reset_tx(aud_rst),
+        .reset_rx(~rst_n),
+        .data_rx (reg_play ? fifo_out : {DW{1'b0}}),   // 空なら audio_fifo が 0 を出す
+        .en_rx   (hdmi_take),
+        .full_rx (hdmi_full),
+        .data_tx (aud_data),
+        .valid_tx(aud_valid),
+        .id_tx   (aud_id),
+        .ready_tx(aud_ready)
     );
 
     // =========================================================================

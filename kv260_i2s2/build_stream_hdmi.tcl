@@ -1,0 +1,166 @@
+# =============================================================================
+# build_stream_hdmi.tcl -- build_stream.tcl (段5〜12 の音声設計) に HDMI 音声の出口を足したもの (2026-11-05)
+#   実行: vivado -mode batch -source build_stream_hdmi.tcl
+#   生成物: vivado_stream_hdmi/i2s2_stream_hdmi.runs/impl_1/design_1_wrapper.bit (KV260 では stream_hdmi.bit)
+#
+#   build_stream.tcl との違い:
+#     - PS の PSU__USE__AUDIO=1 (HDMI 出力 = PS の DP サブシステムの live audio 入力 dp_s_axis_audio_* を出す)
+#     - 24.576MHz (= 512 × 48kHz) の clk_wiz (clk_aud) を足し、i2s/aud_clk と ps/dp_s_axis_audio_clk に入れる
+#     - i2s/aud_data,aud_id,aud_valid,aud_ready → ps/dp_s_axis_audio_tdata,tid,tvalid,tready
+#     - rtl/xlive/ (miya4649 さんのひな型の xlive_audio) と constraints/hdmi_audio.xdc を加える
+#     FIFO の出口は 0x140 OUT_SEL で I2S / HDMI を切り替える (rtl/i2s_stream_axi.v)
+#
+#   構成: Zynq PS ─AXI4-Lite─> i2s_stream_axi ─I2S─> Pmod I2S2
+#         PS(Linux)が音声標本をFIFOに流し込み、PLが取り出して送出する
+#   ベースアドレス: 0xA000_0000
+# =============================================================================
+set origin_dir [file normalize [file dirname [info script]]]
+set proj_name  i2s2_stream_hdmi
+set proj_dir   $origin_dir/vivado_stream_hdmi
+set part       xck26-sfvc784-2LV-c
+set board      xilinx.com:kv260_som:part0:1.4
+
+create_project $proj_name $proj_dir -part $part -force
+set_property board_part $board [current_project]
+
+# ---- ソース追加 ----
+#   ★.hex は必ずここに add_files すること。$readmemh は相対パスで探すので、
+#     プロジェクトに入れていないと合成時に「表が全部 x」になって無音になる。
+add_files -norecurse [list $origin_dir/rtl/i2s_stream_axi.v $origin_dir/rtl/audio_fifo.v $origin_dir/rtl/audio_fx.v $origin_dir/rtl/fft512.v $origin_dir/rtl/axi_reader.v $origin_dir/rtl/fm_demod_stereo.v $origin_dir/rtl/stereo_pll.v $origin_dir/rtl/audio_backend.v $origin_dir/rtl/twiddle_cos.hex $origin_dir/rtl/twiddle_sin.hex $origin_dir/rtl/fir15k.hex $origin_dir/rtl/nco_sin.hex]
+add_files -norecurse [glob $origin_dir/rtl/xlive/*.v]
+add_files -fileset constrs_1 -norecurse [list $origin_dir/constraints/pmod_i2s2.xdc $origin_dir/constraints/hdmi_audio.xdc]
+update_compile_order -fileset sources_1
+
+# ---- ブロックデザイン ----
+create_bd_design design_1
+
+set ps_vlnv  [lindex [lsort [get_ipdefs -all *:ip:zynq_ultra_ps_e:*]] end]
+set clk_vlnv [lindex [lsort [get_ipdefs -all *:ip:clk_wiz:*]] end]
+
+# PS: AXI マスタ(GP0)を有効化
+create_bd_cell -type ip -vlnv $ps_vlnv ps
+apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e -config {apply_board_preset 1} [get_bd_cells ps]
+set_property -dict [list \
+  CONFIG.PSU__FPGA_PL0_ENABLE {1} \
+  CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {100} \
+  CONFIG.PSU__USE__M_AXI_GP0 {1} \
+  CONFIG.PSU__USE__M_AXI_GP1 {0} \
+  CONFIG.PSU__MAXIGP0__DATA_WIDTH {32} \
+  CONFIG.PSU__USE__S_AXI_GP2 {1} \
+  CONFIG.PSU__SAXIGP2__DATA_WIDTH {64} \
+  CONFIG.PSU__USE__AUDIO {1} \
+] [get_bd_cells ps]
+# ※ S_AXI_GP2 = S_AXI_HP0_FPD。段11 で PL(自作AXI4マスタ)が PS の DDR を読むための入口。
+#    HPM(制御用 AXI4-Lite) と違い、データ転送向けの広帯域ポート。
+
+# clk_wiz: 12.5MHz (I2S用 mclk)
+create_bd_cell -type ip -vlnv $clk_vlnv clk
+set_property -dict [list CONFIG.PRIM_SOURCE {No_buffer} CONFIG.PRIM_IN_FREQ {99.999001} CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {12.500} CONFIG.USE_LOCKED {true} CONFIG.USE_RESET {false}] [get_bd_cells clk]
+
+# Processor System Reset (AXI用のリセット生成)
+create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:5.0 rst
+# AXI Interconnect (PSのAXI4 と 自作のAXI4-Lite を仲介する)
+create_bd_cell -type ip -vlnv xilinx.com:ip:axi_interconnect:2.1 axi_ic
+set_property CONFIG.NUM_MI {1} [get_bd_cells axi_ic]
+
+# 自作モジュール
+create_bd_cell -type module -reference i2s_stream_axi i2s
+
+# ---- クロック接続（単一クロック構成: すべて 12.5MHz） ----
+#   AXI と I2S を同じクロックで動かし、クロック間の受け渡しを無くす
+#   （異クロックだと標本を取りこぼす。12.5MHz でも AXI は十分な速さ）
+#   ※ 合成時に出る「Port ACLK is either unconnected」警告は無害。
+#      動作実績のある kv260_mips でも同じ警告が出る。これを消そうとして
+#      接続順序を変えると音が出なくなる。
+connect_bd_net [get_bd_pins ps/pl_clk0]   [get_bd_pins clk/clk_in1]
+set aclk [get_bd_pins clk/clk_out1]
+
+# ---- リセット生成 ----
+connect_bd_net $aclk                       [get_bd_pins rst/slowest_sync_clk]
+connect_bd_net [get_bd_pins clk/locked]    [get_bd_pins rst/dcm_locked]
+connect_bd_net [get_bd_pins ps/pl_resetn0] [get_bd_pins rst/ext_reset_in]
+
+# ---- AXI Interconnect のクロック・リセット ----
+connect_bd_net $aclk [get_bd_pins axi_ic/ACLK]
+connect_bd_net $aclk [get_bd_pins axi_ic/S00_ACLK]
+connect_bd_net $aclk [get_bd_pins axi_ic/M00_ACLK]
+connect_bd_net [get_bd_pins rst/interconnect_aresetn] [get_bd_pins axi_ic/ARESETN]
+connect_bd_net [get_bd_pins rst/peripheral_aresetn]   [get_bd_pins axi_ic/S00_ARESETN]
+connect_bd_net [get_bd_pins rst/peripheral_aresetn]   [get_bd_pins axi_ic/M00_ARESETN]
+
+# ---- PS の AXI マスタ → Interconnect ----
+connect_bd_net $aclk [get_bd_pins ps/maxihpm0_fpd_aclk]
+connect_bd_intf_net [get_bd_intf_pins ps/M_AXI_HPM0_FPD] [get_bd_intf_pins axi_ic/S00_AXI]
+
+# ---- Interconnect → 自作モジュール ----
+#   ★この順序（クロック・リセットを先、インターフェースを後）が実機で音が出た構成。
+#     kv260_mips に合わせて逆順にしたところ音が出なくなった。順序を変えないこと。
+connect_bd_net $aclk [get_bd_pins i2s/S_AXI_ACLK]
+connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins i2s/S_AXI_ARESETN]
+connect_bd_intf_net [get_bd_intf_pins axi_ic/M00_AXI] [get_bd_intf_pins i2s/S_AXI]
+
+# ---- 段11: 自作AXI4マスタ → PS の HP0 ポート（PL が DDR を読む） ----
+#   自作モジュールの M_AXI 端子群を BD のインターフェースとして束ね、HP0 に繋ぐ。
+connect_bd_net $aclk [get_bd_pins ps/saxihp0_fpd_aclk]
+# M_AXI は S_AXI と同じクロックで動く。Vivado は既定で 100MHz と見なすため明示する
+#   （合わないと "FREQ_HZ does not match" で validate_bd_design が失敗する）
+#   ★12500000 ちょうどではなく、clk_wiz が実際に出す周波数に合わせること。
+#     PS 側がその実値(例 12501995)を見ているため、丸めた値では一致しない。
+set_property CONFIG.FREQ_HZ [get_property CONFIG.FREQ_HZ [get_bd_pins clk/clk_out1]] \
+    [get_bd_intf_pins i2s/M_AXI]
+connect_bd_intf_net [get_bd_intf_pins i2s/M_AXI] [get_bd_intf_pins ps/S_AXI_HP0_FPD]
+
+# ---- I2S 出力ポート ----
+create_bd_port -dir O -type clk pmod_mclk
+connect_bd_net [get_bd_pins i2s/mclk_o] [get_bd_port pmod_mclk]
+create_bd_port -dir O pmod_sclk
+connect_bd_net [get_bd_pins i2s/sclk] [get_bd_port pmod_sclk]
+create_bd_port -dir O pmod_lrck
+connect_bd_net [get_bd_pins i2s/lrck] [get_bd_port pmod_lrck]
+create_bd_port -dir O pmod_sdin
+connect_bd_net [get_bd_pins i2s/sdout] [get_bd_port pmod_sdin]
+
+# ---- HDMI 音声 (PS の DP サブシステムの live audio 入力) ----
+#   音声クロック 24.576MHz を PL で作る (PS 側は 0xFD4AB120 で「音声クロックは PL から」にする)。
+#   リセットは使わない (i2s_stream_axi の中で S_AXI_ARESETN を音声クロックで受け直す)
+create_bd_cell -type ip -vlnv $clk_vlnv clk_aud
+set_property -dict [list CONFIG.PRIM_SOURCE {No_buffer} CONFIG.PRIM_IN_FREQ {99.999001} CONFIG.CLKOUT1_REQUESTED_OUT_FREQ {24.576} CONFIG.USE_LOCKED {false} CONFIG.USE_RESET {false}] [get_bd_cells clk_aud]
+connect_bd_net [get_bd_pins ps/pl_clk0] [get_bd_pins clk_aud/clk_in1]
+connect_bd_net [get_bd_pins clk_aud/clk_out1] [get_bd_pins i2s/aud_clk] [get_bd_pins ps/dp_s_axis_audio_clk]
+connect_bd_net [get_bd_pins i2s/aud_data]  [get_bd_pins ps/dp_s_axis_audio_tdata]
+connect_bd_net [get_bd_pins i2s/aud_id]    [get_bd_pins ps/dp_s_axis_audio_tid]
+connect_bd_net [get_bd_pins i2s/aud_valid] [get_bd_pins ps/dp_s_axis_audio_tvalid]
+connect_bd_net [get_bd_pins i2s/aud_ready] [get_bd_pins ps/dp_s_axis_audio_tready]
+puts "clk_aud の実際の周波数: [get_property CONFIG.FREQ_HZ [get_bd_pins clk_aud/clk_out1]] Hz"
+
+# ---- アドレス割り当て: 0xA000_0000 ----
+assign_bd_address -target_address_space [get_bd_addr_spaces ps/Data] \
+    [get_bd_addr_segs i2s/S_AXI/reg0] -range 4K -offset 0xA0000000
+
+# ---- 段11: DMA から見た DDR のアドレス割り当て ----
+#   自作AXI4マスタが PS の DDR を見えるようにする（未割当だと読めない）
+assign_bd_address -target_address_space [get_bd_addr_spaces i2s/M_AXI] \
+    [get_bd_addr_segs ps/SAXIGP2/HP0_DDR_LOW] -force
+
+regenerate_bd_layout
+validate_bd_design
+save_bd_design
+
+make_wrapper -files [get_files $proj_dir/$proj_name.srcs/sources_1/bd/design_1/design_1.bd] -top
+add_files -norecurse $proj_dir/$proj_name.gen/sources_1/bd/design_1/hdl/design_1_wrapper.v
+set_property top design_1_wrapper [current_fileset]
+update_compile_order -fileset sources_1
+
+# ---- 合成 -> 実装 -> ビットストリーム ----
+launch_runs synth_1 -jobs 4
+wait_on_run synth_1
+launch_runs impl_1 -to_step write_bitstream -jobs 4
+wait_on_run impl_1
+
+set pr [get_property PROGRESS [get_runs impl_1]]
+if {$pr ne "100%"} { puts "BUILD FAILED (progress=$pr)"; exit 1 }
+puts "==============================================================="
+puts " i2s2_stream_hdmi (HDMI 音声つき) ビルド完了"
+puts "  bit: $proj_dir/$proj_name.runs/impl_1/design_1_wrapper.bit"
+puts "==============================================================="
+exit

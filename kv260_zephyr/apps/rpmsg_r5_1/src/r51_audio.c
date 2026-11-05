@@ -12,6 +12,7 @@
 //   命令 (Linux → R5_1)  u32 magic = 0x43445541 ("AUDC")  u32 cmd  u32 a  u32 b   (R5_0 の音声と同じ形)
 //     5 状態  6 統計を消す  9 音符  10 波形  11 楽譜に足す  12 楽譜 (中身は R5_0 と同じ)
 //     14 リバーブの量 a (0 = 無し、64 が既定、255 まで)
+//     15 標本の速さ a Hz (I2S 48828 / HDMI 48000)
 //   返事  u32 magic = 0x52445541 ("AUDR")  u32 status  u32 n_notes  u32 n_lat  u32 lat_max_us
 //     u32 lat_avg_us  u32 active  u32 score_run  u32 gen_max_us  u32 gen_avg_us  u32 n_kick  u32 reverb
 //     gen = KICK 1 回で作るのに掛かった時間。遅れ = 命令を受けてから、輪バッファの残り + FIFO の残量を経て鳴るまで
@@ -163,6 +164,13 @@ static int aud_cb(struct rpmsg_endpoint *e, void *data, size_t len, uint32_t src
 			break;
 		case 14:
 			reverb = MIN(c->a, 255);
+			break;
+		case 15:  /* 標本の速さ a Hz (I2S 48828 / HDMI 48000)。R5_0 の命令 15 と同じ */
+			if (c->a < 8000 || c->a > 96000) {
+				r.status = 2;
+			} else {
+				synth_set_fs(c->a);
+			}
 			break;
 		default:
 			r.status = 2;

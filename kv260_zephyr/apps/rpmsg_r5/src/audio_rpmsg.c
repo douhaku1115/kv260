@@ -22,6 +22,7 @@
 //     cmd 8〜12 = シンセ (R5 が音を作る。synth.c)。8 開始/停止 9 音符 10 波形 11 楽譜に足す 12 楽譜の演奏/消去
 //     cmd 13 = 分業 a=1 開始 / a=0 停止。R5_1 が作って共有 DDR の輪バッファに書いた音を、1ms ごとに
 //              FIFO へ移し、R5_1 に「足して」と IPI で知らせる (r2r.c、apps/common/r2r_shm.h)
+//     cmd 15 = 標本の速さ a Hz。PL の出口が I2S なら 48828、HDMI (stream_hdmi.bit の OUT_SEL=1) なら 48000
 //       中身は do_cmd() の各 case のコメント。返事の後ろにシンセの統計が付く (struct aud_res)
 //   返事 (どの命令にも 1 通)  u32 magic = 0x52445541 ("AUDR")  u32 status (0=正常 1=PLが音声設計でない 2=形式違い)
 //     u32 playing  u32 pos (送ったバイト数)  u32 len  u32 level (今の残量)  u32 min_level  u32 n_empty
@@ -330,6 +331,12 @@ static int do_cmd(const struct aud_cmd *c)
 		} else {
 			synth_score_clear();
 		}
+		return 0;
+	case 15:  /* 標本の速さ a Hz (I2S 48828 / HDMI 48000)。シンセの高さ・長さの計算に使う */
+		if (c->a < 8000 || c->a > 96000) {
+			return 2;
+		}
+		synth_set_fs(c->a);
 		return 0;
 	default:
 		return 2;

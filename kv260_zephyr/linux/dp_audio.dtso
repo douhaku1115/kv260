@@ -1,0 +1,25 @@
+// dp_audio.dtso -- HDMI 出力 (PS の DP サブシステム) のドライバを起動させ、音声 (ALSA) も使えるようにする
+//
+//   なぜ要るか: KV260 の元の DT は音声の番地を古い書き方 (xlnx,dpaud-reg で dp-aud@fd4ac000 を参照) で持っている。
+//   カーネル 6.12 の zynqmp-dpsub は dp_aud_clk があると音声も使うと判断し、番地を reg-names の "aud" で探す
+//   (drivers/gpu/drm/xlnx/zynqmp_dp_audio.c の zynqmp_audio_init)。無いので -EINVAL で起動全体が失敗していた
+//   (dmesg: "invalid resource (null)" / "probe with driver zynqmp-dpsub failed with error -22")。
+//   → reg に 0xFD4AC000 を足して "aud" と名付け、音声の DMA 2 本 (DPDMA の 4・5 番 = aud0/aud1) も足す。
+//
+//   作り方 (KV260):
+//     dtc -@ -I dts -O dtb -o dp_audio.dtbo dp_audio.dtso
+//     sudo cat boot_now.dtb > /tmp/base.dtb
+//     fdtoverlay -i /tmp/base.dtb -o rpmsg.dtb r5_rpmsg.dtbo dp_audio.dtbo
+/dts-v1/;
+/plugin/;
+
+&zynqmp_dpsub {
+	reg = <0x0 0xfd4a0000 0x0 0x1000>,
+	      <0x0 0xfd4aa000 0x0 0x1000>,
+	      <0x0 0xfd4ab000 0x0 0x1000>,
+	      <0x0 0xfd4ac000 0x0 0x1000>;
+	reg-names = "dp", "blend", "av_buf", "aud";
+	dmas = <&zynqmp_dpdma 0>, <&zynqmp_dpdma 1>, <&zynqmp_dpdma 2>, <&zynqmp_dpdma 3>,
+	       <&zynqmp_dpdma 4>, <&zynqmp_dpdma 5>;
+	dma-names = "vid0", "vid1", "vid2", "gfx0", "aud0", "aud1";
+};

@@ -17,6 +17,8 @@ extern struct synth_stats synth_st;
 
 void synth_init(void);
 void synth_wave(uint8_t w);
+void synth_set_fs(uint32_t hz);   /* 標本の速さ: I2S 48828 / HDMI 48000 */
+uint32_t synth_get_fs(void);
 void synth_note(uint8_t note, uint16_t len_ms, uint8_t vel);
 void synth_score_clear(void);
 int synth_score_add(uint32_t t_ms, uint8_t note, uint16_t len_ms, uint8_t vel);

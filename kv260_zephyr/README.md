@@ -23,6 +23,7 @@ Linux も SD カードも使わない。Zephyr はアプリと一体の `zephyr.
 | `apps/rpmsg_r5/src/cnn_rpmsg.c` / `linux/cnn_rpmsg.py` | 段2: Linux から RPMsg で PL の CNN 推論を頼む |
 | `apps/rpmsg_r5/src/audio_rpmsg.c` / `linux/r5play.py` | 段2: R5 が PL の音声 FIFO を 5ms ごとに満たす (Linux は指示だけ) |
 | `linux/linplay.c` / `linux/audio_cmp.sh` | 段2: 比較用。Linux だけで FIFO を満たす場合と R5 の場合を測る |
+| `linux/dp_audio.dtso` / `linux/hdmi_audio.sh` | 段6: Linux の HDMI ドライバを起動させる DT の差分 / HDMI の音声入力を PL に切り替える |
 | `apps/rpmsg_r5/src/synth.c` / `linux/r5synth.py` / `linux/synth_cmp.sh` | 段2: R5 で音を作る (8 音シンセ + 楽譜演奏) |
 | `rpmsg_r5_1.overlay` + `apps/rpmsg_r5_1` / `linux/r5_1_calc.py` / `linux/core_cmp.sh` | 段2: R5_1 (2 コア目) で重い計算。R5_0 の音が乱れないかを測る |
 
@@ -576,6 +577,67 @@ sudo python3 ~/r5synth.py --r51 twinkle                # 聞き取り (キー演
 - 残響の重さは 1 回あたり平均約 49us (1ms の約 5%)。R5_1 が受け持つので R5_0 の処理時間は変わらない
 - 遅れは 輪バッファの目標 256 標本 (5.2ms) + FIFO 128 段 (2.6ms) の分。R5_0 だけのシンセ (2.1ms) より大きい
 - きらきら星で残響が付くこと、割れ・爆発音がないことを耳で確認
+
+## R5 の音を HDMI モニターから出す (段6, 2026-11-05)
+
+段5 までの音は Pmod I2S2 (イヤホン) に出ていた。PL を kv260_i2s2 の `stream_hdmi.bit` に替え、
+同じ FIFO の出口を PS の HDMI 出力の音声入力 (live audio) につなぐ。Linux の ALSA は通らない。
+
+```
+R5_0 (または R5_1 + R5_0 の分業) ─ 1ms ごと ─> PL の FIFO ─ xlive_audio ─> PS の HDMI 音声入力 (PL から, 48kHz) ─> モニター
+```
+
+- 標本の速さが変わる: I2S は 12.5MHz/256 = 48828Hz、HDMI は 48000Hz。音の高さがずれないよう
+  命令 15 (R5_0 は `audio_rpmsg.c`、R5_1 は `r51_audio.c`) で `synth_set_fs()` を呼び、位相の増分と楽譜の時間を作り直す。
+  `r5synth.py` は PL の OUT_SEL (0xA0000140) を読んで、HDMI なら 48000 を送る。PC で MIDI 69 = 440.000Hz (両方の速さ)、割れ 0 を確認
+- PL の中身 (xlive_audio、OUT_SEL / HDMI_EMPTY レジスタ、合成) は kv260_i2s2 の README「HDMI モニターから出す」
+
+### HDMI 側 (PS) の切り替え: `linux/hdmi_audio.sh`
+
+| レジスタ | on にした値 | 意味 (Vitis の avbuf / dppsu ドライバのヘッダで確認) |
+|---|---|---|
+| 0xFD4AB070 | bit5:4 = 00 (0x04) | 音声の入力元を PL (live) に。Linux の ALSA は 01 (メモリ) で 0x54 |
+| 0xFD4AB120 | bit1 = 0 (0x05) | 音声クロックを PL の 24.576MHz に。Linux は PS (0x07) |
+| 0xFD4ACC00 | 1 → 0 | 音声のリセット |
+| 0xFD4A0304 / 0300 | 1 / 1 | 2ch、送信の音声を有効 |
+| 0xFD4AC000 | 0x20002000 | 音量 等倍 |
+
+`sudo sh hdmi_audio.sh off` で Linux の ALSA が使う形に戻す、`status` で表示。
+
+### はまった所
+
+- **Linux の HDMI ドライバが起動していなかった** (`zynqmp-dpsub` が -22)。Linux 6.12 のドライバは音声の番地を
+  reg-names "aud" で探すが、KV260 の元の DT は古い `xlnx,dpaud-reg` で持っていた。
+  → `linux/dp_audio.dtso` (reg に 0xFD4AC000 "aud"、dmas に DPDMA 4・5 番 aud0/aud1) を rpmsg.dtb に重ねた。
+  これで ALSA の「DisplayPort Monitor」が現れ、まず Linux の aplay で 440Hz がモニターから鳴ることを確かめた
+- **1 回目は FIFO が 256 段のまま減らず、楽譜が進まなかった**。起動直後、`on` の後で Linux が 070 と 120 を
+  元の値 (0x54 / 0x07) に書き戻していた (きっかけは未特定。その後 1 分見張っても戻らなかった)。
+  戻ると HDMI 側は PL の音を取りに来ない。→ `on` をやり直したら鳴った。`r5synth.py` は鳴らす前に 2 つを読み、
+  戻っていれば止まって知らせる
+- **音量が 0 (消音)**。0xFD4AC000 は Linux が一度鳴らすまで 0。→ `on` で 0x20002000 を書く
+
+### 使い方 (KV260)
+
+```bash
+sudo fpgautil -b ~/stream_hdmi.bit
+sudo devmem 0xFF5E00C0 32 0x01010A00
+sudo devmem 0xA0000000 32                     # 0xDEADBEEF
+sudo sh ~/hdmi_audio.sh on
+sudo sh ~/hdmi_audio.sh status                # 0xFD4AB070=0x04、0xFD4AB120=0x05 を確認
+sudo python3 ~/r5synth.py twinkle             # R5_0 だけ
+sudo python3 ~/r5synth.py --r51 twinkle       # R5_1 が作って残響、R5_0 が流す
+```
+
+### 実測 (きらきら星の最初の 1 節、FIFO の上限 256 段)
+
+| 形 | 音 | FIFO 最小残量 | 鳴っている間の HDMI_EMPTY 増加 | その他 |
+|---|---|---|---|---|
+| R5_0 だけ | 11 | 205 | 0 | R5_0 の 1ms の処理 最長 330us |
+| R5_1 + R5_0 (残響 64) | 11 | 205 | 0 | R5_1 が 1 回に作る時間 平均 69us / 最長 365us、輪バッファ不足 0 |
+
+- HDMI_EMPTY は合計 130 回前後あるが、増えるのは鳴らし始め (FIFO が溜まる前) と終わり (出し切った後) だけ。
+  中身は 0 なので無音
+- 両方ともモニターから鳴ること、残響が付くことを耳で確認
 
 ## 止まったとき
 - `xsdb debug_r5.tcl` → CPSR のモードが 0x17 ならアボート。DFSR/DFAR で原因と番地がわかる

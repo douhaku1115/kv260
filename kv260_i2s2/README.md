@@ -16,6 +16,8 @@ KV260 の PL で I2S 送受信を組み、Pmod I2S2（CS5343 ADC / CS4344 DAC）
   （`fm_demod.v` / ステレオ版 `fm_demod_stereo.v`）と PS 側（`rtl_fm`）の二段構え。
   19kHz パイロットに PLL で追従してステレオ復調まで実装（実機でロック成功、
   ただし電界強度が足りずステレオは雑音になる）。音を良くする過程は全て実測で進めた
+- **HDMI 出力（2026-11-05）**: FIFO の出口を I2S の代わりに HDMI モニターの音声入力へつなぐ
+  （`rtl/xlive/`、`build_stream_hdmi.tcl`）。kv260_zephyr の R5 シンセを Linux を通さずモニターから鳴らした
 
 ---
 
@@ -890,6 +892,54 @@ CIC のスケーリングを `$clog2(DECIM³)` による自動計算に直した
   変動幅 0.2dB で一定だった。
 
 ---
+
+## HDMI モニターから出す（2026-11-05、kv260_zephyr 段6 と対）
+
+段5 の FIFO の出口を、Pmod I2S2 の代わりに PS の HDMI 出力の音声入力（live audio、`dp_s_axis_audio_*`）へつなぐ。
+CPU（kv260_zephyr の R5）が FIFO に書いた音が、Linux の ALSA を通らずにモニターのスピーカーから出る。
+
+```
+R5 ─AXI─> i2s_stream_axi ─ FIFO (8192) ─┬─ OUT_SEL=0: I2S (12.5MHz/256 = 48828Hz) ─> Pmod I2S2
+                                         └─ OUT_SEL=1: xlive_audio ─ 24.576MHz ─> PS の HDMI 音声入力 (48kHz)
+```
+
+- `rtl/xlive/`: miya4649 さんの Live_Audio_KV260_KR260_Template（commit a300828、BSD 2 条項）から写した 7 ファイル。
+  標本を HDMI の音声の形（左右のサブフレーム、`tid` 0 = 左）に組む。`shift_register_vector.v` だけ xsim が
+  generate の中の参照を通さないので配列で書き直した（動きは同じ）
+- HDMI 側が `tready` で標本を引くので、FIFO はその時だけ読む（`hdmi_take`）。音の速さは 48000Hz になる
+  （I2S は 48828Hz なので、R5 側は命令 15 で標本の速さを切り替える）
+- 音声クロック 24.576MHz（= 512 × 48kHz）は clk_wiz `clk_aud` で pl_clk0（100MHz）から作る（実 24576025Hz）。
+  12.5MHz 側とは非同期（`constraints/hdmi_audio.xdc`）。音声側のリセットは 4 段のシフトレジスタで同期
+- PS 設定に `PSU__USE__AUDIO {1}` を足して `dp_s_axis_audio_*` を出した
+
+### 追加したレジスタ
+
+| 番地 | 名前 | 中身 |
+|---|---|---|
+| 0x140 | OUT_SEL（RW） | bit0: 1 で FIFO を HDMI の速さで読み HDMI へ。0 で従来の I2S。書くと 0x150 を 0 に戻す |
+| 0x150 | HDMI_EMPTY（R） | 再生中、HDMI が標本を欲しい時に FIFO が空だった回数（途切れの数） |
+
+### シミュレーション・合成
+
+```bash
+cd sim && bash run_hdmi_sim.sh        # tb_hdmi_audio.v: 300 組を照合 → 不一致 0、48172 組/秒、空の回数も数える → 結果: OK
+vivado -mode batch -source E:/fpga/kria260/kv260_i2s2/build_stream_hdmi.tcl
+# 生成物: vivado_stream_hdmi/i2s2_stream_hdmi.runs/impl_1/design_1_wrapper.bit
+# 実績: WNS +36.993ns / WHS +0.012ns、ERROR・CRITICAL WARNING 0
+```
+
+### 実機（KV260）
+
+```bash
+sudo fpgautil -b ~/stream_hdmi.bit
+sudo devmem 0xFF5E00C0 32 0x01010A00
+sudo devmem 0xA0000000 32                  # 0xDEADBEEF
+sudo sh ~/hdmi_audio.sh on                 # kv260_zephyr/linux/hdmi_audio.sh。OUT_SEL=1 と HDMI 側の切り替え
+sudo python3 ~/r5synth.py twinkle          # kv260_zephyr の R5 シンセ
+```
+
+HDMI 側（PS）の設定と R5 側は kv260_zephyr の README「段6」を参照。Linux の HDMI ドライバが動いていること
+（kv260_zephyr/linux/dp_audio.dtso を入れた dtb）が前提。
 
 ## ★書き込みは fpgautil を使う（重要）
 

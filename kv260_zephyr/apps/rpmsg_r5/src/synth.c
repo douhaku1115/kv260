@@ -13,7 +13,8 @@
 #include <zephyr/sys/sys_io.h>
 #include "synth.h"
 
-#define FS        48828.125f   /* 12.5MHz / 256 */
+/* 標本の速さ (Hz)。既定は PL の I2S (12.5MHz / 256 = 48828.125)。HDMI に出すときは 48000 (synth_set_fs) */
+static uint32_t fs = 48828;
 #define NVOICE    8
 #define ATTACK    98           /* 立ち上がり 約 2ms (標本) */
 #define ENV_MAX   (1 << 24)    /* 包絡の最大 (Q24) */
@@ -60,13 +61,27 @@ void synth_init(void)
 		y = x * s + y * c;
 		x = nx;
 	}
+	synth_set_fs(fs);
+}
+
+/* 標本の速さを変え、高さの表 (inc12) を作り直す。I2S は 48828、HDMI は 48000 (段6) */
+void synth_set_fs(uint32_t hz)
+{
+	/* I2S の正確な値は 48828.125 なので、48828 のときだけ端数を足す */
+	float rate = (hz == 48828U) ? 48828.125f : (float)hz;
 	/* 半音ずつ 2^(1/12) 倍。MIDI 120 (C9) = 440 × 2^(51/12) ≒ 8372.018Hz */
 	float f = 8372.018f;
 
+	fs = hz;
 	for (int k = 0; k < 12; k++) {
-		inc12[k] = (uint32_t)(f / FS * 4294967296.0f);
+		inc12[k] = (uint32_t)(f / rate * 4294967296.0f);
 		f *= 1.0594630943592953f;
 	}
+}
+
+uint32_t synth_get_fs(void)
+{
+	return fs;
 }
 
 static uint32_t note_inc(uint8_t n)
@@ -105,7 +120,7 @@ static void note_start(uint8_t note, uint16_t len_ms, uint8_t vel, bool measure)
 	p->peak = (int32_t)((uint32_t)ENV_MAX / 127 * MIN(vel, 127));
 	p->env = 0;
 	p->age = 0;
-	p->len = (uint32_t)len_ms * 48828U / 1000U;
+	p->len = (uint32_t)len_ms * fs / 1000U;
 	p->t_rx = measure ? (k_cycle_get_32() | 1) : 0;
 	p->on = true;
 	synth_st.n_notes++;
@@ -127,7 +142,7 @@ int synth_score_add(uint32_t t_ms, uint8_t note, uint16_t len_ms, uint8_t vel)
 	if (n_score >= SCORE_MAX) {
 		return -1;
 	}
-	score[n_score++] = (struct ev){(uint32_t)((uint64_t)t_ms * 48828U / 1000U), note, vel, len_ms};
+	score[n_score++] = (struct ev){(uint32_t)((uint64_t)t_ms * fs / 1000U), note, vel, len_ms};
 	return 0;
 }
 
@@ -197,7 +212,7 @@ void synth_measure(uint32_t level)
 		if (v[i].on && v[i].t_rx) {
 			uint32_t us = (uint32_t)((uint64_t)(now - v[i].t_rx) * 1000000U /
 						 sys_clock_hw_cycles_per_sec()) +
-				      (uint32_t)((uint64_t)level * 1000000U / 48828U);
+				      (uint32_t)((uint64_t)level * 1000000U / fs);
 
 			synth_st.lat_max_us = MAX(synth_st.lat_max_us, us);
 			synth_st.lat_sum_us += us;
