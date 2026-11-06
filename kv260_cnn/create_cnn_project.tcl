@@ -69,7 +69,10 @@ set_property -dict [list \
   CONFIG.PSU__USE__M_AXI_GP0 {1} \
   CONFIG.PSU__USE__M_AXI_GP1 {0} \
   CONFIG.PSU__MAXIGP0__DATA_WIDTH {32} \
+  CONFIG.PSU__USE__IRQ0 {1} \
 ] [get_bd_cells ps]
+# ↑ 段14: PL→PS 割り込み 0 番（pl_ps_irq0）を有効にする。
+#   pl_ps_irq0[0] は GIC の SPI 89 番（ID 121）。Linux の DT では interrupts = <0 89 4>。
 
 # ---- リセット生成 ----
 #   段11 と違い clk_wiz を使わず PL0(100MHz) をそのまま使うので、
@@ -109,6 +112,9 @@ connect_bd_intf_net [get_bd_intf_pins ps/M_AXI_HPM0_FPD] [get_bd_intf_pins axi_i
 connect_bd_net $aclk [get_bd_pins cnn/S_AXI_ACLK]
 connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins cnn/S_AXI_ARESETN]
 connect_bd_intf_net [get_bd_intf_pins axi_ic/M00_AXI] [get_bd_intf_pins cnn/S_AXI]
+
+# ---- 段14: 計算終了の割り込み → PS ----
+connect_bd_net [get_bd_pins cnn/irq] [get_bd_pins ps/pl_ps_irq0]
 
 # ---- アドレス割り当て: 0xA000_0000 ----
 assign_bd_address -target_address_space [get_bd_addr_spaces ps/Data] \

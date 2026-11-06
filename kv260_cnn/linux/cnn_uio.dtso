@@ -1,0 +1,37 @@
+// -----------------------------------------------------------------------------
+// cnn_uio.dtso -- 段14: PL の CNN(0xA0000000) を Linux の UIO として見せる DT 差分
+//
+//   動いている Linux に後から足す（configfs）。SD・uEnv.txt・起動 DT は変えない。
+//
+//   KV260 の起動 DT で確かめたこと（2026-11-07）:
+//     /axi は simple-bus、#address-cells = 2、#size-cells = 2、ラベル amba
+//     GIC は /axi/interrupt-controller@f9010000、ラベル gic
+//     uio_pdrv_genirq はモジュールで読み込み済みだが of_id が空なので、
+//     compatible では自動で結び付かない → 足したあと driver_override で結ぶ
+//
+//   割り込み: PL→PS の pl_ps_irq0[0] = GIC の SPI 89（ID 121）、レベル High(4)
+//
+//   使い方（KV260 上）:
+//     dtc -@ -I dts -O dtb -o cnn_uio.dtbo cnn_uio.dtso
+//     sudo mkdir /sys/kernel/config/device-tree/overlays/cnn
+//     sudo sh -c 'cat cnn_uio.dtbo > /sys/kernel/config/device-tree/overlays/cnn/dtbo'
+//     echo uio_pdrv_genirq | sudo tee /sys/bus/platform/devices/a0000000.cnn_uio/driver_override
+//     echo a0000000.cnn_uio | sudo tee /sys/bus/platform/drivers/uio_pdrv_genirq/bind
+//   外すとき: sudo rmdir /sys/kernel/config/device-tree/overlays/cnn
+// -----------------------------------------------------------------------------
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target = <&amba>;
+		__overlay__ {
+			cnn_uio@a0000000 {
+				compatible = "kv260,cnn-uio";
+				reg = <0x0 0xa0000000 0x0 0x1000>;
+				interrupt-parent = <&gic>;
+				interrupts = <0 89 4>;
+			};
+		};
+	};
+};

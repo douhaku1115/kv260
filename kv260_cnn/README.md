@@ -1,4 +1,4 @@
-# 段13 KV260 の PL に自作 CNN（MNIST 手書き数字認識）
+# 段13・14 KV260 の PL に自作 CNN（MNIST 手書き数字認識）＋割り込みで Linux へ
 
 FPGA（KV260 の PL）に畳み込みニューラルネットを自分で書いて載せ、手書き数字を認識させる。
 学習は PyTorch、推論は全部 Verilog。**実機の答えが Python の量子化版と 1 ビットも違わないこと**を合格条件にした。
@@ -13,6 +13,24 @@ FPGA（KV260 の PL）に畳み込みニューラルネットを自分で書い�
 | **KV260 実機** | **完全一致** | **1.991 ms/枚（毎秒 502 枚）** |
 
 資源は LUT 2,220（KV260 の約 2%）、DSP **0 個**、BRAM 4 個。タイミング余裕 WNS = 2.280 ns。
+
+## 段14: 終了を割り込みで Linux に知らせる（UIO）
+
+段13 は `/dev/mem` を root で開き、STATUS を読み続けて終わりを待っていた（待つ間 CPU は回りっぱなし）。
+段14 では PL の終了フラグをそのまま PS への割り込み（pl_ps_irq0[0]、GIC SPI 89）にし、
+Linux の UIO（`uio_pdrv_genirq`）で受けて、`read()` で眠って待つ。
+「気づくまでの遅れ」を測るため、PL に 0x70 LAT（終了から CPU の最初の読み出しが届くまでのクロック数）を足した。
+
+KV260 実機、1000 枚ずつ（2026-11-07）:
+
+| | 1 枚の待ち | 待つ間の CPU | 気づくまでの遅れ（LAT） | 不一致 |
+|---|---|---|---|---|
+| ポーリング | 1.994 ms | 1.992 ms（99.9%） | 平均 0.13 µs | 0 |
+| **割り込み** | 2.013 ms | **0.012 ms（0.6%）** | 平均 18.3 µs（14.0〜32.0） | 0 |
+
+割り込みにすると待つ間の CPU がほぼ空く。代わりに、割り込みから眠っていたプロセスが動き出すまでに
+平均 18 µs かかる（1 枚 2 ms に対して約 0.9%）。合成後の WNS = 2.288 ns。
+SD・uEnv.txt・起動 DT は変えず、動いている Linux に DT 差分を後から足す（再起動で消える）。
 
 ## ネットワーク
 
@@ -52,6 +70,8 @@ y   = clip(acc >>> SHIFT, 0, 255)      ← ReLU と 8ビット飽和を同時に
 | `rtl/cnn_axi.v` | AXI4-Lite の窓口（0xA0000000） |
 | `sim/tb_*.v` | 層ごと＋通し＋AXI 越しの検証 |
 | `sw/cnn_test.c` | 実機（Linux）から動かして期待値と突き合わせる |
+| `sw/cnn_uio.c` | 段14: UIO 経由でポーリングと割り込みを比べる（待ち・CPU・LAT） |
+| `linux/cnn_uio.dtso` | 段14: CNN を UIO として見せる DT 差分（割り込み SPI 89） |
 | `create_cnn_project.tcl` | Vivado プロジェクト生成〜ビットストリームまで |
 
 Vivado のプロジェクトと MNIST 本体は容量が大きいので git に入れていない。どちらも再生成できる。
@@ -98,6 +118,27 @@ gcc -O2 -o cnn_test cnn_test.c
 sudo ./cnn_test test_images.hex test_scores.hex
 ```
 
+### 5. 段14: 割り込み（UIO）で動かす（④の ① ② の PL 書き込みとクロックまで済ませてから）
+
+```bash
+# ① パソコンから送る
+scp -O sw\cnn_uio.c linux\cnn_uio.dtso petalinux@192.168.0.8:~/
+
+# ② KV260 側: DT 差分を足す
+dtc -@ -I dts -O dtb -o cnn_uio.dtbo cnn_uio.dtso    # reg の警告が出るが無害（親 /axi は 2/2 桁）
+sudo mkdir /sys/kernel/config/device-tree/overlays/cnn
+sudo sh -c 'cat cnn_uio.dtbo > /sys/kernel/config/device-tree/overlays/cnn/dtbo'
+
+# ③ UIO の割り込みドライバに手で結ぶ（of_id が空なので compatible では結び付かない）
+echo uio_pdrv_genirq | sudo tee /sys/bus/platform/devices/a0000000.cnn_uio/driver_override
+echo a0000000.cnn_uio | sudo tee /sys/bus/platform/drivers/uio_pdrv_genirq/bind
+grep cnn /proc/interrupts                             # GICv2 121 Level cnn_uio@a0000000
+
+# ④ 測る
+gcc -O2 -o cnn_uio cnn_uio.c
+sudo ./cnn_uio test_images.hex test_scores.hex 1000
+```
+
 ## レジスタ（0x10 刻み、base 0xA0000000）
 
 | 番地 | 向き | 内容 |
@@ -109,6 +150,9 @@ sudo ./cnn_test test_images.hex test_scores.hex
 | 0x40 | R | 答え（0〜9） |
 | 0x50 | W | 読み出すスコアの番号 |
 | 0x60 | R | スコア（int32） |
+| 0x70 | R | LAT（段14）: 終了から CPU の最初の読み出しが届くまでのクロック数（10 ns 単位） |
+
+割り込み `irq`（段14）= 終了フラグそのもの（レベル High）。CTRL bit2 で下がる。
 
 **0x10 刻みに整列させるのは必須。** ZynqMP の HPM を 32 ビット幅で使うと、
 整列していない番地は devmem/mmap の読み出しが必ず 0 を返す（段11 で半日溶かした）。
@@ -137,3 +181,20 @@ sudo ./cnn_test test_images.hex test_scores.hex
 
 `kv260_cnn/vivado/   # コメント` と書くとパターンとして解釈されず効かない。
 コメントは独立した行に書く。
+
+### 4. 段14: UIO の名前は DT のノード名そのもの
+
+`/sys/class/uio/uioN/name` は `cnn_uio` ではなく `cnn_uio@a0000000` になった。
+`cnn_uio.c` は先頭一致で探す。
+
+### 5. 段14: 溜まった「起こす合図」で 1 枚目が計算途中に起きた
+
+UIO の割り込みは bind した時点で有効。先にポーリングの回を走らせると、その 1 枚目の終了で
+割り込みが 1 回入って合図が残り、割り込みの回の 1 枚目が計算途中で `read()` から戻った
+（不一致 22）。割り込みの回の前に、終了フラグを消して割り込みを再開し、`poll()`（待ち 0）で
+残っている合図を読み捨てるようにした。ただし直した後の実行では、前のプロセスの最後で割り込みが
+止まったままだったため合図が溜まらず、**捨てる処理が実際に働く場面はまだ確かめていない**
+（bind し直した直後に走らせれば確かめられる）。
+
+UIO の割り込みは来るたびに止められるので、利用者は「終了フラグを消す → `/dev/uioN` に 1 を書いて
+再開」の順にする。irq はレベルなので、逆だとすぐにもう一度入る。

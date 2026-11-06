@@ -27,6 +27,7 @@ module tb_cnn_axi;
     localparam [7:0] REG_DIGIT  = 8'h40;
     localparam [7:0] REG_SEL    = 8'h50;
     localparam [7:0] REG_SCORE  = 8'h60;
+    localparam [7:0] REG_LAT    = 8'h70;    // 段14: 気づくまでのクロック数
 
     reg clk = 1'b0;
     reg rst_n = 1'b0;
@@ -39,6 +40,8 @@ module tb_cnn_axi;
     reg  [7:0]  araddr;   reg arvalid;  wire arready;
     wire [31:0] rdata;    wire [1:0] rresp; wire rvalid; reg rready;
 
+    wire        irq;                            // 段14: 割り込み
+
     cnn_axi dut (
         .S_AXI_ACLK(clk), .S_AXI_ARESETN(rst_n),
         .S_AXI_AWADDR(awaddr), .S_AXI_AWPROT(3'b0),
@@ -49,7 +52,8 @@ module tb_cnn_axi;
         .S_AXI_ARADDR(araddr), .S_AXI_ARPROT(3'b0),
         .S_AXI_ARVALID(arvalid), .S_AXI_ARREADY(arready),
         .S_AXI_RDATA(rdata), .S_AXI_RRESP(rresp),
-        .S_AXI_RVALID(rvalid), .S_AXI_RREADY(rready)
+        .S_AXI_RVALID(rvalid), .S_AXI_RREADY(rready),
+        .irq(irq)
     );
 
     // ---- 1回の書き込み ----
@@ -114,6 +118,11 @@ module tb_cnn_axi;
         for (n = 0; n < NIMG; n = n + 1) begin
             // ---- 画素ポインタを戻し、終了フラグも消す ----
             axi_write(REG_CTRL, 32'h6);          // bit1=ポインタ戻す, bit2=終了フラグ消す
+            @(posedge clk);
+            if (irq !== 1'b0) begin              // 段14: 終了フラグを消したら irq も下がる
+                $display("  画像%0d: 終了フラグを消しても irq が下がらない", n);
+                total_bad = total_bad + 1;
+            end
 
             // ---- 画像を 784 個書く ----
             for (i = 0; i < XLEN; i = i + 1)
@@ -130,7 +139,18 @@ module tb_cnn_axi;
             axi_write(REG_CTRL, 32'h1);          // bit0=開始
 
             // ---- 終了待ち ----
+            //   段14: 偶数番目は割り込み（irq を待ち、わざと 50 クロック置いてから読む）
+            //         奇数番目は従来どおりポーリング
             v = 0;
+            if (n % 2 == 0) begin
+                wait (irq === 1'b1);
+                repeat (50) @(posedge clk);
+                axi_read(REG_STATUS, v);         // この読み出しで LAT が止まる
+                if (v[1] !== 1'b1) begin
+                    $display("  画像%0d: irq が立ったのに STATUS の終了ビットが 0", n);
+                    total_bad = total_bad + 1;
+                end
+            end
             while (v[1] !== 1'b1) begin
                 axi_read(REG_STATUS, v);
                 cyc = cyc + 1;
@@ -141,6 +161,22 @@ module tb_cnn_axi;
                     total_bad = total_bad + 1;
                     $finish;
                 end
+            end
+
+            // ---- 段14: 遅れカウンタ ----
+            axi_read(REG_LAT, v);
+            if (n % 2 == 0) begin
+                if (v < 50 || v > 60) begin
+                    $display("  画像%0d: 割り込み LAT=%0d（期待 50〜60）", n, v);
+                    total_bad = total_bad + 1;
+                end else
+                    $display("  画像%0d: 割り込み   LAT=%0d クロック", n, v);
+            end else begin
+                if (v > 20) begin
+                    $display("  画像%0d: ポーリング LAT=%0d（期待 20 以下）", n, v);
+                    total_bad = total_bad + 1;
+                end else
+                    $display("  画像%0d: ポーリング LAT=%0d クロック", n, v);
             end
 
             // ---- 期待される答え（同点は先勝ち）----

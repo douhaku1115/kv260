@@ -20,6 +20,15 @@
 //     0x40 DIGIT  (R)  答え（0〜9）
 //     0x50 SEL    (W)  次に読むスコアの番号（0〜9）
 //     0x60 SCORE  (R)  SEL で選んだスコア（int32、符号つき）
+//     0x70 LAT    (R)  計算が終わってから CPU の最初の読み出しが届くまでのクロック数
+//                      （段14: 割り込みとポーリングで「気づくまでの遅れ」を比べる物差し）
+//
+//   【割り込み irq（段14 で追加）】
+//     irq = 終了フラグ(done_latched) そのもの。レベル（High の間ずっと要求）。
+//     PS の pl_ps_irq0[0] につなぎ、Linux では UIO（uio_pdrv_genirq）で受ける。
+//     UIO は割り込みが来ると割り込みを止めてから利用者を起こすので、
+//     利用者は「CTRL bit2 で終了フラグを消す → /dev/uioN に 1 を書いて再開」
+//     の順にすること（逆にすると、まだ High のままなので即座にもう一度入る）。
 //
 //   【画素を1つずつ書く理由】
 //     AXI スレーブ側に 784 バイトの配列を置いて直接番地を振ると、
@@ -64,7 +73,10 @@ module cnn_axi #(
     output wire [C_S_AXI_DATA_WIDTH-1:0]   S_AXI_RDATA,
     output wire [1:0]                      S_AXI_RRESP,
     output wire                            S_AXI_RVALID,
-    input  wire                            S_AXI_RREADY
+    input  wire                            S_AXI_RREADY,
+
+    // ---- 割り込み（段14）: 計算終了で High、CTRL bit2 で Low ----
+    output wire                            irq
 );
     wire clk   = S_AXI_ACLK;
     wire rst_n = S_AXI_ARESETN;
@@ -200,6 +212,30 @@ module cnn_axi #(
         else if (clr_done) done_latched <= 1'b0;
     end
 
+    assign irq = done_latched;
+
+    // =========================================================================
+    // 遅れカウンタ（段14）
+    //   done の瞬間に 0 から数え始め、その後に最初の読み出し要求が PL に
+    //   届いたクロックで止める。読み出しの番地は問わない（ポーリングなら
+    //   STATUS、割り込みなら最初に読んだもの）。値 x 10ns が「CPU が気づくまで」。
+    // =========================================================================
+    wire       rd_accept = axi_arready && S_AXI_ARVALID && ~axi_rvalid;
+    reg        lat_run;
+    reg [31:0] lat_cnt;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            lat_run <= 1'b0;
+            lat_cnt <= 32'd0;
+        end else if (done) begin
+            lat_run <= 1'b1;
+            lat_cnt <= 32'd0;
+        end else if (lat_run) begin
+            if (rd_accept) lat_run <= 1'b0;     // このクロックの値で止める
+            else           lat_cnt <= lat_cnt + 32'd1;
+        end
+    end
+
     // =========================================================================
     // レジスタの読み出し
     // =========================================================================
@@ -226,6 +262,7 @@ module cnn_axi #(
             4'h4: axi_rdata <= {28'b0, digit};                   // 0x40 DIGIT
             4'h5: axi_rdata <= {28'b0, score_sel};               // 0x50 SEL（読み戻し）
             4'h6: axi_rdata <= score_data;                       // 0x60 SCORE
+            4'h7: axi_rdata <= lat_cnt;                          // 0x70 LAT（段14）
             default: axi_rdata <= 32'b0;
             endcase
         end
